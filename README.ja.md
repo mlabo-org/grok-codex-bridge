@@ -18,7 +18,9 @@ cd grok-codex-bridge
 codex
 ```
 
-起動したCodexへ、次のように依頼してください。
+起動したCodexへ、目的に応じて次のどちらかを依頼してください。
+
+### V1.0分離プロファイルまでinstallする
 
 ```text
 AGENTS.mdを最後まで読み、その契約に従ってください。このMacへV1.0の分離型
@@ -30,7 +32,26 @@ publishは行わないでください。Apple Silicon搭載macOSでない場合�
 authoritative inputを確認できない場合は停止して不足境界を説明してください。
 ```
 
-この依頼文は、意図的にV1.0分離ルートだけを選びます。V1.1統合ピッカーの有効化はactiveなCodexモデルカタログを変更し、検証済みNative Codex入力を必要とするため、別の明示操作として扱ってください。
+### 実験的V1.1統合ピッカーまで自動でinstallする
+
+build、V1.0分離install、Native GPT/Grok統合ピッカー有効化までを、Codexへ一仕事で任せる場合はこちらを使用します。
+
+```text
+AGENTS.mdを最後まで読み、その契約に従ってください。このMacでV1.0分離型
+grok-bridgeプロファイルをbuild・installし、同じjobの中で実験的V1.1 Native GPT/Grok
+統合pickerの有効化まで続けてください。picker有効化前に、現在のauthoritative Native
+Codex catalogと、実際に有効なfirst-party Responses upstreamを、credentialの読み取り・
+copy・表示を行わずに特定してください。./scripts/materialize-macos.shとrepo所有のnative
+lifecycle commandだけを使用し、既存差分と完全なrollback境界を保持してください。
+install済みservice、Native/Grok統合catalog、Grokの272,000-token context metadataを、
+最小のprimary-path checkで確認してください。Native Codex入力を推測すること、Codex
+本体binaryへのpatch、Codex設定・Grok認証・LaunchAgent fileの直接編集、commit、push、
+publishは禁止します。authoritative inputを確認できない場合はpicker有効化前に停止し、
+不足内容を説明してください。成功時は必要なCLI/Desktopの完全再起動と、pickerの正確な
+rollback commandを報告してください。
+```
+
+この経路はrepoが所有するV1.1導入処理をすべて自動化します。有効化したcatalogとprovider stateをCodexへ読み込ませるため、完了後の新規Codex CLIプロセス起動またはDesktop完全再起動だけは必要です。
 
 ## 謝辞
 
