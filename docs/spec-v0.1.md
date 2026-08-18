@@ -190,7 +190,7 @@ Responsesの`instructions`は同じResponses fieldとして損失なく維持す
 
 ## 20. Text Message
 
-Responses input messageのrole、content order、`input_text`を対応するResponses itemとして損失なく維持する。未対応content typeをsilent dropしない。
+Responses input messageのrole、content order、`input_text`を対応するResponses itemとして損失なく維持する。Codex assistant履歴の`phase`は`commentary`または`final_answer`として検証し、phaseを持たないxAI easy message境界で終端する。未対応content typeをsilent dropしない。
 
 ## 21. Images
 
@@ -207,6 +207,8 @@ Codexから渡されたfunction toolのname、description、parameters schemaを
 ## 24. Tool Calls
 
 Grokが返すResponses function call itemのtool name、tool call ID、arguments JSONを検証してそのまま維持する。`call_id`は次turnのtool result対応に必要なため失わない。
+
+Native GPTで完了済みの`custom_tool_call`と`custom_tool_call_output`はCodex harnessが所有するforeign実行履歴としてschemaを検証し、Grok requestから除外する。これらをGrok function call stateへ混入させず、同じturnのassistant message textは会話履歴として維持する。
 
 ## 25. Tool Result
 
