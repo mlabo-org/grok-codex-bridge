@@ -1119,10 +1119,7 @@ impl NamespaceToolProjection {
             return;
         };
         item.insert("name".into(), Value::String(native.name.clone()));
-        item.insert(
-            "namespace".into(),
-            Value::String(native.namespace.clone()),
-        );
+        item.insert("namespace".into(), Value::String(native.namespace.clone()));
     }
 
     fn restore_response_event(&self, value: &mut Value) {
@@ -3687,10 +3684,7 @@ mod tests {
         });
         projection.restore_response_event(&mut completed);
         assert_eq!(completed["response"]["output"][0]["name"], "ping");
-        assert_eq!(
-            completed["response"]["output"][0]["namespace"],
-            "mcp__demo"
-        );
+        assert_eq!(completed["response"]["output"][0]["namespace"], "mcp__demo");
     }
 
     #[test]

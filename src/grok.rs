@@ -628,10 +628,7 @@ mod tests {
         assert_eq!(events[4]["item"]["name"], "ping");
         assert_eq!(events[4]["item"]["namespace"], "mcp__demo");
         assert_eq!(events[5]["response"]["output"][0]["name"], "ping");
-        assert_eq!(
-            events[5]["response"]["output"][0]["namespace"],
-            "mcp__demo"
-        );
+        assert_eq!(events[5]["response"]["output"][0]["namespace"], "mcp__demo");
         task.abort();
     }
 }
