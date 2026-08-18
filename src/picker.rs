@@ -160,6 +160,7 @@ fn grok_picker_entry(id: &str, priority: i32) -> Value {
             "mode": "bytes",
             "limit": 10_000
         },
+        "supports_parallel_tool_calls": true,
         "supports_image_detail_original": false,
         "context_window": null,
         "max_context_window": null,
@@ -706,7 +707,51 @@ mod tests {
             true
         );
         assert_eq!(after["models"][1]["include_apps_usage_instructions"], true);
+        assert_eq!(after["models"][1]["supports_parallel_tool_calls"], true);
         assert_eq!(serde_json::from_slice::<Value>(&source).unwrap(), before);
+    }
+
+    #[test]
+    #[ignore = "requires the accepted Codex consumer binary and its bundled catalog"]
+    fn generated_catalog_is_accepted_by_codex_consumer() {
+        let codex_binary = std::env::var_os("CODEX_CONSUMER_BINARY")
+            .expect("CODEX_CONSUMER_BINARY must name the accepted Codex executable");
+        let native_catalog = std::env::var_os("CODEX_NATIVE_CATALOG")
+            .expect("CODEX_NATIVE_CATALOG must name that consumer's bundled catalog");
+        let native_bytes = std::fs::read(native_catalog).unwrap();
+        let grok = CatalogSnapshot::new(["grok-4.6"], Some("\"grok-v1\"".to_owned())).unwrap();
+        let generated = generate_picker_catalog(&native_bytes, &grok).unwrap();
+        let isolated_home = tempfile::tempdir().unwrap();
+        let generated_path = isolated_home.path().join("picker-models.json");
+        std::fs::write(&generated_path, generated.bytes()).unwrap();
+        let catalog_path = serde_json::to_string(generated_path.to_str().unwrap()).unwrap();
+        std::fs::write(
+            isolated_home.path().join("config.toml"),
+            format!(
+                "model_catalog_json = {catalog_path}\n\n[model_providers.grok_bridge]\nname = \"Grok Bridge\"\nbase_url = \"http://127.0.0.1:9/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = false\nsupports_websockets = false\n"
+            ),
+        )
+        .unwrap();
+
+        let output = std::process::Command::new(codex_binary)
+            .env("CODEX_HOME", isolated_home.path())
+            .args(["debug", "models"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "Codex rejected generated catalog: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let parsed: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let grok_entry = parsed["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["slug"] == "grok-4.6")
+            .expect("Codex consumer output must retain the generated Grok row");
+        assert_eq!(grok_entry["model_provider"], "grok_bridge");
+        assert_eq!(grok_entry["supports_parallel_tool_calls"], true);
     }
 
     #[test]
