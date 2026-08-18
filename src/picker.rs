@@ -7,8 +7,8 @@ use thiserror::Error;
 
 use crate::catalog::{CatalogError, CatalogSnapshot, OFFICIAL_MODELS_ORIGIN, validate_model_ids};
 
-const PICKER_POLICY_VERSION: u32 = 1;
-const MANAGED_STATE_VERSION: u32 = 1;
+const PICKER_POLICY_VERSION: u32 = 2;
+const MANAGED_STATE_VERSION: u32 = 2;
 const GROK_ENTRY_DESCRIPTION: &str = "Grok model served through Grok Codex Bridge.";
 const GROK_BASE_INSTRUCTIONS: &str = "You are Codex, a coding agent using the selected Grok model through Grok Codex Bridge. Follow the developer and user instructions supplied by Codex, and use Codex tools when needed.";
 
@@ -20,6 +20,7 @@ const GROK_BASE_INSTRUCTIONS: &str = "You are Codex, a coding agent using the se
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GeneratedPickerCatalog {
     bytes: Vec<u8>,
+    native_model_slugs: Vec<String>,
     native_model_count: usize,
     grok_model_count: usize,
 }
@@ -38,6 +39,11 @@ impl GeneratedPickerCatalog {
     #[must_use]
     pub fn native_model_count(&self) -> usize {
         self.native_model_count
+    }
+
+    #[must_use]
+    pub fn native_model_slugs(&self) -> &[String] {
+        &self.native_model_slugs
     }
 
     #[must_use]
@@ -74,19 +80,13 @@ pub fn generate_picker_catalog(
     }
 
     let mut seen = HashSet::with_capacity(native_models.len() + grok_catalog.models().len());
+    let mut native_model_slugs = Vec::with_capacity(native_models.len());
     for (index, model) in native_models.iter().enumerate() {
         let slug = validate_model_entry(model, index)?;
         if !seen.insert(slug.to_owned()) {
             return Err(PickerError::DuplicateSlug(slug.to_owned()));
         }
-    }
-    // Remote catalog metadata is not routing authority.  The generated local
-    // catalog makes the native provider explicit for every copied native row.
-    for model in native_models.iter_mut() {
-        model
-            .as_object_mut()
-            .expect("validated native picker entry must be an object")
-            .insert("model_provider".to_owned(), Value::String("openai".to_owned()));
+        native_model_slugs.push(slug.to_owned());
     }
 
     let native_model_count = native_models.len();
@@ -108,6 +108,7 @@ pub fn generate_picker_catalog(
         .map_err(|error| PickerError::SerializeCatalog(error.to_string()))?;
     Ok(GeneratedPickerCatalog {
         bytes,
+        native_model_slugs,
         native_model_count,
         grok_model_count: grok_ids.len(),
     })
@@ -116,7 +117,6 @@ pub fn generate_picker_catalog(
 fn grok_picker_entry(id: &str, priority: i32) -> Value {
     let mut entry = json!({
         "slug": id,
-        "model_provider": "grok_bridge",
         "display_name": id,
         "description": GROK_ENTRY_DESCRIPTION,
         "default_reasoning_level": "high",
@@ -473,6 +473,12 @@ enum GeneratedCatalogRollbackOwnership {
     RemoveIfIdentityMatches,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum NativeRouteRollbackOwnership {
+    RemoveIfIdentityMatches,
+}
+
 /// Versioned metadata-only state. It contains no credential, capability, or
 /// request content and performs no filesystem mutation by itself.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -484,6 +490,8 @@ pub struct PickerManagedState {
     grok_catalog: AdmittedGrokCatalogState,
     generated_catalog: ArtifactIdentity,
     generated_catalog_rollback: GeneratedCatalogRollbackOwnership,
+    native_route: ArtifactIdentity,
+    native_route_rollback: NativeRouteRollbackOwnership,
     managed_config: ArtifactIdentity,
     config_rollback: ConfigRollbackOwnership,
 }
@@ -493,6 +501,7 @@ impl PickerManagedState {
         native_catalog: ArtifactIdentity,
         grok_catalog: &CatalogSnapshot,
         generated_catalog: ArtifactIdentity,
+        native_route: ArtifactIdentity,
         managed_config: ArtifactIdentity,
         config_rollback: ConfigRollbackOwnership,
     ) -> Result<Self, PickerError> {
@@ -503,6 +512,8 @@ impl PickerManagedState {
             grok_catalog: AdmittedGrokCatalogState::from_snapshot(grok_catalog),
             generated_catalog,
             generated_catalog_rollback: GeneratedCatalogRollbackOwnership::RemoveIfIdentityMatches,
+            native_route,
+            native_route_rollback: NativeRouteRollbackOwnership::RemoveIfIdentityMatches,
             managed_config,
             config_rollback,
         };
@@ -534,6 +545,11 @@ impl PickerManagedState {
     }
 
     #[must_use]
+    pub fn native_route(&self) -> &ArtifactIdentity {
+        &self.native_route
+    }
+
+    #[must_use]
     pub fn managed_config(&self) -> &ArtifactIdentity {
         &self.managed_config
     }
@@ -552,11 +568,13 @@ impl PickerManagedState {
         self.native_catalog.validate()?;
         self.grok_catalog.validate()?;
         self.generated_catalog.validate()?;
+        self.native_route.validate()?;
         self.managed_config.validate()?;
 
         let paths = [
             self.native_catalog.path(),
             self.generated_catalog.path(),
+            self.native_route.path(),
             self.managed_config.path(),
         ];
         for (index, path) in paths.iter().enumerate() {
@@ -681,12 +699,11 @@ mod tests {
 
         assert_eq!(generated.native_model_count(), 1);
         assert_eq!(generated.grok_model_count(), 1);
-        let mut expected_native = before["models"][0].clone();
-        expected_native["model_provider"] = json!("openai");
-        assert_eq!(after["models"][0], expected_native);
+        assert_eq!(generated.native_model_slugs(), &["gpt-native"]);
+        assert_eq!(after["models"][0], before["models"][0]);
         assert_eq!(after["future_top_level"], before["future_top_level"]);
         assert_eq!(after["models"][1]["slug"], "grok-4.6");
-        assert_eq!(after["models"][1]["model_provider"], "grok_bridge");
+        assert!(after["models"][1].get("model_provider").is_none());
         assert_eq!(after["models"][1]["display_name"], "grok-4.6");
         assert_eq!(after["models"][1]["context_window"], Value::Null);
         assert_eq!(after["models"][1]["default_reasoning_level"], "high");
@@ -728,7 +745,7 @@ mod tests {
         std::fs::write(
             isolated_home.path().join("config.toml"),
             format!(
-                "model_catalog_json = {catalog_path}\n\n[model_providers.grok_bridge]\nname = \"Grok Bridge\"\nbase_url = \"http://127.0.0.1:9/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = false\nsupports_websockets = false\n"
+                "openai_base_url = \"http://127.0.0.1:9/v1\"\nmodel_catalog_json = {catalog_path}\n"
             ),
         )
         .unwrap();
@@ -750,7 +767,7 @@ mod tests {
             .iter()
             .find(|entry| entry["slug"] == "grok-4.6")
             .expect("Codex consumer output must retain the generated Grok row");
-        assert_eq!(grok_entry["model_provider"], "grok_bridge");
+        assert!(grok_entry.get("model_provider").is_none());
         assert_eq!(grok_entry["supports_parallel_tool_calls"], true);
     }
 
@@ -834,6 +851,7 @@ mod tests {
             identity("/opt/bridge/native-models.json", 100, 'a'),
             &grok,
             identity("/opt/bridge/generated-models.json", 200, 'b'),
+            identity("/opt/bridge/picker-native-route.json", 175, 'e'),
             identity("/Users/test/.codex/config.toml", 300, 'c'),
             ConfigRollbackOwnership::RestoreExactBackup {
                 backup: identity(
@@ -850,8 +868,8 @@ mod tests {
         let decoded = PickerManagedState::from_json(&encoded).unwrap();
         assert_eq!(decoded, state);
         let value: Value = serde_json::from_slice(&encoded).unwrap();
-        assert_eq!(value["version"], 1);
-        assert_eq!(value["policy_version"], 1);
+        assert_eq!(value["version"], 2);
+        assert_eq!(value["policy_version"], 2);
         assert_eq!(
             value["grok_catalog"]["models"],
             json!(["grok-4.6", "grok-4.7"])
@@ -861,6 +879,7 @@ mod tests {
             value["generated_catalog_rollback"],
             "remove_if_identity_matches"
         );
+        assert_eq!(value["native_route_rollback"], "remove_if_identity_matches");
         assert!(value.get("credential").is_none());
         assert!(value.get("capability").is_none());
     }

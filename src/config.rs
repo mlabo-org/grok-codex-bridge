@@ -108,6 +108,16 @@ impl GrokConfig {
     pub fn refresh_on_start(&self) -> bool {
         self.refresh_on_start
     }
+
+    /// Phase J publishes Native routing state beside the Grok catalog so the
+    /// runtime config remains a single source-owned V1 schema.
+    #[must_use]
+    pub fn native_route_file(&self) -> PathBuf {
+        self.catalog_cache_file
+            .parent()
+            .expect("validated absolute catalog path must have a parent")
+            .join("picker-native-route.json")
+    }
 }
 
 pub(crate) struct CapabilityToken(String);

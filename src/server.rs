@@ -1,15 +1,15 @@
-use std::io;
+use std::io::{self, Cursor, Read};
 use std::sync::Arc;
 
 use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::{Path, State};
-use axum::http::header::{CONTENT_TYPE, RETRY_AFTER};
-use axum::http::{HeaderValue, Request, StatusCode};
+use axum::http::header::{CONTENT_ENCODING, CONTENT_TYPE, RETRY_AFTER};
+use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::StreamExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 use tokio::net::TcpListener;
@@ -18,6 +18,9 @@ use crate::catalog::ModelCatalog;
 use crate::config::{CapabilityToken, RuntimeConfig};
 use crate::credential::{CredentialError, CredentialStore};
 use crate::grok::{GrokClient, GrokError, ResponsesTransportRequest};
+use crate::native::{
+    NativeClient, NativeError, NativeResponsesPath, NativeRouteState, is_hop_by_hop_response_header,
+};
 use crate::protocol::NormalizedResponsesRequest;
 
 const MAX_RESPONSES_BODY_BYTES: usize = 16 * 1024 * 1024;
@@ -29,6 +32,7 @@ struct ServiceState {
     capability: Arc<CapabilityToken>,
     catalog: ModelCatalog,
     responses: Option<Arc<ResponsesService>>,
+    native: Option<Arc<NativeService>>,
     responses_disabled: bool,
 }
 
@@ -48,13 +52,28 @@ pub fn build_router(config: RuntimeConfig, catalog: ModelCatalog) -> Router {
             }
         }
     };
-    build_router_with_responses(config, catalog, responses, responses_disabled)
+    let native = native_service(&config).unwrap_or_else(|error| {
+        tracing::error!(error_class = "native_route", %error, "Native route is unavailable");
+        None
+    });
+    build_router_with_services(config, catalog, responses, native, responses_disabled)
 }
 
+#[cfg(test)]
 fn build_router_with_responses(
     config: RuntimeConfig,
     catalog: ModelCatalog,
     responses_service: Option<Arc<ResponsesService>>,
+    responses_disabled: bool,
+) -> Router {
+    build_router_with_services(config, catalog, responses_service, None, responses_disabled)
+}
+
+fn build_router_with_services(
+    config: RuntimeConfig,
+    catalog: ModelCatalog,
+    responses_service: Option<Arc<ResponsesService>>,
+    native_service: Option<Arc<NativeService>>,
     responses_disabled: bool,
 ) -> Router {
     let (_, capability) = config.into_server_parts();
@@ -62,26 +81,35 @@ fn build_router_with_responses(
         capability: Arc::new(capability),
         catalog,
         responses: responses_service,
+        native: native_service,
         responses_disabled,
     };
 
     Router::new()
         .route("/_grok/{capability}/healthz", get(healthz))
         .route("/_grok/{capability}/v1/models", get(models))
-        .route("/_grok/{capability}/v1/responses", post(responses))
+        .route(
+            "/_grok/{capability}/v1/responses",
+            get(responses_websocket_not_supported).post(responses),
+        )
+        .route(
+            "/_grok/{capability}/v1/responses/compact",
+            post(responses_compact),
+        )
         .fallback(not_found)
         .with_state(state)
 }
 
 pub async fn serve(config: RuntimeConfig, catalog: ModelCatalog) -> Result<(), ServerError> {
     let bind = config.bind();
+    let native = native_service(&config).map_err(ServerError::NativeRoute)?;
     let responses_disabled = responses_disabled_from_environment();
     let responses = if responses_disabled {
         None
     } else {
         Some(Arc::new(ResponsesService::production()?))
     };
-    let router = build_router_with_responses(config, catalog, responses, responses_disabled);
+    let router = build_router_with_services(config, catalog, responses, native, responses_disabled);
     let listener = TcpListener::bind(bind).await.map_err(ServerError::Bind)?;
 
     tracing::info!(address = %bind, "loopback service started");
@@ -89,6 +117,14 @@ pub async fn serve(config: RuntimeConfig, catalog: ModelCatalog) -> Result<(), S
         .with_graceful_shutdown(shutdown_signal())
         .await
         .map_err(ServerError::Serve)
+}
+
+fn native_service(config: &RuntimeConfig) -> Result<Option<Arc<NativeService>>, NativeError> {
+    let Some(route) = NativeRouteState::load_if_present(&config.grok().native_route_file())? else {
+        return Ok(None);
+    };
+    let client = NativeClient::production(route.upstream())?;
+    Ok(Some(Arc::new(NativeService { route, client })))
 }
 
 async fn healthz(State(state): State<ServiceState>, Path(capability): Path<String>) -> Response {
@@ -120,20 +156,39 @@ async fn responses(
     Path(capability): Path<String>,
     request: Request<Body>,
 ) -> Response {
+    route_responses(state, capability, request, NativeResponsesPath::Responses).await
+}
+
+async fn responses_compact(
+    State(state): State<ServiceState>,
+    Path(capability): Path<String>,
+    request: Request<Body>,
+) -> Response {
+    route_responses(state, capability, request, NativeResponsesPath::Compact).await
+}
+
+async fn responses_websocket_not_supported(
+    State(state): State<ServiceState>,
+    Path(capability): Path<String>,
+) -> Response {
     if !state.capability.matches(&capability) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    if state.responses_disabled {
-        return route_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "bridge_disabled",
-            "server_error",
-            "bridge_disabled",
-            "Grok Responses routing is disabled",
-        );
+    StatusCode::UPGRADE_REQUIRED.into_response()
+}
+
+async fn route_responses(
+    state: ServiceState,
+    capability: String,
+    request: Request<Body>,
+    path: NativeResponsesPath,
+) -> Response {
+    if !state.capability.matches(&capability) {
+        return StatusCode::NOT_FOUND.into_response();
     }
 
-    let body = match to_bytes(request.into_body(), MAX_RESPONSES_BODY_BYTES).await {
+    let (parts, body) = request.into_parts();
+    let body = match to_bytes(body, MAX_RESPONSES_BODY_BYTES).await {
         Ok(body) => body,
         Err(_) => {
             return route_error(
@@ -145,7 +200,83 @@ async fn responses(
             );
         }
     };
-    let value: Value = match serde_json::from_slice(&body) {
+    let decoded = match decode_request_copy(&parts.headers, &body) {
+        Ok(decoded) => decoded,
+        Err(()) => {
+            return route_error(
+                StatusCode::BAD_REQUEST,
+                "request_encoding",
+                "invalid_request_error",
+                "request_body_invalid",
+                "Responses request body encoding is invalid or unsupported",
+            );
+        }
+    };
+    let envelope: RouteEnvelope = match serde_json::from_slice(&decoded) {
+        Ok(envelope) => envelope,
+        Err(_) => {
+            return route_error(
+                StatusCode::BAD_REQUEST,
+                "request_json",
+                "invalid_request_error",
+                "invalid_json",
+                "Responses request body must be valid JSON with a model",
+            );
+        }
+    };
+    let is_grok = state.catalog.contains(&envelope.model).await;
+    let is_native = state
+        .native
+        .as_ref()
+        .is_some_and(|native| native.route.contains(&envelope.model));
+    match (is_native, is_grok) {
+        (true, false) => {
+            let native = state
+                .native
+                .expect("Native classifier requires a Native service");
+            return native_response(native, path, &parts.headers, body).await;
+        }
+        (true, true) => {
+            return route_error(
+                StatusCode::BAD_REQUEST,
+                "model_collision",
+                "invalid_request_error",
+                "model_route_ambiguous",
+                "Requested model collides across Native and Grok catalogs",
+            );
+        }
+        (false, false) => {
+            return route_error(
+                StatusCode::BAD_REQUEST,
+                "unknown_model",
+                "invalid_request_error",
+                "model_not_admitted",
+                "Requested model is not admitted by the current picker state",
+            );
+        }
+        (false, true) => {}
+    }
+
+    if path == NativeResponsesPath::Compact {
+        return route_error(
+            StatusCode::BAD_REQUEST,
+            "grok_compaction",
+            "invalid_request_error",
+            "unsupported_request",
+            "Grok upstream does not expose an authoritative Responses compact contract",
+        );
+    }
+    if state.responses_disabled {
+        return route_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "bridge_disabled",
+            "server_error",
+            "bridge_disabled",
+            "Grok Responses routing is disabled",
+        );
+    }
+
+    let value: Value = match serde_json::from_slice(&decoded) {
         Ok(value) => value,
         Err(_) => {
             return route_error(
@@ -195,16 +326,6 @@ async fn responses(
             );
         }
     };
-    if !state.catalog.contains(normalized.model()).await {
-        return route_error(
-            StatusCode::BAD_REQUEST,
-            "unknown_model",
-            "invalid_request_error",
-            "model_not_admitted",
-            "Requested model is not admitted by the current Grok catalog",
-        );
-    }
-
     let Some(service) = state.responses else {
         return route_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -280,6 +401,66 @@ async fn responses(
     response
 }
 
+async fn native_response(
+    service: Arc<NativeService>,
+    path: NativeResponsesPath,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Response {
+    let upstream = match service.client.post(path, headers, body).await {
+        Ok(response) => response,
+        Err(_) => {
+            return route_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "native_transport",
+                "server_error",
+                "native_upstream_unavailable",
+                "Native Codex Responses upstream is unavailable",
+            );
+        }
+    };
+    let status = upstream.status();
+    let headers = upstream.headers().clone();
+    let stream = upstream
+        .bytes_stream()
+        .map(|chunk| chunk.map_err(io::Error::other));
+    let mut response = Body::from_stream(stream).into_response();
+    *response.status_mut() = status;
+    for (name, value) in &headers {
+        if !is_hop_by_hop_response_header(name) {
+            response.headers_mut().append(name.clone(), value.clone());
+        }
+    }
+    response
+}
+
+fn decode_request_copy(headers: &HeaderMap, raw: &[u8]) -> Result<Vec<u8>, ()> {
+    let Some(encoding) = headers.get(CONTENT_ENCODING) else {
+        return Ok(raw.to_vec());
+    };
+    match encoding.to_str().map_err(|_| ())?.trim() {
+        "identity" => Ok(raw.to_vec()),
+        "zstd" => {
+            let decoder = zstd::stream::read::Decoder::new(Cursor::new(raw)).map_err(|_| ())?;
+            let mut decoded = Vec::new();
+            decoder
+                .take((MAX_RESPONSES_BODY_BYTES + 1) as u64)
+                .read_to_end(&mut decoded)
+                .map_err(|_| ())?;
+            if decoded.len() > MAX_RESPONSES_BODY_BYTES {
+                return Err(());
+            }
+            Ok(decoded)
+        }
+        _ => Err(()),
+    }
+}
+
+#[derive(Deserialize)]
+struct RouteEnvelope {
+    model: String,
+}
+
 fn stream_error_class(error: &GrokError) -> &'static str {
     match error {
         GrokError::Protocol(_) => "upstream_stream_protocol",
@@ -317,6 +498,12 @@ fn responses_disabled_from_environment() -> bool {
 struct ResponsesService {
     credentials: Arc<CredentialStore>,
     client: GrokClient,
+}
+
+#[derive(Clone)]
+struct NativeService {
+    route: NativeRouteState,
+    client: NativeClient,
 }
 
 impl ResponsesService {
@@ -476,6 +663,8 @@ pub enum ServerError {
     CredentialSource(#[source] CredentialError),
     #[error("failed to construct the origin-locked Grok client")]
     UpstreamClient(#[source] GrokError),
+    #[error("failed to load or construct the Native Codex route")]
+    NativeRoute(#[source] NativeError),
     #[error("failed to bind loopback service")]
     Bind(#[source] std::io::Error),
     #[error("loopback service failed")]
@@ -487,6 +676,7 @@ impl ServerError {
         match self {
             Self::CredentialSource(_) => "credential_source",
             Self::UpstreamClient(_) => "upstream_client",
+            Self::NativeRoute(_) => "native_route",
             Self::Bind(_) => "bind",
             Self::Serve(_) => "serve",
         }
@@ -578,6 +768,23 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    async fn send_with_headers(
+        app: Router,
+        capability: &str,
+        headers: &[(&str, &str)],
+        body: impl Into<Body>,
+    ) -> Response {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(format!("/_grok/{capability}/v1/responses"));
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        app.oneshot(builder.body(body.into()).unwrap())
+            .await
+            .unwrap()
     }
 
     fn test_app(
@@ -697,6 +904,120 @@ mod tests {
         (client, state, task)
     }
 
+    struct NativeMockState {
+        hits: AtomicUsize,
+        observed: Mutex<Vec<(HeaderMap, Vec<u8>)>>,
+        response: Vec<u8>,
+    }
+
+    async fn mock_native_responses(
+        AxumState(state): AxumState<Arc<NativeMockState>>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Response {
+        state.hits.fetch_add(1, Ordering::SeqCst);
+        state
+            .observed
+            .lock()
+            .unwrap()
+            .push((headers, body.to_vec()));
+        let mut response = Body::from(state.response.clone()).into_response();
+        response.headers_mut().insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream; charset=utf-8"),
+        );
+        response
+            .headers_mut()
+            .insert("x-native-proof", HeaderValue::from_static("raw"));
+        response
+    }
+
+    async fn start_native_mock() -> (NativeClient, Arc<NativeMockState>, JoinHandle<()>) {
+        let response = b"event: response.created\ndata: {\"type\":\"response.created\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\"}\n\n".to_vec();
+        let state = Arc::new(NativeMockState {
+            hits: AtomicUsize::new(0),
+            observed: Mutex::new(Vec::new()),
+            response,
+        });
+        let router = Router::new()
+            .route(
+                "/backend-api/codex/responses",
+                upstream_post(mock_native_responses),
+            )
+            .with_state(Arc::clone(&state));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let client = NativeClient::for_test(
+            Url::parse(&format!("http://{address}/backend-api/codex/")).unwrap(),
+        )
+        .unwrap();
+        (client, state, task)
+    }
+
+    #[tokio::test]
+    async fn native_route_preserves_compressed_request_auth_and_sse_bytes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (client, mock, task) = start_native_mock().await;
+        let route = NativeRouteState::new(
+            crate::native::NativeUpstream::ChatgptCodex,
+            ["gpt-native".to_owned()],
+        )
+        .unwrap();
+        let app = build_router_with_services(
+            runtime_config(temporary.path()),
+            ModelCatalog::bootstrap().unwrap(),
+            None,
+            Some(Arc::new(NativeService { route, client })),
+            true,
+        );
+        let raw = br#"{ "future": {"opaque":true}, "model" : "gpt-native", "input":[] }"#;
+        let compressed = zstd::stream::encode_all(Cursor::new(raw), 3).unwrap();
+
+        let response = send_with_headers(
+            app.clone(),
+            TOKEN,
+            &[
+                ("content-encoding", "zstd"),
+                ("content-type", "application/json"),
+                ("authorization", "Bearer native-caller-secret"),
+                ("chatgpt-account-id", "native-account"),
+                ("x-codex-turn-metadata", "opaque-metadata"),
+            ],
+            compressed.clone(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-native-proof"], "raw");
+        let response_body = to_bytes(response.into_body(), 4096).await.unwrap();
+        assert_eq!(response_body.as_ref(), mock.response.as_slice());
+        assert_eq!(mock.hits.load(Ordering::SeqCst), 1);
+        let observed = mock.observed.lock().unwrap();
+        let (headers, upstream_body) = &observed[0];
+        assert_eq!(upstream_body, &compressed);
+        assert_eq!(headers[CONTENT_ENCODING], "zstd");
+        assert_eq!(headers["authorization"], "Bearer native-caller-secret");
+        assert_eq!(headers["chatgpt-account-id"], "native-account");
+        assert_eq!(headers["x-codex-turn-metadata"], "opaque-metadata");
+        assert!(headers.get("x-grok-model-override").is_none());
+        drop(observed);
+
+        let websocket = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/_grok/{TOKEN}/v1/responses"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(websocket.status(), StatusCode::UPGRADE_REQUIRED);
+        task.abort();
+    }
+
     #[tokio::test]
     async fn health_models_and_wrong_capability_do_not_read_credentials_or_hit_upstream() {
         let temporary = tempfile::tempdir().unwrap();
@@ -812,7 +1133,16 @@ mod tests {
             client,
         );
 
-        let response = send(app, TOKEN, request_body("grok-4.6").to_string()).await;
+        let response = send_with_headers(
+            app,
+            TOKEN,
+            &[
+                ("authorization", "Bearer native-caller-secret"),
+                ("chatgpt-account-id", "native-account"),
+            ],
+            request_body("grok-4.6").to_string(),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response.headers()[CONTENT_TYPE],
@@ -827,6 +1157,7 @@ mod tests {
         let observed = mock.observed.lock().unwrap();
         let (headers, upstream_body) = &observed[0];
         assert_eq!(headers["authorization"], "Bearer mock-session-secret");
+        assert!(headers.get("chatgpt-account-id").is_none());
         assert_eq!(headers["x-grok-model-override"], "grok-4.6");
         assert_eq!(headers["x-grok-conv-id"], headers["x-grok-session-id"]);
         assert_eq!(
