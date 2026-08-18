@@ -14,8 +14,9 @@ use grok_codex_bridge::launchd::{
 };
 use grok_codex_bridge::lifecycle::{
     AuthAvailability, DoctorCheckStatus, DoctorRequest, InstallRequest, UninstallRequest,
-    PickerInstallRequest, auth_status, doctor, install, install_picker, uninstall, uninstall_picker,
+    PickerInstallRequest, auth_status, doctor, install, uninstall, uninstall_picker,
 };
+use grok_codex_bridge::picker_activation::{PickerActivationRequest, activate_picker};
 use grok_codex_bridge::{
     CatalogCache, CatalogCommand, CatalogSnapshot, Cli, Command, CredentialStore, GrokClient,
     GrokConfig, ModelCatalog, NativeUpstream, RuntimeConfig, serve,
@@ -104,16 +105,21 @@ fn picker_install_command(arguments: PickerInstallArgs) -> Result<ExitCode, Oper
     let native_catalog_path = require_absolute(arguments.native_catalog, "native catalog")?;
     let bind = arguments.bind.parse::<SocketAddr>().map_err(|_| OperationError::InvalidBind)?;
     let native_upstream = NativeUpstream::parse_base_url(&arguments.native_upstream_base_url)?;
-    let receipt = install_picker(&PickerInstallRequest {
-        install_root: paths.install_root,
-        codex_home: paths.codex_home,
-        native_catalog_path,
-        native_upstream,
-        bind,
+    let launch_agent = recommended_launch_agent(&paths.install_root)?;
+    let receipt = activate_picker(&PickerActivationRequest {
+        picker: PickerInstallRequest {
+            install_root: paths.install_root,
+            codex_home: paths.codex_home,
+            native_catalog_path,
+            native_upstream,
+            bind,
+        },
+        launch_agent,
+        launch_agent_path: paths.launch_agent,
     })?;
     println!(
         "picker state: generated {} native and {} admitted Grok models",
-        receipt.native_model_count, receipt.grok_model_count
+        receipt.picker.native_model_count, receipt.picker.grok_model_count
     );
     println!(
         "restart required: start a fresh Codex CLI process or fully relaunch Desktop after bridge publication"
@@ -559,4 +565,6 @@ enum OperationError {
     Credential(#[from] grok_codex_bridge::CredentialError),
     #[error(transparent)]
     Native(#[from] grok_codex_bridge::native::NativeError),
+    #[error(transparent)]
+    PickerActivation(#[from] grok_codex_bridge::picker_activation::PickerActivationError),
 }

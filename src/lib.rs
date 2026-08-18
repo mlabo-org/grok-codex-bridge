@@ -7,6 +7,7 @@ pub mod launchd;
 pub mod lifecycle;
 pub mod native;
 pub mod picker;
+pub mod picker_activation;
 pub mod protocol;
 pub mod server;
 
