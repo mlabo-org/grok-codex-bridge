@@ -40,6 +40,11 @@ pub enum Command {
         #[command(subcommand)]
         command: ServiceCommand,
     },
+    /// Prepare or remove the Phase J provider-aware picker state.
+    Picker {
+        #[command(subcommand)]
+        command: PickerCommand,
+    },
     /// Stop the service and restore only manifest-owned install changes.
     Uninstall(LifecyclePathArgs),
     /// Report source/runtime capability without probing credentials or network.
@@ -109,6 +114,26 @@ pub enum ServiceCommand {
     Uninstall(ServicePathArgs),
     /// Report the installed user LaunchAgent state.
     Status(ServicePathArgs),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PickerCommand {
+    /// Generate the provider-aware catalog and atomically publish the managed base-config block.
+    Install(PickerInstallArgs),
+    /// Restore the exact pre-picker base configuration and remove generated picker state.
+    Uninstall(LifecyclePathArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct PickerInstallArgs {
+    #[command(flatten)]
+    pub paths: LifecyclePathArgs,
+    /// Current authoritative native Codex catalog JSON to copy into bridge-owned state.
+    #[arg(long, value_name = "FILE")]
+    pub native_catalog: PathBuf,
+    /// Loopback address used by the installed bridge provider.
+    #[arg(long, default_value = "127.0.0.1:8746", value_name = "ADDRESS")]
+    pub bind: String,
 }
 
 #[derive(Debug, Clone, Args)]

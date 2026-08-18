@@ -5,7 +5,8 @@ use std::process::ExitCode;
 
 use clap::{CommandFactory, Parser};
 use grok_codex_bridge::cli::{
-    AuthCommand, DoctorArgs, InstallArgs, LifecyclePathArgs, ServiceCommand, ServicePathArgs,
+    AuthCommand, DoctorArgs, InstallArgs, LifecyclePathArgs, PickerCommand, PickerInstallArgs,
+    ServiceCommand, ServicePathArgs,
 };
 use grok_codex_bridge::launchd::{
     LaunchAgentSpec, RECOMMENDED_LAUNCH_AGENT_LABEL, ServiceStatus, ServiceUninstallOutcome,
@@ -13,7 +14,7 @@ use grok_codex_bridge::launchd::{
 };
 use grok_codex_bridge::lifecycle::{
     AuthAvailability, DoctorCheckStatus, DoctorRequest, InstallRequest, UninstallRequest,
-    auth_status, doctor, install, uninstall,
+    PickerInstallRequest, auth_status, doctor, install, install_picker, uninstall, uninstall_picker,
 };
 use grok_codex_bridge::{
     CatalogCache, CatalogCommand, CatalogSnapshot, Cli, Command, CredentialStore, GrokClient,
@@ -78,8 +79,42 @@ async fn main() -> ExitCode {
             command: AuthCommand::Status,
         }) => command_result(auth_status_command()),
         Some(Command::Service { command }) => command_result(service_command(command)),
+        Some(Command::Picker { command }) => command_result(picker_command(command)),
         Some(Command::Uninstall(arguments)) => command_result(uninstall_command(arguments)),
     }
+}
+
+fn picker_command(command: PickerCommand) -> Result<ExitCode, OperationError> {
+    match command {
+        PickerCommand::Install(arguments) => picker_install_command(arguments),
+        PickerCommand::Uninstall(arguments) => {
+            let paths = resolve_lifecycle_paths(&arguments)?;
+            let removed = uninstall_picker(&paths.install_root, &paths.codex_home)?;
+            println!(
+                "picker state: {}",
+                if removed { "removed; restart the accepted Codex CLI/Desktop runtime before relying on configuration" } else { "not installed" }
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
+fn picker_install_command(arguments: PickerInstallArgs) -> Result<ExitCode, OperationError> {
+    let paths = resolve_lifecycle_paths(&arguments.paths)?;
+    let native_catalog_path = require_absolute(arguments.native_catalog, "native catalog")?;
+    let bind = arguments.bind.parse::<SocketAddr>().map_err(|_| OperationError::InvalidBind)?;
+    let receipt = install_picker(&PickerInstallRequest {
+        install_root: paths.install_root,
+        codex_home: paths.codex_home,
+        native_catalog_path,
+        bind,
+    })?;
+    println!(
+        "picker state: generated {} native and {} admitted Grok models",
+        receipt.native_model_count, receipt.grok_model_count
+    );
+    println!("restart required: use the accepted combined Codex binary and a fresh CLI process or full Desktop relaunch");
+    Ok(ExitCode::SUCCESS)
 }
 
 fn command_result(result: Result<ExitCode, OperationError>) -> ExitCode {
