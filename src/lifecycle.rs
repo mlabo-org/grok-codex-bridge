@@ -752,13 +752,11 @@ fn prepare_picker_config(
                 || parsed.get("model_catalog_json").is_some()
                 || parsed.get("openai_base_url").is_some()
                 || parsed.get("model_provider").is_some()
-                || parsed
-                    .get("model_providers")
-                    .is_some_and(|providers| {
-                        providers
-                            .as_table()
-                            .is_none_or(|providers| providers.contains_key(PICKER_PROVIDER_ID))
-                    })
+                || parsed.get("model_providers").is_some_and(|providers| {
+                    providers
+                        .as_table()
+                        .is_none_or(|providers| providers.contains_key(PICKER_PROVIDER_ID))
+                })
             {
                 return Err(LifecycleError::PickerConfigConflict);
             }
@@ -798,7 +796,7 @@ fn render_picker_config(
     let generated_catalog = path_text(generated_catalog)?;
     let base_url = format!("http://{bind}/v1");
     let block = format!(
-        "{PICKER_BEGIN}\nmodel_provider = {PICKER_PROVIDER_ID:?}\nmodel_catalog_json = {generated_catalog:?}\n\n[model_providers.{PICKER_PROVIDER_ID}]\nname = {PICKER_PROVIDER_NAME:?}\nbase_url = {base_url:?}\nhttp_headers = {{ {PICKER_CALLER_HEADER:?} = {capability:?} }}\nwire_api = \"responses\"\nrequires_openai_auth = true\nsupports_websockets = false\n{PICKER_END}\n"
+        "{PICKER_BEGIN}\nmodel_provider = {PICKER_PROVIDER_ID:?}\nmodel_catalog_json = {generated_catalog:?}\n\n[model_providers.{PICKER_PROVIDER_ID}]\nname = {PICKER_PROVIDER_NAME:?}\nbase_url = {base_url:?}\nhttp_headers = {{ {PICKER_CALLER_HEADER:?} = {capability:?} }}\nwire_api = \"responses\"\nrequires_openai_auth = true\nsupports_websockets = false\nrequest_max_retries = 0\nstream_max_retries = 0\n{PICKER_END}\n"
     );
     let markers = picker_marker_count(source);
     if markers > 1 {
@@ -2162,6 +2160,8 @@ mod tests {
         assert_eq!(provider["wire_api"].as_str(), Some("responses"));
         assert_eq!(provider["requires_openai_auth"].as_bool(), Some(true));
         assert_eq!(provider["supports_websockets"].as_bool(), Some(false));
+        assert_eq!(provider["request_max_retries"].as_integer(), Some(0));
+        assert_eq!(provider["stream_max_retries"].as_integer(), Some(0));
         assert!(managed.ends_with("[features]\nfuture = true\n"));
         assert_eq!(mode(&config), 0o600);
 
@@ -2207,7 +2207,12 @@ mod tests {
             });
             assert!(matches!(result, Err(LifecycleError::PickerConfigConflict)));
             assert_eq!(fs::read_to_string(&config).unwrap(), conflict);
-            assert!(!fixture.install_root.join("state/picker-models.json").exists());
+            assert!(
+                !fixture
+                    .install_root
+                    .join("state/picker-models.json")
+                    .exists()
+            );
             assert!(
                 !fixture
                     .install_root
