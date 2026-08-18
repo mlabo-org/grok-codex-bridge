@@ -4,7 +4,7 @@ Status: `READY_TO_CONTINUE`
 
 ## Project
 
-- source repo: `/Users/suzukimakoto/Desktop/git/current-work/codex-infrastructure/grok-codex-bridge`
+- source repo: the [repository root](..)
 - product: standalone native Rust provider bridge, not a Codex plugin
 - goal: use Grok as the inference model while retaining the Codex Harness as the agent body
 - intended future publication: GitHub, after the implementation is proven useful
@@ -84,4 +84,3 @@ V1.1 native picker, GPT passthrough, merged catalog, and aliases are deliberatel
 ## Working-tree state
 
 The repository is intentionally uncommitted. All source files are new. `.CAO/`, `target/`, and `dist/` are local ignored state/artifacts. Preserve them during continuation; do not stage `.CAO`, build caches, materialized binaries, secrets, or user-specific runtime files.
-

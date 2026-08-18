@@ -4,7 +4,7 @@ Status: `READY_FOR_NEW_ROOT_TASK`
 
 ## Why this is a new CAO task
 
-The completed V1.0 state is bound to task `grok-codex-bridge-v1-0`, epoch `e1`, and root thread `01a01388-ebbf-7422-b192-69689195b9bc`. Its scope explicitly excludes V1.1 and its handoff is finalized. Do not reopen, overwrite, or rebind it for Phase H-J.
+The completed V1.0 state is bound to task `grok-codex-bridge-v1-0`, epoch `e1`, and a finalized root thread retained only in local runtime state. Its scope explicitly excludes V1.1 and its handoff is finalized. Do not reopen, overwrite, or rebind it for Phase H-J.
 
 V1.1 starts in a separate Codex task with a new CAO identity:
 
@@ -28,4 +28,3 @@ V1.1 starts in a separate Codex task with a new CAO identity:
 6. `README.md`, `Cargo.toml`, current source, current materialized/installed runtime state, and one current dirty-state check.
 
 After the new `intake`, read CAO `context`, record the decisions and progress items named in the V1.1 brief, and open only R0. Do not begin Phase H source edits until R0 has resolved the shared-or-separate CLI/Desktop producer and the native GPT routing decision.
-

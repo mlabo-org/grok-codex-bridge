@@ -857,10 +857,10 @@ mod tests {
             &grok,
             identity("/opt/bridge/generated-models.json", 200, 'b'),
             identity("/opt/bridge/picker-native-route.json", 175, 'e'),
-            identity("/Users/test/.codex/config.toml", 300, 'c'),
+            identity("/private/tmp/grok-codex-bridge-test/config.toml", 300, 'c'),
             ConfigRollbackOwnership::RestoreExactBackup {
                 backup: identity(
-                    "/Users/test/.codex/config.toml.grok-codex-bridge-backup-20260818",
+                    "/private/tmp/grok-codex-bridge-test/config.toml.grok-codex-bridge-backup-20260818",
                     250,
                     'd',
                 ),

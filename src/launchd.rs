@@ -593,10 +593,10 @@ mod tests {
 
     fn spec() -> LaunchAgentSpec {
         LaunchAgentSpec::recommended(
-            "/Users/test/Library/Application Support/Grok Codex Bridge/bin/grok-codex-bridge",
-            "/Users/test/Library/Application Support/Grok Codex Bridge/bridge.toml",
-            "/Users/test/Library/Logs/Grok Codex Bridge/stdout.log",
-            "/Users/test/Library/Logs/Grok Codex Bridge/stderr.log",
+            "/private/tmp/grok-codex-bridge-test/bin/grok-codex-bridge",
+            "/private/tmp/grok-codex-bridge-test/bridge.toml",
+            "/private/tmp/grok-codex-bridge-test/logs/stdout.log",
+            "/private/tmp/grok-codex-bridge-test/logs/stderr.log",
         )
         .unwrap()
     }
@@ -638,10 +638,10 @@ mod tests {
     fn plist_is_deterministic_escaped_and_uses_only_the_direct_binary() {
         let spec = LaunchAgentSpec::new(
             "com.local.grok-codex-bridge",
-            "/Users/A&B/Bridge/grok-codex-bridge",
-            "/Users/A&B/Bridge/config<safe>.toml",
-            "/Users/A&B/Logs/stdout\"one.log",
-            "/Users/A&B/Logs/stderr'one.log",
+            "/private/tmp/A&B/Bridge/grok-codex-bridge",
+            "/private/tmp/A&B/Bridge/config<safe>.toml",
+            "/private/tmp/A&B/Logs/stdout\"one.log",
+            "/private/tmp/A&B/Logs/stderr'one.log",
         )
         .unwrap();
 
@@ -653,10 +653,10 @@ mod tests {
   <string>com.local.grok-codex-bridge</string>\n\
   <key>ProgramArguments</key>\n\
   <array>\n\
-    <string>/Users/A&amp;B/Bridge/grok-codex-bridge</string>\n\
+    <string>/private/tmp/A&amp;B/Bridge/grok-codex-bridge</string>\n\
     <string>run</string>\n\
     <string>--config</string>\n\
-    <string>/Users/A&amp;B/Bridge/config&lt;safe&gt;.toml</string>\n\
+    <string>/private/tmp/A&amp;B/Bridge/config&lt;safe&gt;.toml</string>\n\
   </array>\n\
   <key>RunAtLoad</key>\n\
   <true/>\n\
@@ -665,9 +665,9 @@ mod tests {
   <key>ProcessType</key>\n\
   <string>Background</string>\n\
   <key>StandardOutPath</key>\n\
-  <string>/Users/A&amp;B/Logs/stdout&quot;one.log</string>\n\
+  <string>/private/tmp/A&amp;B/Logs/stdout&quot;one.log</string>\n\
   <key>StandardErrorPath</key>\n\
-  <string>/Users/A&amp;B/Logs/stderr&apos;one.log</string>\n\
+  <string>/private/tmp/A&amp;B/Logs/stderr&apos;one.log</string>\n\
   <key>EnvironmentVariables</key>\n\
   <dict>\n\
     <key>RUST_LOG</key>\n\
