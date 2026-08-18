@@ -2184,11 +2184,57 @@ impl ValidatedTextStreamEvent {
         self.original
     }
 
+    /// Project one validated Grok event onto the Codex-facing Responses
+    /// boundary without exposing provider-bound encrypted reasoning state.
+    ///
+    /// OpenAI-compatible reasoning ciphertext is not portable across
+    /// providers. Codex persists completed reasoning items and may replay them
+    /// after a model-picker change, so forwarding Grok's opaque blob would
+    /// make a later native GPT request fail verification. The reasoning item,
+    /// summary, content, identity, and stream ordering remain intact; only the
+    /// non-portable ciphertext becomes the schema-supported `null` value.
+    pub fn into_codex_value(mut self) -> Value {
+        clear_provider_bound_reasoning(&mut self.original);
+        self.original
+    }
+
     pub(crate) fn restore_namespaced_tool_calls(
         &mut self,
         namespace_projection: &NamespaceToolProjection,
     ) {
         namespace_projection.restore_response_event(&mut self.original);
+    }
+}
+
+fn clear_provider_bound_reasoning(event: &mut Value) {
+    let Some(event) = event.as_object_mut() else {
+        return;
+    };
+    match event.get("type").and_then(Value::as_str) {
+        Some("response.output_item.done") => {
+            if let Some(item) = event.get_mut("item").and_then(Value::as_object_mut) {
+                clear_reasoning_ciphertext(item);
+            }
+        }
+        Some("response.completed") => {
+            if let Some(output) = event
+                .get_mut("response")
+                .and_then(Value::as_object_mut)
+                .and_then(|response| response.get_mut("output"))
+                .and_then(Value::as_array_mut)
+            {
+                for item in output.iter_mut().filter_map(Value::as_object_mut) {
+                    clear_reasoning_ciphertext(item);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn clear_reasoning_ciphertext(item: &mut Map<String, Value>) {
+    if item.get("type").and_then(Value::as_str) == Some("reasoning") {
+        item.insert("encrypted_content".into(), Value::Null);
     }
 }
 

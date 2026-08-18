@@ -468,7 +468,7 @@ async fn route_authorized_responses(
     tracing::debug!(route = "responses", status = 200_u16, "request accepted");
     let stream = upstream.validated_text_events().map(|result| match result {
         Ok(event) => {
-            let original = event.into_original();
+            let original = event.into_codex_value();
             let event_type = original
                 .get("type")
                 .and_then(Value::as_str)
@@ -924,6 +924,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum MockReply {
         Valid,
+        Reasoning,
         Unauthorized,
         RateLimited,
         Unavailable,
@@ -945,6 +946,7 @@ mod tests {
         state.observed.lock().unwrap().push((headers, body));
         match state.reply {
             MockReply::Valid => sse_response(valid_text_events()),
+            MockReply::Reasoning => sse_response(valid_reasoning_events()),
             MockReply::Unauthorized => StatusCode::UNAUTHORIZED.into_response(),
             MockReply::RateLimited => (
                 StatusCode::TOO_MANY_REQUESTS,
@@ -996,6 +998,29 @@ mod tests {
             json!({"type":"response.content_part.done","sequence_number":5,"item_id":"msg_1","output_index":0,"content_index":0,"part":{"type":"output_text","text":"ok","annotations":[]}}),
             json!({"type":"response.output_item.done","sequence_number":6,"output_index":0,"item":item_done.clone()}),
             json!({"type":"response.completed","sequence_number":7,"response":{"id":"resp_1","output":[item_done]}}),
+        ]
+        .into_iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect()
+    }
+
+    fn valid_reasoning_events() -> String {
+        let reasoning_done = json!({
+            "type": "reasoning",
+            "id": "reasoning_1",
+            "summary": [{"type": "summary_text", "text": "Plan."}],
+            "encrypted_content": "provider-bound-ciphertext",
+            "status": "completed"
+        });
+        [
+            json!({"type":"response.created","sequence_number":0,"response":{"id":"resp_1","output":[]}}),
+            json!({"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"type":"reasoning","id":"reasoning_1","summary":[],"status":"in_progress"}}),
+            json!({"type":"response.reasoning_summary_part.added","sequence_number":2,"item_id":"reasoning_1","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":""}}),
+            json!({"type":"response.reasoning_summary_text.delta","sequence_number":3,"item_id":"reasoning_1","output_index":0,"summary_index":0,"delta":"Plan."}),
+            json!({"type":"response.reasoning_summary_text.done","sequence_number":4,"item_id":"reasoning_1","output_index":0,"summary_index":0,"text":"Plan."}),
+            json!({"type":"response.reasoning_summary_part.done","sequence_number":5,"item_id":"reasoning_1","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":"Plan."}}),
+            json!({"type":"response.output_item.done","sequence_number":6,"output_index":0,"item":reasoning_done.clone()}),
+            json!({"type":"response.completed","sequence_number":7,"response":{"id":"resp_1","output":[reasoning_done]}}),
         ]
         .into_iter()
         .map(|event| format!("data: {event}\n\n"))
@@ -1297,6 +1322,42 @@ mod tests {
             .remove("client_metadata");
         assert_eq!(upstream_body, &expected_upstream);
         drop(observed);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn grok_reasoning_ciphertext_does_not_cross_the_codex_boundary() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (client, mock, task) = start_mock(MockReply::Reasoning).await;
+        let app = test_app(
+            runtime_config(temporary.path()),
+            ModelCatalog::bootstrap().unwrap(),
+            CredentialStore::new(write_auth(temporary.path())).unwrap(),
+            client,
+        );
+
+        let response = send(app, TOKEN, request_body("grok-4.6").to_string()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(!body.contains("provider-bound-ciphertext"));
+
+        let events = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|data| serde_json::from_str::<Value>(data).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 8);
+        assert_eq!(events[6]["item"]["type"], "reasoning");
+        assert_eq!(events[6]["item"]["summary"][0]["text"], "Plan.");
+        assert!(events[6]["item"]["encrypted_content"].is_null());
+        assert_eq!(events[7]["response"]["output"][0]["type"], "reasoning");
+        assert_eq!(
+            events[7]["response"]["output"][0]["summary"][0]["text"],
+            "Plan."
+        );
+        assert!(events[7]["response"]["output"][0]["encrypted_content"].is_null());
+        assert_eq!(mock.hits.load(Ordering::SeqCst), 1);
         task.abort();
     }
 
