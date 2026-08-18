@@ -1325,8 +1325,7 @@ mod tests {
         to_bytes(legacy.into_body(), 64 * 1024).await.unwrap();
 
         let missing =
-            send_picker_with_headers(app.clone(), &[], request_body("grok-4.6").to_string())
-                .await;
+            send_picker_with_headers(app.clone(), &[], request_body("grok-4.6").to_string()).await;
         assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
 
         let wrong = send_picker_with_headers(
