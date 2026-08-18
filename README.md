@@ -18,7 +18,9 @@ cd grok-codex-bridge
 codex
 ```
 
-Then give Codex this request:
+Then choose one of the following requests.
+
+### Install the isolated V1.0 profile
 
 ```text
 Read AGENTS.md completely and follow it. Build and install the isolated V1.0
@@ -31,7 +33,28 @@ Stop and explain the missing boundary if this is not Apple Silicon macOS or a
 required authoritative input cannot be verified.
 ```
 
-This prompt deliberately selects the isolated V1.0 route. Enabling the merged V1.1 picker is a separate, explicit operation because it changes the active Codex model catalog and requires verified Native Codex inputs.
+### Install through the experimental V1.1 merged picker
+
+Use this request when you want Codex to complete the build, isolated installation, and merged Native GPT/Grok picker activation in one job:
+
+```text
+Read AGENTS.md completely and follow it. On this Mac, build and install the V1.0
+isolated grok-bridge profile, then continue through the experimental V1.1 merged
+Native GPT/Grok picker activation in the same job. Before picker activation,
+identify the current authoritative Native Codex catalog and the exact effective
+first-party Responses upstream without reading, copying, or printing credentials.
+Use ./scripts/materialize-macos.sh and only the repository-owned native lifecycle
+commands. Preserve existing changes and the exact rollback boundary. Verify the
+installed service, merged native/Grok catalog, and 272,000-token Grok context
+metadata with the minimum primary-path checks. Do not guess either Native Codex
+input, patch the Codex binary, edit Codex configuration, Grok authentication, or
+LaunchAgent files directly, or commit, push, or publish. If an authoritative input
+cannot be verified, stop before picker activation and explain what is missing. On
+success, report the required fresh CLI/Desktop restart and exact picker rollback
+command.
+```
+
+This route automates every repository-owned V1.1 installation step. A fresh Codex CLI process or full Desktop relaunch remains necessary after activation so Codex loads the published catalog and provider state.
 
 ## Acknowledgements
 
