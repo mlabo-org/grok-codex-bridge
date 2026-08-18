@@ -22,7 +22,7 @@ use crate::lifecycle::PICKER_CALLER_HEADER;
 use crate::native::{
     NativeClient, NativeError, NativeResponsesPath, NativeRouteState, is_hop_by_hop_response_header,
 };
-use crate::protocol::NormalizedResponsesRequest;
+use crate::protocol::{NormalizedResponsesRequest, remove_unreplayable_reasoning_for_native};
 
 const MAX_RESPONSES_BODY_BYTES: usize = 16 * 1024 * 1024;
 const DISABLE_ENVIRONMENT_VARIABLE: &str = "GROK_CODEX_BRIDGE_DISABLE";
@@ -323,6 +323,18 @@ async fn route_authorized_responses(
             let native = state
                 .native
                 .expect("Native classifier requires a Native service");
+            let body = match native_request_body(path, &parts.headers, body, &decoded) {
+                Ok(body) => body,
+                Err(()) => {
+                    return route_error(
+                        StatusCode::BAD_REQUEST,
+                        "request_encoding",
+                        "invalid_request_error",
+                        "request_body_invalid",
+                        "Responses request body encoding is invalid or unsupported",
+                    );
+                }
+            };
             return native_response(native, path, &parts.headers, body).await;
         }
         (true, true) => {
@@ -543,6 +555,33 @@ fn decode_request_copy(headers: &HeaderMap, raw: &[u8]) -> Result<Vec<u8>, ()> {
         }
         _ => Err(()),
     }
+}
+
+fn native_request_body(
+    path: NativeResponsesPath,
+    headers: &HeaderMap,
+    original: Bytes,
+    decoded: &[u8],
+) -> Result<Bytes, ()> {
+    if path != NativeResponsesPath::Responses {
+        return Ok(original);
+    }
+    let mut request: Value = serde_json::from_slice(decoded).map_err(|_| ())?;
+    if !remove_unreplayable_reasoning_for_native(&mut request) {
+        return Ok(original);
+    }
+    let serialized = serde_json::to_vec(&request).map_err(|_| ())?;
+    let encoded = match headers
+        .get(CONTENT_ENCODING)
+        .map(|value| value.to_str().map(str::trim))
+        .transpose()
+        .map_err(|_| ())?
+    {
+        None | Some("identity") => serialized,
+        Some("zstd") => zstd::stream::encode_all(Cursor::new(serialized), 0).map_err(|_| ())?,
+        Some(_) => return Err(()),
+    };
+    Ok(Bytes::from(encoded))
 }
 
 #[derive(Deserialize)]
@@ -1326,7 +1365,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn grok_reasoning_ciphertext_does_not_cross_the_codex_boundary() {
+    async fn model_switch_marks_grok_reasoning_for_provider_safe_replay() {
         let temporary = tempfile::tempdir().unwrap();
         let (client, mock, task) = start_mock(MockReply::Reasoning).await;
         let app = test_app(
@@ -1340,7 +1379,6 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
         let body = std::str::from_utf8(&body).unwrap();
-        assert!(!body.contains("provider-bound-ciphertext"));
 
         let events = body
             .lines()
@@ -1350,14 +1388,85 @@ mod tests {
         assert_eq!(events.len(), 8);
         assert_eq!(events[6]["item"]["type"], "reasoning");
         assert_eq!(events[6]["item"]["summary"][0]["text"], "Plan.");
-        assert!(events[6]["item"]["encrypted_content"].is_null());
+        assert_eq!(
+            events[6]["item"]["encrypted_content"],
+            "grok-codex-bridge:v1:provider-bound-ciphertext"
+        );
         assert_eq!(events[7]["response"]["output"][0]["type"], "reasoning");
         assert_eq!(
             events[7]["response"]["output"][0]["summary"][0]["text"],
             "Plan."
         );
-        assert!(events[7]["response"]["output"][0]["encrypted_content"].is_null());
+        assert_eq!(
+            events[7]["response"]["output"][0]["encrypted_content"],
+            "grok-codex-bridge:v1:provider-bound-ciphertext"
+        );
         assert_eq!(mock.hits.load(Ordering::SeqCst), 1);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn model_switch_removes_grok_reasoning_before_native_gpt() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (client, mock, task) = start_native_mock().await;
+        let route = NativeRouteState::new(
+            crate::native::NativeUpstream::ChatgptCodex,
+            ["gpt-native".to_owned()],
+        )
+        .unwrap();
+        let app = build_router_with_services(
+            runtime_config(temporary.path()),
+            ModelCatalog::bootstrap().unwrap(),
+            None,
+            Some(Arc::new(NativeService { route, client })),
+            true,
+        );
+        let mut request = request_body("gpt-native");
+        request["input"] = json!([
+            {
+                "type": "reasoning", "id": "rs_grok",
+                "summary": [], "encrypted_content": "grok-codex-bridge:v1:grok-ciphertext"
+            },
+            {
+                "type": "reasoning", "id": "rs_legacy_grok",
+                "summary": [], "encrypted_content": null
+            },
+            {
+                "type": "reasoning", "id": "rs_native",
+                "summary": [], "encrypted_content": "native-gpt-ciphertext"
+            },
+            {
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "continue"}]
+            }
+        ]);
+        let compressed = zstd::stream::encode_all(Cursor::new(request.to_string()), 3).unwrap();
+
+        let response = send_with_headers(
+            app,
+            TOKEN,
+            &[
+                ("content-encoding", "zstd"),
+                ("content-type", "application/json"),
+                ("authorization", "Bearer native-caller-secret"),
+            ],
+            compressed,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let observed = mock.observed.lock().unwrap();
+        let (headers, upstream_body) = &observed[0];
+        assert_eq!(headers[CONTENT_ENCODING], "zstd");
+        let decoded = zstd::stream::decode_all(Cursor::new(upstream_body)).unwrap();
+        let upstream: Value = serde_json::from_slice(&decoded).unwrap();
+        assert_eq!(upstream["input"].as_array().unwrap().len(), 2);
+        assert_eq!(upstream["input"][0]["id"], "rs_native");
+        assert_eq!(
+            upstream["input"][0]["encrypted_content"],
+            "native-gpt-ciphertext"
+        );
+        assert_eq!(upstream["input"][1]["content"][0]["text"], "continue");
+        drop(observed);
         task.abort();
     }
 

@@ -28,6 +28,7 @@ const MAX_CLIENT_METADATA_TOTAL_VALUE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_REASONING_TEXT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ENCRYPTED_REASONING_BYTES: usize = 16 * 1024 * 1024;
 const MAX_REASONING_PARTS: usize = 64;
+const GROK_REASONING_ENVELOPE_PREFIX: &str = "grok-codex-bridge:v1:";
 const NAMESPACE_DELIMITER: &str = "__";
 const MAX_XAI_TOOLS: usize = 128;
 const INTERNAL_MESSAGE_METADATA_FIELD: &str = "internal_chat_message_metadata_passthrough";
@@ -168,7 +169,8 @@ enum PriorReasoningContent {
 #[derive(Debug, Clone, PartialEq)]
 enum PriorEncryptedContent {
     Null,
-    Opaque(String),
+    Grok(String),
+    Foreign(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -473,7 +475,12 @@ impl NormalizedResponsesRequest {
         }
         object.insert(
             "input".into(),
-            Value::Array(self.input.iter().map(InputItem::to_value).collect()),
+            Value::Array(
+                self.input
+                    .iter()
+                    .filter_map(InputItem::to_grok_value)
+                    .collect(),
+            ),
         );
         insert_tools(&mut object, &self.tools);
         // xAI rejects `tool_choice` when no projected tool is present, even
@@ -639,6 +646,17 @@ impl InputItem {
             }),
         }
     }
+
+    fn to_grok_value(&self) -> Option<Value> {
+        match self {
+            Self::Reasoning(reasoning)
+                if !matches!(reasoning.encrypted_content, PriorEncryptedContent::Grok(_)) =>
+            {
+                None
+            }
+            _ => Some(self.to_value()),
+        }
+    }
 }
 
 fn validate_internal_message_metadata(object: &Map<String, Value>) -> Result<(), ProtocolError> {
@@ -702,7 +720,15 @@ impl PriorReasoning {
                 if value.len() > MAX_ENCRYPTED_REASONING_BYTES {
                     return Err(ProtocolError::InvalidRequestField("encrypted_content"));
                 }
-                PriorEncryptedContent::Opaque(value.clone())
+                match value.strip_prefix(GROK_REASONING_ENVELOPE_PREFIX) {
+                    Some(value) if !value.is_empty() => {
+                        PriorEncryptedContent::Grok(value.to_owned())
+                    }
+                    Some(_) => {
+                        return Err(ProtocolError::InvalidRequestField("encrypted_content"));
+                    }
+                    None => PriorEncryptedContent::Foreign(value.clone()),
+                }
             }
             _ => return Err(ProtocolError::InvalidRequestField("encrypted_content")),
         };
@@ -747,11 +773,44 @@ impl PriorReasoning {
             "encrypted_content".into(),
             match &self.encrypted_content {
                 PriorEncryptedContent::Null => Value::Null,
-                PriorEncryptedContent::Opaque(value) => Value::String(value.clone()),
+                PriorEncryptedContent::Grok(value) | PriorEncryptedContent::Foreign(value) => {
+                    Value::String(value.clone())
+                }
             },
         );
         Value::Object(object)
     }
+}
+
+/// Removes reasoning state that cannot be resolved by a `store: false`
+/// Native GPT request. Bridge-enveloped items came from Grok; explicit null
+/// items are legacy Grok history that was already made non-decryptable.
+/// Native GPT ciphertext remains byte-for-byte intact.
+pub fn remove_unreplayable_reasoning_for_native(request: &mut Value) -> bool {
+    let Some(object) = request.as_object_mut() else {
+        return false;
+    };
+    if object.get("store").and_then(Value::as_bool) != Some(false) {
+        return false;
+    }
+    let Some(input) = object.get_mut("input").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    let original_len = input.len();
+    input.retain(|item| {
+        let Some(item) = item.as_object() else {
+            return true;
+        };
+        if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+            return true;
+        }
+        match item.get("encrypted_content") {
+            Some(Value::Null) => false,
+            Some(Value::String(value)) => !value.starts_with(GROK_REASONING_ENVELOPE_PREFIX),
+            _ => true,
+        }
+    });
+    input.len() != original_len
 }
 
 fn parse_prior_reasoning_parts(
@@ -2185,16 +2244,15 @@ impl ValidatedTextStreamEvent {
     }
 
     /// Project one validated Grok event onto the Codex-facing Responses
-    /// boundary without exposing provider-bound encrypted reasoning state.
+    /// boundary while marking provider-bound encrypted reasoning state.
     ///
     /// OpenAI-compatible reasoning ciphertext is not portable across
     /// providers. Codex persists completed reasoning items and may replay them
-    /// after a model-picker change, so forwarding Grok's opaque blob would
-    /// make a later native GPT request fail verification. The reasoning item,
-    /// summary, content, identity, and stream ordering remain intact; only the
-    /// non-portable ciphertext becomes the schema-supported `null` value.
+    /// after a model-picker change, so the bridge wraps Grok's opaque value
+    /// with provenance. A later Grok request unwraps it, while a native GPT
+    /// request removes the complete foreign reasoning item before forwarding.
     pub fn into_codex_value(mut self) -> Value {
-        clear_provider_bound_reasoning(&mut self.original);
+        mark_provider_bound_reasoning(&mut self.original);
         self.original
     }
 
@@ -2206,14 +2264,14 @@ impl ValidatedTextStreamEvent {
     }
 }
 
-fn clear_provider_bound_reasoning(event: &mut Value) {
+fn mark_provider_bound_reasoning(event: &mut Value) {
     let Some(event) = event.as_object_mut() else {
         return;
     };
     match event.get("type").and_then(Value::as_str) {
         Some("response.output_item.done") => {
             if let Some(item) = event.get_mut("item").and_then(Value::as_object_mut) {
-                clear_reasoning_ciphertext(item);
+                mark_reasoning_ciphertext(item);
             }
         }
         Some("response.completed") => {
@@ -2224,7 +2282,7 @@ fn clear_provider_bound_reasoning(event: &mut Value) {
                 .and_then(Value::as_array_mut)
             {
                 for item in output.iter_mut().filter_map(Value::as_object_mut) {
-                    clear_reasoning_ciphertext(item);
+                    mark_reasoning_ciphertext(item);
                 }
             }
         }
@@ -2232,9 +2290,14 @@ fn clear_provider_bound_reasoning(event: &mut Value) {
     }
 }
 
-fn clear_reasoning_ciphertext(item: &mut Map<String, Value>) {
-    if item.get("type").and_then(Value::as_str) == Some("reasoning") {
-        item.insert("encrypted_content".into(), Value::Null);
+fn mark_reasoning_ciphertext(item: &mut Map<String, Value>) {
+    if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+        return;
+    }
+    if let Some(Value::String(value)) = item.get_mut("encrypted_content")
+        && !value.starts_with(GROK_REASONING_ENVELOPE_PREFIX)
+    {
+        value.insert_str(0, GROK_REASONING_ENVELOPE_PREFIX);
     }
 }
 
@@ -3894,7 +3957,7 @@ mod tests {
                 "id": "reasoning_turn_1",
                 "summary": [{"type": "summary_text", "text": "Use the shell tool."}],
                 "content": [{"type": "reasoning_text", "text": "Need the marker value."}],
-                "encrypted_content": "opaque-encrypted-turn-state"
+                "encrypted_content": format!("{GROK_REASONING_ENVELOPE_PREFIX}opaque-encrypted-turn-state")
             },
             {
                 "type": "message", "id": "msg_turn_1", "role": "assistant",
@@ -3915,12 +3978,13 @@ mod tests {
     }
 
     #[test]
-    fn tool_followup_strips_output_only_ids_and_preserves_reasoning_replay() {
+    fn model_switch_replays_only_bridge_enveloped_reasoning_to_grok() {
         let original = two_turn_reasoning_request();
         let normalized = NormalizedResponsesRequest::parse(original.clone()).unwrap();
         let mut expected = original;
         expected.as_object_mut().unwrap().remove("client_metadata");
         expected.as_object_mut().unwrap().remove("tool_choice");
+        expected["input"][1]["encrypted_content"] = json!("opaque-encrypted-turn-state");
         expected["input"][2].as_object_mut().unwrap().remove("id");
         expected["input"][3].as_object_mut().unwrap().remove("id");
         expected["input"][4].as_object_mut().unwrap().remove("id");
@@ -3952,6 +4016,21 @@ mod tests {
                 .unwrap()
                 .get("content")
                 .is_none()
+        );
+
+        let mut foreign_reasoning = two_turn_reasoning_request();
+        foreign_reasoning["input"][1]["encrypted_content"] = json!("native-gpt-ciphertext");
+        let normalized = NormalizedResponsesRequest::parse(foreign_reasoning).unwrap();
+        assert_eq!(
+            normalized.to_xai_value()["input"].as_array().unwrap().len(),
+            4
+        );
+        assert!(
+            normalized.to_xai_value()["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["type"] != "reasoning")
         );
     }
 

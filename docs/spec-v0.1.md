@@ -69,10 +69,10 @@ Bridgeはshell command、MCP、filesystem、Browser、Computer Use、permission 
 
 ### V1.0 Safe Provider Mode
 
-GPT通信へ一切介入せず、GrokをCodex custom providerとして動かす。通常のCodex Desktop model picker統合は必須にせず、明示したGrok profileから選択できればよい。
+GrokをCodex custom providerとして動かし、Native GPTの推論とresponseは変更しない。V1.1の共通picker reverse routeでは、`store: false`で再利用不能なGrok由来reasoning itemだけをNative GPT requestから除外する。通常のCodex Desktop model picker統合は必須にせず、明示したGrok profileから選択できればよい。
 
 ```text
-Native GPT task → OpenAI（bridge非介入）
+Native GPT task → bridge（Grok reasoning分離のみ）→ OpenAI
 
 Grok task → Codex custom provider → 127.0.0.1 bridge → xAI
 ```
@@ -241,7 +241,7 @@ Bridge生成IDは`resp_<uuid>`、`msg_<uuid>`、`fc_<uuid>`等とし、同じres
 
 ## 30. Reasoning
 
-V1はhidden chain-of-thoughtを生成、推測、偽造しない。公開可能なreasoning summaryがauthoritative contractで明示された場合だけ別sliceで検討する。
+V1はhidden chain-of-thoughtを生成、推測、偽造しない。Grokが返したopaqueな暗号状態はbridge provenance envelopeで包み、Grokへ戻すときだけ復元する。Native GPTへはreasoning itemごと渡さない。公開可能なreasoning summaryだけをCodex表示へ維持する。
 
 ## 31. Hosted Search
 
