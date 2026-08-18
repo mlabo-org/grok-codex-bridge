@@ -27,6 +27,8 @@ const PICKER_NATIVE_ROUTE_FILE_NAME: &str = "picker-native-route.json";
 const PICKER_STATE_FILE_NAME: &str = "picker-managed-state.json";
 const PICKER_BEGIN: &str = "# >>> grok-codex-bridge picker begin >>>";
 const PICKER_END: &str = "# <<< grok-codex-bridge picker end <<<";
+const PICKER_PROVIDER_ID: &str = "grok_codex_picker";
+const PICKER_PROVIDER_NAME: &str = "Grok Codex Picker Bridge";
 
 /// Complete, explicit inputs owned by the filesystem lifecycle producer.
 pub struct InstallRequest {
@@ -725,13 +727,14 @@ fn prepare_picker_config(
             if picker_marker_count(source) != 0
                 || parsed.get("model_catalog_json").is_some()
                 || parsed.get("openai_base_url").is_some()
-                || parsed
-                    .get("model_provider")
-                    .is_some_and(|provider| provider.as_str() != Some("openai"))
+                || parsed.get("model_provider").is_some()
                 || parsed
                     .get("model_providers")
-                    .and_then(toml::Value::as_table)
-                    .is_some_and(|providers| providers.contains_key("grok_bridge"))
+                    .is_some_and(|providers| {
+                        providers
+                            .as_table()
+                            .is_none_or(|providers| providers.contains_key(PICKER_PROVIDER_ID))
+                    })
             {
                 return Err(LifecycleError::PickerConfigConflict);
             }
@@ -771,7 +774,7 @@ fn render_picker_config(
     let generated_catalog = path_text(generated_catalog)?;
     let base_url = format!("http://{bind}/_grok/{capability}/v1");
     let block = format!(
-        "{PICKER_BEGIN}\nopenai_base_url = {base_url:?}\nmodel_catalog_json = {generated_catalog:?}\n{PICKER_END}\n"
+        "{PICKER_BEGIN}\nmodel_provider = {PICKER_PROVIDER_ID:?}\nmodel_catalog_json = {generated_catalog:?}\n\n[model_providers.{PICKER_PROVIDER_ID}]\nname = {PICKER_PROVIDER_NAME:?}\nbase_url = {base_url:?}\nwire_api = \"responses\"\nrequires_openai_auth = true\nsupports_websockets = false\n{PICKER_END}\n"
     );
     let markers = picker_marker_count(source);
     if markers > 1 {
@@ -2076,8 +2079,24 @@ mod tests {
         let managed = fs::read_to_string(&config).unwrap();
         assert!(managed.starts_with("# keep this comment\nmodel = \"gpt-native\"\n\n"));
         assert!(managed.contains(PICKER_BEGIN));
-        assert!(managed.contains("openai_base_url = \"http://127.0.0.1:4545/_grok/"));
-        assert!(!managed.contains("[model_providers.grok_bridge]"));
+        let parsed: toml::Value = toml::from_str(&managed).unwrap();
+        assert_eq!(parsed["model_provider"].as_str(), Some(PICKER_PROVIDER_ID));
+        assert_eq!(
+            parsed["model_catalog_json"].as_str(),
+            receipt.generated_catalog_path.to_str()
+        );
+        assert!(parsed.get("openai_base_url").is_none());
+        let provider = &parsed["model_providers"][PICKER_PROVIDER_ID];
+        assert_eq!(provider["name"].as_str(), Some(PICKER_PROVIDER_NAME));
+        assert!(
+            provider["base_url"]
+                .as_str()
+                .unwrap()
+                .starts_with("http://127.0.0.1:4545/_grok/")
+        );
+        assert_eq!(provider["wire_api"].as_str(), Some("responses"));
+        assert_eq!(provider["requires_openai_auth"].as_bool(), Some(true));
+        assert_eq!(provider["supports_websockets"].as_bool(), Some(false));
         assert!(managed.ends_with("[features]\nfuture = true\n"));
         assert_eq!(mode(&config), 0o600);
 
@@ -2086,6 +2105,57 @@ mod tests {
         assert!(!receipt.generated_catalog_path.exists());
         assert!(!receipt.native_route_path.exists());
         assert!(!receipt.managed_state_path.exists());
+    }
+
+    #[test]
+    fn picker_config_conflicts_fail_closed_before_publication() {
+        let fixture = Fixture::new();
+        install(&fixture.install_request()).unwrap();
+        let catalog = CatalogSnapshot::new(["grok-4.6"], None).unwrap();
+        CatalogCache::new(fixture.install_root.join("state/models.json"))
+            .persist(&catalog)
+            .unwrap();
+        let native_catalog = fixture.home.join("native-models.json");
+        fs::write(
+            &native_catalog,
+            br#"{"models":[{"slug":"gpt-native","display_name":"Native GPT","supported_reasoning_levels":[],"shell_type":"default","visibility":"list","supported_in_api":true,"priority":1,"base_instructions":"native","support_verbosity":true,"truncation_policy":{"mode":"tokens","limit":1000},"experimental_supported_tools":[]}]}"#,
+        )
+        .unwrap();
+        fs::set_permissions(&native_catalog, fs::Permissions::from_mode(0o600)).unwrap();
+        let config = fixture.codex_home.join("config.toml");
+        let conflicts = [
+            "model_provider = \"openai\"\n",
+            "model_catalog_json = \"/tmp/user-catalog.json\"\n",
+            "openai_base_url = \"https://example.invalid/v1\"\n",
+            "[model_providers.grok_codex_picker]\nname = \"user-owned\"\n",
+        ];
+
+        for conflict in conflicts {
+            fs::write(&config, conflict).unwrap();
+            fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+            let result = install_picker(&PickerInstallRequest {
+                install_root: fixture.install_root.clone(),
+                codex_home: fixture.codex_home.clone(),
+                native_catalog_path: native_catalog.clone(),
+                native_upstream: NativeUpstream::ChatgptCodex,
+                bind: "127.0.0.1:4545".parse().unwrap(),
+            });
+            assert!(matches!(result, Err(LifecycleError::PickerConfigConflict)));
+            assert_eq!(fs::read_to_string(&config).unwrap(), conflict);
+            assert!(!fixture.install_root.join("state/picker-models.json").exists());
+            assert!(
+                !fixture
+                    .install_root
+                    .join("state/picker-native-route.json")
+                    .exists()
+            );
+            assert!(
+                !fixture
+                    .install_root
+                    .join("state/picker-managed-state.json")
+                    .exists()
+            );
+        }
     }
 
     #[test]
