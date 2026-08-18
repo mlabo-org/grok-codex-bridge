@@ -29,6 +29,7 @@ const MAX_REASONING_TEXT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ENCRYPTED_REASONING_BYTES: usize = 16 * 1024 * 1024;
 const MAX_REASONING_PARTS: usize = 64;
 const NAMESPACE_DELIMITER: &str = "__";
+const INTERNAL_MESSAGE_METADATA_FIELD: &str = "internal_chat_message_metadata_passthrough";
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ProtocolError {
@@ -473,28 +474,65 @@ impl InputItem {
             .ok_or(ProtocolError::InvalidRequestField("input"))?;
         match required_string(object, "type")? {
             "message" => {
-                reject_unknown_keys(object, &["type", "id", "role", "content"])?;
+                reject_unknown_keys(
+                    object,
+                    &[
+                        "type",
+                        "id",
+                        "role",
+                        "content",
+                        INTERNAL_MESSAGE_METADATA_FIELD,
+                    ],
+                )?;
+                validate_internal_message_metadata(object)?;
                 Ok(Self::Message(TextMessage::parse(object)?))
             }
             "reasoning" => {
                 reject_unknown_keys(
                     object,
-                    &["type", "id", "summary", "content", "encrypted_content"],
+                    &[
+                        "type",
+                        "id",
+                        "summary",
+                        "content",
+                        "encrypted_content",
+                        INTERNAL_MESSAGE_METADATA_FIELD,
+                    ],
                 )?;
+                validate_internal_message_metadata(object)?;
                 Ok(Self::Reasoning(PriorReasoning::parse(object)?))
             }
             "function_call" => {
                 reject_unknown_keys(
                     object,
-                    &["type", "id", "name", "namespace", "arguments", "call_id"],
+                    &[
+                        "type",
+                        "id",
+                        "name",
+                        "namespace",
+                        "arguments",
+                        "call_id",
+                        INTERNAL_MESSAGE_METADATA_FIELD,
+                    ],
                 )?;
+                validate_internal_message_metadata(object)?;
                 Ok(Self::FunctionCall(FunctionCall::parse(
                     object,
                     namespace_projection,
                 )?))
             }
             "function_call_output" => {
-                reject_unknown_keys(object, &["type", "id", "call_id", "output"])?;
+                reject_unknown_keys(
+                    object,
+                    &[
+                        "type",
+                        "id",
+                        "call_id",
+                        "output",
+                        INTERNAL_MESSAGE_METADATA_FIELD,
+                    ],
+                )?;
+                validate_internal_message_metadata(object)?;
                 Ok(Self::FunctionCallOutput(FunctionCallOutput::parse(object)?))
             }
             _ => Err(ProtocolError::UnsupportedInputItem),
@@ -509,6 +547,49 @@ impl InputItem {
             Self::FunctionCallOutput(output) => output.to_value(),
         }
     }
+}
+
+fn validate_internal_message_metadata(object: &Map<String, Value>) -> Result<(), ProtocolError> {
+    let Some(metadata) = object.get(INTERNAL_MESSAGE_METADATA_FIELD) else {
+        return Ok(());
+    };
+    let metadata = metadata
+        .as_object()
+        .ok_or(ProtocolError::InvalidRequestField("input"))?;
+    if reject_unknown_keys_for(metadata, &["turn_id", "create_time", "executed_tool_calls"])
+        .is_err()
+    {
+        return Err(ProtocolError::InvalidRequestField("input"));
+    }
+    if let Some(turn_id) = metadata.get("turn_id")
+        && turn_id.as_str().is_none_or(str::is_empty)
+    {
+        return Err(ProtocolError::InvalidRequestField("input"));
+    }
+    if let Some(create_time) = metadata.get("create_time")
+        && create_time
+            .as_f64()
+            .is_none_or(|seconds| !seconds.is_finite() || seconds < 0.0)
+    {
+        return Err(ProtocolError::InvalidRequestField("input"));
+    }
+    if let Some(executed_tool_calls) = metadata.get("executed_tool_calls") {
+        let calls = executed_tool_calls
+            .as_array()
+            .ok_or(ProtocolError::InvalidRequestField("input"))?;
+        for call in calls {
+            let call = call
+                .as_object()
+                .ok_or(ProtocolError::InvalidRequestField("input"))?;
+            if reject_unknown_keys_for(call, &["name", "arguments"]).is_err()
+                || required_nonempty_string(call, "name").is_err()
+                || !call.contains_key("arguments")
+            {
+                return Err(ProtocolError::InvalidRequestField("input"));
+            }
+        }
+    }
+    Ok(())
 }
 
 impl PriorReasoning {
@@ -3081,6 +3162,52 @@ mod tests {
         expected_upstream["input"][1]["content"] = json!("prior answer");
         assert_eq!(request.to_xai_value(), expected_upstream);
         assert_eq!(request.into_xai_value(), expected_upstream);
+    }
+
+    #[test]
+    fn codex_openai_message_metadata_is_validated_and_ends_at_grok_boundary() {
+        let mut request = request_fixture();
+        request["input"] = json!([
+            {
+                "type": "message",
+                "id": "msg_context",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "context"}],
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": "11111111-1111-4111-8111-111111111111",
+                    "create_time": 1787079600.125
+                }
+            },
+            {
+                "type": "message",
+                "id": "msg_user",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hello"}],
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": "11111111-1111-4111-8111-111111111111",
+                    "create_time": 1787079600.25
+                }
+            }
+        ]);
+
+        let upstream = NormalizedResponsesRequest::parse(request)
+            .unwrap()
+            .to_xai_value();
+        assert_eq!(
+            upstream["input"],
+            json!([
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "context"}]
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}]
+                }
+            ])
+        );
     }
 
     fn two_turn_reasoning_request() -> Value {

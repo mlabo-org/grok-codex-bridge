@@ -1237,6 +1237,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_openai_message_metadata_is_not_sent_to_grok() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (client, mock, task) = start_mock(MockReply::Valid).await;
+        let app = test_app(
+            runtime_config(temporary.path()),
+            ModelCatalog::bootstrap().unwrap(),
+            CredentialStore::new(write_auth(temporary.path())).unwrap(),
+            client,
+        );
+        let mut request = request_body("grok-4.6");
+        request["input"] = json!([
+            {
+                "type": "message",
+                "id": "msg_context",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "context"}],
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": "11111111-1111-4111-8111-111111111111",
+                    "create_time": 1787079600.125
+                }
+            },
+            {
+                "type": "message",
+                "id": "msg_user",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hello"}],
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": "11111111-1111-4111-8111-111111111111",
+                    "create_time": 1787079600.25
+                }
+            }
+        ]);
+
+        let response = send_with_headers(
+            app,
+            TOKEN,
+            &[("authorization", "Bearer native-caller-secret")],
+            request.to_string(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+
+        assert_eq!(mock.hits.load(Ordering::SeqCst), 1);
+        let observed = mock.observed.lock().unwrap();
+        let (headers, upstream_body) = &observed[0];
+        assert_eq!(headers["authorization"], "Bearer mock-session-secret");
+        assert_ne!(headers["authorization"], "Bearer native-caller-secret");
+        assert_eq!(
+            upstream_body["input"],
+            json!([
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "context"}]
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}]
+                }
+            ])
+        );
+        drop(observed);
+        task.abort();
+    }
+
+    #[tokio::test]
     async fn codex_tool_followup_reuses_official_grok_conversation_and_turn_headers() {
         let temporary = tempfile::tempdir().unwrap();
         let (client, mock, task) = start_mock(MockReply::Valid).await;
