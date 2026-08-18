@@ -149,11 +149,8 @@ impl PickerActivationOperations for SystemPickerActivationOperations<'_> {
     }
 
     fn start_service(&mut self) -> Result<(), PickerActivationOperationError> {
-        service_install(
-            &self.request.launch_agent,
-            &self.request.launch_agent_path,
-        )
-        .map_err(Into::into)
+        service_install(&self.request.launch_agent, &self.request.launch_agent_path)
+            .map_err(Into::into)
     }
 
     fn remove_picker(&mut self) -> Result<(), PickerActivationOperationError> {
@@ -169,11 +166,13 @@ impl PickerActivationOperations for SystemPickerActivationOperations<'_> {
 fn activate_picker_with_operations<O: PickerActivationOperations>(
     operations: &mut O,
 ) -> Result<PickerActivationReceipt, PickerActivationError> {
-    let prior_status = operations.service_status().map_err(|source| PickerActivationError {
-        stage: PickerActivationStage::InspectPriorService,
-        source,
-        rollback_failures: Vec::new(),
-    })?;
+    let prior_status = operations
+        .service_status()
+        .map_err(|source| PickerActivationError {
+            stage: PickerActivationStage::InspectPriorService,
+            source,
+            rollback_failures: Vec::new(),
+        })?;
     let prior_service_loaded = match prior_status {
         ServiceStatus::Loaded => true,
         ServiceStatus::NotLoaded => false,
@@ -389,8 +388,7 @@ mod tests {
 
     #[test]
     fn absent_service_is_published_then_started_and_verified() {
-        let mut operations =
-            FakeOperations::new([ServiceStatus::NotLoaded, ServiceStatus::Loaded]);
+        let mut operations = FakeOperations::new([ServiceStatus::NotLoaded, ServiceStatus::Loaded]);
 
         let result = activate_picker_with_operations(&mut operations).unwrap();
 
