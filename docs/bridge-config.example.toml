@@ -1,0 +1,11 @@
+version = 1
+
+[server]
+bind = "127.0.0.1:4545"
+capability_token_file = "/absolute/path/to/caller-token"
+
+[grok]
+catalog_cache_file = "/absolute/path/to/model-catalog.json"
+# Keep development runs offline unless this one bounded official refresh is intended.
+# The runtime default is true when this field is omitted.
+refresh_on_start = false

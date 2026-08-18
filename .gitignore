@@ -1,0 +1,13 @@
+/target/
+/dist/
+/.DS_Store
+/.env
+/.env.*
+!/.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+auth.json
+caller-token
+
