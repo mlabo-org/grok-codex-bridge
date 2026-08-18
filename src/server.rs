@@ -1184,6 +1184,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_cached_web_search_reaches_grok_as_bare_hosted_tool() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (client, mock, task) = start_mock(MockReply::Valid).await;
+        let app = test_app(
+            runtime_config(temporary.path()),
+            ModelCatalog::bootstrap().unwrap(),
+            CredentialStore::new(write_auth(temporary.path())).unwrap(),
+            client,
+        );
+        let mut request = request_body("grok-4.6");
+        request["tools"] = json!([
+            {
+                "type": "namespace",
+                "name": "mcp__demo",
+                "description": "Tools in the mcp__demo namespace.",
+                "tools": [{
+                    "type": "function",
+                    "name": "ping",
+                    "description": "",
+                    "strict": false,
+                    "parameters": {"type": "object", "properties": {}}
+                }]
+            },
+            {
+                "type": "web_search",
+                "external_web_access": false
+            }
+        ]);
+
+        let response = send(app, TOKEN, request.to_string()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+
+        assert_eq!(mock.hits.load(Ordering::SeqCst), 1);
+        let observed = mock.observed.lock().unwrap();
+        assert_eq!(
+            observed[0].1["tools"],
+            json!([
+                {
+                    "type": "function",
+                    "name": "mcp__demo__ping",
+                    "description": "",
+                    "strict": false,
+                    "parameters": {"type": "object", "properties": {}}
+                },
+                {"type": "web_search"}
+            ])
+        );
+        drop(observed);
+        task.abort();
+    }
+
+    #[tokio::test]
     async fn codex_tool_followup_reuses_official_grok_conversation_and_turn_headers() {
         let temporary = tempfile::tempdir().unwrap();
         let (client, mock, task) = start_mock(MockReply::Valid).await;
