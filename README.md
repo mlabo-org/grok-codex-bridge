@@ -8,6 +8,31 @@
 
 It is not a Codex plugin, a general-purpose LLM router, or an agent harness.
 
+## Install with Codex
+
+The repository includes [AGENTS.md](AGENTS.md) as a binding safety and lifecycle contract for coding agents. To let Codex inspect the source, build the native executable, and install the conservative V1.0 isolated profile, clone the repository and start Codex from its root:
+
+```sh
+git clone https://github.com/mlabo-org/grok-codex-bridge.git
+cd grok-codex-bridge
+codex
+```
+
+Then give Codex this request:
+
+```text
+Read AGENTS.md completely and follow it. Build and install the isolated V1.0
+grok-bridge profile on this Mac. Verify the platform and prerequisites, preserve
+existing changes, use ./scripts/materialize-macos.sh and the repository-owned
+lifecycle commands, and run only the minimum primary-path checks. Do not enable
+the experimental V1.1 merged picker, edit the Codex binary, Codex configuration,
+Grok authentication, or LaunchAgent files directly, or commit, push, or publish.
+Stop and explain the missing boundary if this is not Apple Silicon macOS or a
+required authoritative input cannot be verified.
+```
+
+This prompt deliberately selects the isolated V1.0 route. Enabling the merged V1.1 picker is a separate, explicit operation because it changes the active Codex model catalog and requires verified Native Codex inputs.
+
 ## Acknowledgements
 
 This project owes a substantial design debt to [duolahypercho/codex-router](https://github.com/duolahypercho/codex-router/tree/9995c77278608640759982c98ec5bdaeb371c174). Its implementation and documentation were an important feasibility reference and materially informed our decisions around official Grok credential freshness, provider-bound metadata, xAI Responses/SSE taxonomy, native picker integration, and reversible activation. We sincerely thank the author and contributors for publishing that work under the MIT License.
