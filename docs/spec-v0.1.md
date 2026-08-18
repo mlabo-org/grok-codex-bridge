@@ -281,7 +281,7 @@ Native OpenAI upstreamを推測でhard-codeしない。既存Codex config/defaul
 
 ## 39. Merged Model Catalog
 
-V1.1ではnative catalogを直接編集せず、copyを基にGrok entryを加えたgenerated catalogをruntime stateへ置く。Desktop表示は実機確認する。
+V1.1ではnative catalogを直接編集せず、copyを基にGrok entryを加えたgenerated catalogをruntime stateへ置く。Grok entryはnative GPT-5.6と同じ `context_window` / `max_context_window`（272000）を広告し、Codexのスキル説明予算を同じ 2% token 計算にする。Desktop表示は実機確認する。
 
 ## 40. Native Alias
 
