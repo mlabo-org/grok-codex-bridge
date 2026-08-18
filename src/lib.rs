@@ -5,6 +5,7 @@ pub mod credential;
 pub mod grok;
 pub mod launchd;
 pub mod lifecycle;
+pub mod picker;
 pub mod protocol;
 pub mod server;
 
@@ -15,6 +16,10 @@ pub use credential::{CredentialError, CredentialStore, SessionCredential};
 pub use grok::{
     FetchModelsResult, GrokClient, GrokError, ResponsesByteStream, ResponsesTransportRequest,
     ValidatedTextEventStream,
+};
+pub use picker::{
+    ArtifactIdentity, ConfigRollbackOwnership, GeneratedPickerCatalog, PickerError,
+    PickerManagedState, generate_picker_catalog,
 };
 pub use protocol::{
     NormalizedResponsesRequest, ProtocolError, TextStreamEventKind, TextStreamState,
