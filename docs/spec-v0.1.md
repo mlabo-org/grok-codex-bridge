@@ -210,6 +210,8 @@ Grokが返すResponses function call itemのtool name、tool call ID、arguments
 
 Native GPTで完了済みの`custom_tool_call`と`custom_tool_call_output`はCodex harnessが所有するforeign実行履歴としてschemaを検証し、Grok requestから除外する。これらをGrok function call stateへ混入させず、同じturnのassistant message textは会話履歴として維持する。
 
+Codex CLIの`agent_message`はauthor、recipient、contentをschema検証する。contentがすべて`input_text`なら順序を維持したassistant easy messageとしてGrokへ投影する。1つでもprovider-boundな`encrypted_content`を含む場合はitem全体を不可分なforeign履歴としてGrok requestから除外し、復号、要約、部分的なprefix転送を行わない。
+
 ## 25. Tool Result
 
 Responsesの`function_call_output`を、同一`call_id`を持つxAI Responses input itemとして維持する。textとimage resultを保持する。

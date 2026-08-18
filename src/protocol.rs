@@ -149,6 +149,7 @@ enum InputItem {
     FunctionCallOutput(FunctionCallOutput),
     ToolSearchCall(ToolSearchCall),
     ToolSearchOutput(ToolSearchOutput),
+    ForeignAgentMessage,
     ForeignCustomToolCall,
     ForeignCustomToolCallOutput,
 }
@@ -456,6 +457,7 @@ impl NormalizedResponsesRequest {
                 | InputItem::FunctionCallOutput(_)
                 | InputItem::ToolSearchCall(_)
                 | InputItem::ToolSearchOutput(_)
+                | InputItem::ForeignAgentMessage
                 | InputItem::ForeignCustomToolCall
                 | InputItem::ForeignCustomToolCallOutput => in_user_block = false,
             }
@@ -564,6 +566,24 @@ impl InputItem {
                 )?;
                 validate_internal_message_metadata(object)?;
                 Ok(Self::Reasoning(PriorReasoning::parse(object)?))
+            }
+            "agent_message" => {
+                reject_unknown_keys(
+                    object,
+                    &[
+                        "type",
+                        "id",
+                        "author",
+                        "recipient",
+                        "content",
+                        INTERNAL_MESSAGE_METADATA_FIELD,
+                    ],
+                )?;
+                validate_internal_message_metadata(object)?;
+                match parse_agent_message(object)? {
+                    Some(message) => Ok(Self::Message(message)),
+                    None => Ok(Self::ForeignAgentMessage),
+                }
             }
             "function_call" => {
                 reject_unknown_keys(
@@ -687,6 +707,7 @@ impl InputItem {
                 Some(reasoning.to_value())
             }
             Self::Reasoning(_)
+            | Self::ForeignAgentMessage
             | Self::ForeignCustomToolCall
             | Self::ForeignCustomToolCallOutput => None,
             Self::FunctionCall(call) => Some(call.to_value()),
@@ -704,6 +725,48 @@ impl InputItem {
             })),
         }
     }
+}
+
+fn parse_agent_message(object: &Map<String, Value>) -> Result<Option<TextMessage>, ProtocolError> {
+    optional_nonempty_string(object, "id")?;
+    required_nonempty_string(object, "author")?;
+    required_nonempty_string(object, "recipient")?;
+
+    let mut text_parts = Vec::new();
+    let mut contains_encrypted_content = false;
+    for part in required_array(object, "content")? {
+        let part = part
+            .as_object()
+            .ok_or(ProtocolError::InvalidRequestField("content"))?;
+        match required_string(part, "type")? {
+            "input_text" => {
+                reject_unknown_keys(part, &["type", "text"])?;
+                text_parts.push(required_string(part, "text")?);
+            }
+            "encrypted_content" => {
+                reject_unknown_keys(part, &["type", "encrypted_content"])?;
+                if required_nonempty_string(part, "encrypted_content")?.len()
+                    > MAX_ENCRYPTED_REASONING_BYTES
+                {
+                    return Err(ProtocolError::InvalidRequestField("encrypted_content"));
+                }
+                contains_encrypted_content = true;
+            }
+            _ => return Err(ProtocolError::UnsupportedContent),
+        }
+    }
+
+    if contains_encrypted_content {
+        return Ok(None);
+    }
+    let text = text_parts.join("\n");
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(TextMessage {
+        role: MessageRole::Assistant,
+        content: vec![MessageContent::OutputText(text)],
+    }))
 }
 
 fn validate_foreign_custom_tool_output(value: &Value) -> Result<(), ProtocolError> {
@@ -1313,6 +1376,8 @@ fn parse_input(
                     assistant_output_started = false;
                 }
             }
+            // Provider-bound agent messages are not Grok tool-loop state.
+            InputItem::ForeignAgentMessage => {}
             // Native custom tools are executed and recorded by the Codex
             // harness. They are complete foreign history, not Grok tool-loop
             // state, so validation terminates at the bridge boundary.
@@ -4223,6 +4288,73 @@ mod tests {
         assert!(input.iter().all(|item| item.get("phase").is_none()));
         assert_eq!(input[1]["content"], "working");
         assert_eq!(input[2]["content"], "done");
+        assert_eq!(input[3]["content"][0]["text"], "continue with Grok");
+    }
+
+    #[test]
+    fn model_switch_preserves_plaintext_and_drops_encrypted_cli_agent_messages() {
+        let mut request = request_fixture();
+        request["prompt_cache_key"] = json!("11111111-1111-4111-8111-111111111111");
+        request["client_metadata"] = json!({
+            "session_id": "11111111-1111-4111-8111-111111111111",
+            "turn_id": "22222222-2222-4222-8222-222222222222",
+            "x-codex-installation-id": "33333333-3333-4333-8333-333333333333"
+        });
+        request["input"] = json!([
+            {
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "first"}]
+            },
+            {
+                "type": "agent_message",
+                "id": "amsg_foreign_1",
+                "author": "/root",
+                "recipient": "/root/worker",
+                "content": [
+                    {"type": "input_text", "text": "Message Type: NEW_TASK\nPayload:\n"},
+                    {"type": "encrypted_content", "encrypted_content": "native-gpt-agent-state"}
+                ],
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": "turn-agent-1",
+                    "create_time": 1.0
+                }
+            },
+            {
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "second"}]
+            },
+            {
+                "type": "agent_message",
+                "id": "amsg_plaintext_1",
+                "author": "/root/worker",
+                "recipient": "/root",
+                "content": [{
+                    "type": "input_text",
+                    "text": "Message Type: FINAL_ANSWER\nPayload:\nworker result"
+                }],
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": "turn-agent-2",
+                    "create_time": 2.0
+                }
+            },
+            {
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "continue with Grok"}]
+            }
+        ]);
+
+        let normalized = NormalizedResponsesRequest::parse(request).unwrap();
+        assert_eq!(normalized.grok_routing_metadata().unwrap().turn_index(), 3);
+        let upstream = normalized.to_xai_value();
+        let input = upstream["input"].as_array().unwrap();
+        assert_eq!(input.len(), 4);
+        assert!(input.iter().all(|item| item["type"] != "agent_message"));
+        assert_eq!(input[0]["content"][0]["text"], "first");
+        assert_eq!(input[1]["content"][0]["text"], "second");
+        assert_eq!(
+            input[2]["content"],
+            "Message Type: FINAL_ANSWER\nPayload:\nworker result"
+        );
         assert_eq!(input[3]["content"][0]["text"], "continue with Grok");
     }
 
