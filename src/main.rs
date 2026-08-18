@@ -18,7 +18,7 @@ use grok_codex_bridge::lifecycle::{
 };
 use grok_codex_bridge::{
     CatalogCache, CatalogCommand, CatalogSnapshot, Cli, Command, CredentialStore, GrokClient,
-    GrokConfig, ModelCatalog, RuntimeConfig, serve,
+    GrokConfig, ModelCatalog, NativeUpstream, RuntimeConfig, serve,
 };
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::filter::Targets;
@@ -103,17 +103,21 @@ fn picker_install_command(arguments: PickerInstallArgs) -> Result<ExitCode, Oper
     let paths = resolve_lifecycle_paths(&arguments.paths)?;
     let native_catalog_path = require_absolute(arguments.native_catalog, "native catalog")?;
     let bind = arguments.bind.parse::<SocketAddr>().map_err(|_| OperationError::InvalidBind)?;
+    let native_upstream = NativeUpstream::parse_base_url(&arguments.native_upstream_base_url)?;
     let receipt = install_picker(&PickerInstallRequest {
         install_root: paths.install_root,
         codex_home: paths.codex_home,
         native_catalog_path,
+        native_upstream,
         bind,
     })?;
     println!(
         "picker state: generated {} native and {} admitted Grok models",
         receipt.native_model_count, receipt.grok_model_count
     );
-    println!("restart required: use the accepted combined Codex binary and a fresh CLI process or full Desktop relaunch");
+    println!(
+        "restart required: start a fresh Codex CLI process or fully relaunch Desktop after bridge publication"
+    );
     Ok(ExitCode::SUCCESS)
 }
 
@@ -553,4 +557,6 @@ enum OperationError {
     Launchd(#[from] grok_codex_bridge::launchd::LaunchdError),
     #[error(transparent)]
     Credential(#[from] grok_codex_bridge::CredentialError),
+    #[error(transparent)]
+    Native(#[from] grok_codex_bridge::native::NativeError),
 }

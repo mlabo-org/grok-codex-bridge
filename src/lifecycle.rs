@@ -12,6 +12,7 @@ use uuid::Uuid;
 use crate::catalog::CatalogCache;
 use crate::credential::CredentialStore;
 use crate::picker::{ArtifactIdentity, ConfigRollbackOwnership, PickerManagedState, generate_picker_catalog};
+use crate::native::{NativeRouteState, NativeUpstream};
 
 const MANIFEST_VERSION: u32 = 1;
 const CONFIG_VERSION: u32 = 1;
@@ -22,6 +23,7 @@ const BINARY_FILE_NAME: &str = "grok-codex-bridge";
 const MAX_CONTROL_FILE_BYTES: u64 = 1024 * 1024;
 const CAPABILITY_LENGTH: usize = 64;
 const PICKER_CATALOG_FILE_NAME: &str = "picker-models.json";
+const PICKER_NATIVE_ROUTE_FILE_NAME: &str = "picker-native-route.json";
 const PICKER_STATE_FILE_NAME: &str = "picker-managed-state.json";
 const PICKER_BEGIN: &str = "# >>> grok-codex-bridge picker begin >>>";
 const PICKER_END: &str = "# <<< grok-codex-bridge picker end <<<";
@@ -70,12 +72,14 @@ pub struct PickerInstallRequest {
     pub install_root: PathBuf,
     pub codex_home: PathBuf,
     pub native_catalog_path: PathBuf,
+    pub native_upstream: NativeUpstream,
     pub bind: SocketAddr,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PickerInstallReceipt {
     pub generated_catalog_path: PathBuf,
+    pub native_route_path: PathBuf,
     pub managed_state_path: PathBuf,
     pub config_path: PathBuf,
     pub native_model_count: usize,
@@ -373,51 +377,86 @@ pub fn install_picker(request: &PickerInstallRequest) -> Result<PickerInstallRec
         .ok_or(LifecycleError::PickerCatalogUnavailable)?;
     let generated = generate_picker_catalog(&native_bytes, &grok_catalog)
         .map_err(LifecycleError::Picker)?;
+    let native_route = NativeRouteState::new(
+        request.native_upstream,
+        generated.native_model_slugs().iter().cloned(),
+    )
+    .map_err(LifecycleError::Native)?;
+    let native_route_bytes = native_route.to_json().map_err(LifecycleError::Native)?;
     let capability = read_private_control_file(&install_manifest.caller_token_path)?;
     let capability = validate_capability_bytes(&capability)?;
     let config_path = request.codex_home.join("config.toml");
     let generated_path = request.install_root.join("state").join(PICKER_CATALOG_FILE_NAME);
     let state_path = request.install_root.join("state").join(PICKER_STATE_FILE_NAME);
+    let native_route_path = request
+        .install_root
+        .join("state")
+        .join(PICKER_NATIVE_ROUTE_FILE_NAME);
 
     let prior_state = read_picker_state(&state_path)?;
-    let config_plan = prepare_picker_config(&config_path, prior_state.as_ref())?;
-    let config_contents = render_picker_config(
-        config_plan.current.as_deref().unwrap_or_default(),
-        &generated_path,
-        request.bind,
-        capability,
-    )?;
-
     let previous_generated = read_optional_control_file(&generated_path, &[0o600])?;
+    let previous_native_route = read_optional_control_file(&native_route_path, &[0o600])?;
     let previous_state = read_optional_control_file(&state_path, &[0o600])?;
-    atomic_write(&generated_path, generated.bytes(), 0o600)?;
-    if let Err(error) = atomic_write(&config_path, config_contents.as_bytes(), 0o600) {
+    let config_plan = prepare_picker_config(&config_path, prior_state.as_ref())?;
+    let prepared = (|| {
+        let config_contents = render_picker_config(
+            config_plan.current.as_deref().unwrap_or_default(),
+            &generated_path,
+            request.bind,
+            capability,
+        )?;
+        let generated_identity = artifact_identity(&generated_path, generated.bytes())?;
+        let native_route_identity = artifact_identity(&native_route_path, &native_route_bytes)?;
+        let config_identity = artifact_identity(&config_path, config_contents.as_bytes())?;
+        let state = PickerManagedState::new(
+            artifact_identity(&request.native_catalog_path, &native_bytes)?,
+            &grok_catalog,
+            generated_identity,
+            native_route_identity,
+            config_identity,
+            config_plan.rollback.clone(),
+        )
+        .map_err(LifecycleError::Picker)?;
+        let state_bytes = state.to_json().map_err(LifecycleError::Picker)?;
+        Ok::<_, LifecycleError>((config_contents, state_bytes))
+    })();
+    let (config_contents, state_bytes) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            config_plan.abort()?;
+            return Err(error);
+        }
+    };
+
+    if let Err(error) = atomic_write(&generated_path, generated.bytes(), 0o600) {
+        config_plan.abort()?;
+        return Err(error);
+    }
+    if let Err(error) = atomic_write(&native_route_path, &native_route_bytes, 0o600) {
         restore_optional_file(&generated_path, previous_generated.as_deref(), 0o600)?;
+        config_plan.abort()?;
+        return Err(error);
+    }
+    if let Err(error) = atomic_write(&config_path, config_contents.as_bytes(), 0o600) {
+        restore_optional_file(&native_route_path, previous_native_route.as_deref(), 0o600)?;
+        restore_optional_file(&generated_path, previous_generated.as_deref(), 0o600)?;
+        config_plan.abort()?;
         return Err(error);
     }
 
-    let generated_identity = artifact_identity(&generated_path, generated.bytes())?;
-    let config_identity = artifact_identity(&config_path, config_contents.as_bytes())?;
-    let rollback = config_plan.rollback.clone();
-    let state = PickerManagedState::new(
-        artifact_identity(&request.native_catalog_path, &native_bytes)?,
-        &grok_catalog,
-        generated_identity,
-        config_identity,
-        rollback,
-    )
-    .map_err(LifecycleError::Picker)?;
-    let state_bytes = state.to_json().map_err(LifecycleError::Picker)?;
     if let Err(error) = atomic_write(&state_path, &state_bytes, 0o600) {
         restore_optional_file(&config_path, config_plan.current.as_deref(), config_plan.previous_mode)?;
         restore_optional_file(&generated_path, previous_generated.as_deref(), 0o600)?;
+        restore_optional_file(&native_route_path, previous_native_route.as_deref(), 0o600)?;
         restore_optional_file(&state_path, previous_state.as_deref(), 0o600)?;
+        config_plan.abort()?;
         return Err(error);
     }
 
     config_plan.finish()?;
     Ok(PickerInstallReceipt {
         generated_catalog_path: generated_path,
+        native_route_path,
         managed_state_path: state_path,
         config_path,
         native_model_count: generated.native_model_count(),
@@ -438,11 +477,19 @@ fn uninstall_picker_if_present(install_root: &Path, codex_home: &Path) -> Result
     };
     let state = PickerManagedState::from_json(&bytes).map_err(LifecycleError::Picker)?;
     let config_path = codex_home.join("config.toml");
-    if state.managed_config().path() != config_path || state.generated_catalog().path() != install_root.join("state").join(PICKER_CATALOG_FILE_NAME) {
+    if state.managed_config().path() != config_path
+        || state.generated_catalog().path()
+            != install_root.join("state").join(PICKER_CATALOG_FILE_NAME)
+        || state.native_route().path()
+            != install_root
+                .join("state")
+                .join(PICKER_NATIVE_ROUTE_FILE_NAME)
+    {
         return Err(LifecycleError::InvalidPickerState);
     }
     validate_identity(state.managed_config())?;
     validate_identity(state.generated_catalog())?;
+    validate_identity(state.native_route())?;
     match state.config_rollback() {
         ConfigRollbackOwnership::RemoveCreated => {
             fs::remove_file(&config_path).map_err(LifecycleError::RestoreExternalTarget)?;
@@ -457,6 +504,7 @@ fn uninstall_picker_if_present(install_root: &Path, codex_home: &Path) -> Result
         }
     }
     fs::remove_file(state.generated_catalog().path()).map_err(LifecycleError::RemoveInstallRoot)?;
+    fs::remove_file(state.native_route().path()).map_err(LifecycleError::RemoveInstallRoot)?;
     fs::remove_file(&state_path).map_err(LifecycleError::RemoveInstallRoot)?;
     sync_parent(&state_path)?;
     Ok(true)
@@ -634,6 +682,14 @@ impl PickerConfigPlan {
         let _ = self.fresh_backup;
         Ok(())
     }
+
+    fn abort(self) -> Result<(), LifecycleError> {
+        if let Some(path) = self.fresh_backup {
+            fs::remove_file(&path).map_err(LifecycleError::RemoveBackup)?;
+            sync_parent(&path)?;
+        }
+        Ok(())
+    }
 }
 
 fn prepare_picker_config(
@@ -668,6 +724,10 @@ fn prepare_picker_config(
             let parsed: toml::Value = toml::from_str(source).map_err(|_| LifecycleError::InvalidPickerConfig)?;
             if picker_marker_count(source) != 0
                 || parsed.get("model_catalog_json").is_some()
+                || parsed.get("openai_base_url").is_some()
+                || parsed
+                    .get("model_provider")
+                    .is_some_and(|provider| provider.as_str() != Some("openai"))
                 || parsed
                     .get("model_providers")
                     .and_then(toml::Value::as_table)
@@ -711,7 +771,7 @@ fn render_picker_config(
     let generated_catalog = path_text(generated_catalog)?;
     let base_url = format!("http://{bind}/_grok/{capability}/v1");
     let block = format!(
-        "{PICKER_BEGIN}\nmodel_catalog_json = {generated_catalog:?}\n\n[model_providers.grok_bridge]\nname = {PROFILE_PROVIDER_NAME:?}\nbase_url = {base_url:?}\nwire_api = \"responses\"\nrequires_openai_auth = false\nsupports_websockets = false\n{PICKER_END}\n"
+        "{PICKER_BEGIN}\nopenai_base_url = {base_url:?}\nmodel_catalog_json = {generated_catalog:?}\n{PICKER_END}\n"
     );
     let markers = picker_marker_count(source);
     if markers > 1 {
@@ -1780,6 +1840,8 @@ pub enum LifecycleError {
     Picker(#[from] crate::picker::PickerError),
     #[error(transparent)]
     Catalog(#[from] crate::catalog::CatalogError),
+    #[error(transparent)]
+    Native(#[from] crate::native::NativeError),
     #[error("test-only injected install failure")]
     InjectedInstallFailure,
     #[cfg(not(unix))]
@@ -1999,21 +2061,30 @@ mod tests {
             install_root: fixture.install_root.clone(),
             codex_home: fixture.codex_home.clone(),
             native_catalog_path: native_catalog,
+            native_upstream: NativeUpstream::ChatgptCodex,
             bind: "127.0.0.1:4545".parse().unwrap(),
         })
         .unwrap();
         let generated: serde_json::Value = serde_json::from_slice(&fs::read(&receipt.generated_catalog_path).unwrap()).unwrap();
-        assert_eq!(generated["models"][0]["model_provider"], "openai");
-        assert_eq!(generated["models"][1]["model_provider"], "grok_bridge");
+        assert!(generated["models"][0].get("model_provider").is_none());
+        assert!(generated["models"][1].get("model_provider").is_none());
+        let native_route =
+            NativeRouteState::from_json(&fs::read(&receipt.native_route_path).unwrap()).unwrap();
+        assert!(native_route.contains("gpt-native"));
+        assert!(!native_route.contains("grok-4.6"));
+        assert_eq!(native_route.upstream(), NativeUpstream::ChatgptCodex);
         let managed = fs::read_to_string(&config).unwrap();
         assert!(managed.starts_with("# keep this comment\nmodel = \"gpt-native\"\n\n"));
         assert!(managed.contains(PICKER_BEGIN));
+        assert!(managed.contains("openai_base_url = \"http://127.0.0.1:4545/_grok/"));
+        assert!(!managed.contains("[model_providers.grok_bridge]"));
         assert!(managed.ends_with("[features]\nfuture = true\n"));
         assert_eq!(mode(&config), 0o600);
 
         assert!(uninstall_picker(&fixture.install_root, &fixture.codex_home).unwrap());
         assert_eq!(fs::read(&config).unwrap(), original);
         assert!(!receipt.generated_catalog_path.exists());
+        assert!(!receipt.native_route_path.exists());
         assert!(!receipt.managed_state_path.exists());
     }
 

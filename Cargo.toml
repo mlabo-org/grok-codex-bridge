@@ -27,6 +27,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 url = "2"
 uuid = { version = "1", features = ["v4"] }
 zeroize = "1.8"
+zstd = "0.13"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

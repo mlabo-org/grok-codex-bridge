@@ -5,6 +5,7 @@ pub mod credential;
 pub mod grok;
 pub mod launchd;
 pub mod lifecycle;
+pub mod native;
 pub mod picker;
 pub mod protocol;
 pub mod server;
@@ -17,6 +18,7 @@ pub use grok::{
     FetchModelsResult, GrokClient, GrokError, ResponsesByteStream, ResponsesTransportRequest,
     ValidatedTextEventStream,
 };
+pub use native::{NativeRouteState, NativeUpstream};
 pub use picker::{
     ArtifactIdentity, ConfigRollbackOwnership, GeneratedPickerCatalog, PickerError,
     PickerManagedState, generate_picker_catalog,

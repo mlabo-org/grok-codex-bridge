@@ -40,7 +40,7 @@ pub enum Command {
         #[command(subcommand)]
         command: ServiceCommand,
     },
-    /// Prepare or remove the Phase J provider-aware picker state.
+    /// Prepare or remove the Phase J merged picker and routing state.
     Picker {
         #[command(subcommand)]
         command: PickerCommand,
@@ -118,7 +118,7 @@ pub enum ServiceCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum PickerCommand {
-    /// Generate the provider-aware catalog and atomically publish the managed base-config block.
+    /// Generate the merged catalog and atomically publish managed loopback routing state.
     Install(PickerInstallArgs),
     /// Restore the exact pre-picker base configuration and remove generated picker state.
     Uninstall(LifecyclePathArgs),
@@ -131,6 +131,9 @@ pub struct PickerInstallArgs {
     /// Current authoritative native Codex catalog JSON to copy into bridge-owned state.
     #[arg(long, value_name = "FILE")]
     pub native_catalog: PathBuf,
+    /// Exact effective first-party Codex Responses base URL captured before loopback activation.
+    #[arg(long, value_name = "URL")]
+    pub native_upstream_base_url: String,
     /// Loopback address used by the installed bridge provider.
     #[arg(long, default_value = "127.0.0.1:8746", value_name = "ADDRESS")]
     pub bind: String,
