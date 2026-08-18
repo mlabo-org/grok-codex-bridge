@@ -13,8 +13,8 @@ use grok_codex_bridge::launchd::{
     service_install, service_status, service_uninstall,
 };
 use grok_codex_bridge::lifecycle::{
-    AuthAvailability, DoctorCheckStatus, DoctorRequest, InstallRequest, UninstallRequest,
-    PickerInstallRequest, auth_status, doctor, install, uninstall, uninstall_picker,
+    AuthAvailability, DoctorCheckStatus, DoctorRequest, InstallRequest, PickerInstallRequest,
+    UninstallRequest, auth_status, doctor, install, uninstall, uninstall_picker,
 };
 use grok_codex_bridge::picker_activation::{PickerActivationRequest, activate_picker};
 use grok_codex_bridge::{
@@ -93,7 +93,11 @@ fn picker_command(command: PickerCommand) -> Result<ExitCode, OperationError> {
             let removed = uninstall_picker(&paths.install_root, &paths.codex_home)?;
             println!(
                 "picker state: {}",
-                if removed { "removed; restart the accepted Codex CLI/Desktop runtime before relying on configuration" } else { "not installed" }
+                if removed {
+                    "removed; restart the accepted Codex CLI/Desktop runtime before relying on configuration"
+                } else {
+                    "not installed"
+                }
             );
             Ok(ExitCode::SUCCESS)
         }
@@ -103,7 +107,10 @@ fn picker_command(command: PickerCommand) -> Result<ExitCode, OperationError> {
 fn picker_install_command(arguments: PickerInstallArgs) -> Result<ExitCode, OperationError> {
     let paths = resolve_lifecycle_paths(&arguments.paths)?;
     let native_catalog_path = require_absolute(arguments.native_catalog, "native catalog")?;
-    let bind = arguments.bind.parse::<SocketAddr>().map_err(|_| OperationError::InvalidBind)?;
+    let bind = arguments
+        .bind
+        .parse::<SocketAddr>()
+        .map_err(|_| OperationError::InvalidBind)?;
     let native_upstream = NativeUpstream::parse_base_url(&arguments.native_upstream_base_url)?;
     let launch_agent = recommended_launch_agent(&paths.install_root)?;
     let receipt = activate_picker(&PickerActivationRequest {
