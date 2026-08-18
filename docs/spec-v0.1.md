@@ -198,7 +198,7 @@ Responses input messageのrole、content order、`input_text`を対応するResp
 
 ## 22. Tool Definition
 
-Codexから渡されたfunction toolのname、description、parameters schemaを同じResponses tool schemaとして損失なく維持する。name変更、schema簡略化、description要約を行わない。
+Codexから渡されたfunction toolのname、description、parameters schemaを内部型では損失なく維持する。Grok providerへの投影だけは、xAIがrequest全体を拒否するroot unionまたはnullable object schemaをplain object rootへ限定的に展開し、宣言型と矛盾する`enum`/`const` literalを除去する。これはCodex app toolの実行時argument validationを置換せず、Native GPT経路のschemaは書換えない。name変更、description要約を行わない。
 
 ## 23. Tool Choice
 
