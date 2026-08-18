@@ -1,5 +1,5 @@
 use serde_json::{Map, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -28,6 +28,7 @@ const MAX_CLIENT_METADATA_TOTAL_VALUE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_REASONING_TEXT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ENCRYPTED_REASONING_BYTES: usize = 16 * 1024 * 1024;
 const MAX_REASONING_PARTS: usize = 64;
+const NAMESPACE_DELIMITER: &str = "__";
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ProtocolError {
@@ -116,6 +117,7 @@ pub struct NormalizedResponsesRequest {
     prompt_cache_key: OptionalJson,
     text: OptionalJson,
     _client_metadata: ClientMetadata,
+    namespace_projection: NamespaceToolProjection,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -152,6 +154,23 @@ struct FunctionCall {
     name: String,
     arguments: String,
     call_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeToolName {
+    namespace: String,
+    name: String,
+}
+
+/// Request-local map between Codex's native namespace tool identity and the
+/// flat function identity accepted by the Grok Responses endpoint.
+///
+/// Namespace strings themselves can contain `__`, so response restoration
+/// always uses this exact map and never tries to split a provider name.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct NamespaceToolProjection {
+    provider_to_native: HashMap<String, NativeToolName>,
+    native_to_provider: HashMap<(String, String), String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -276,8 +295,8 @@ impl NormalizedResponsesRequest {
 
         let model = required_nonempty_string(object, "model")?;
         let instructions = optional_string(object, "instructions")?;
-        let input = parse_input(required_array(object, "input")?)?;
-        let tools = parse_tools(object.get("tools"))?;
+        let (tools, namespace_projection) = parse_tools(object.get("tools"))?;
+        let input = parse_input(required_array(object, "input")?, &namespace_projection)?;
         let tool_choice = parse_tool_choice(required_value(object, "tool_choice")?)?;
         validate_tool_choice(&tool_choice, &tools)?;
         let parallel_tool_calls = required_bool(object, "parallel_tool_calls")?;
@@ -313,11 +332,16 @@ impl NormalizedResponsesRequest {
             prompt_cache_key,
             text,
             _client_metadata: client_metadata,
+            namespace_projection,
         })
     }
 
     pub fn model(&self) -> &str {
         &self.model
+    }
+
+    pub(crate) fn namespace_projection(&self) -> NamespaceToolProjection {
+        self.namespace_projection.clone()
     }
 
     pub fn grok_routing_metadata(&self) -> Result<GrokRoutingMetadata, ProtocolError> {
@@ -434,7 +458,10 @@ impl TryFrom<Value> for NormalizedResponsesRequest {
 }
 
 impl InputItem {
-    fn parse(value: &Value) -> Result<Self, ProtocolError> {
+    fn parse(
+        value: &Value,
+        namespace_projection: &NamespaceToolProjection,
+    ) -> Result<Self, ProtocolError> {
         let object = value
             .as_object()
             .ok_or(ProtocolError::InvalidRequestField("input"))?;
@@ -451,8 +478,14 @@ impl InputItem {
                 Ok(Self::Reasoning(PriorReasoning::parse(object)?))
             }
             "function_call" => {
-                reject_unknown_keys(object, &["type", "id", "name", "arguments", "call_id"])?;
-                Ok(Self::FunctionCall(FunctionCall::parse(object)?))
+                reject_unknown_keys(
+                    object,
+                    &["type", "id", "name", "namespace", "arguments", "call_id"],
+                )?;
+                Ok(Self::FunctionCall(FunctionCall::parse(
+                    object,
+                    namespace_projection,
+                )?))
             }
             "function_call_output" => {
                 reject_unknown_keys(object, &["type", "id", "call_id", "output"])?;
@@ -574,7 +607,10 @@ fn parse_prior_reasoning_parts(
 }
 
 impl FunctionCall {
-    fn parse(object: &Map<String, Value>) -> Result<Self, ProtocolError> {
+    fn parse(
+        object: &Map<String, Value>,
+        namespace_projection: &NamespaceToolProjection,
+    ) -> Result<Self, ProtocolError> {
         // Grok Build deliberately omits the response item id when replaying a
         // tool call. Validate Codex's output-only id, but do not forward it.
         optional_nonempty_string(object, "id")?;
@@ -584,8 +620,16 @@ impl FunctionCall {
         if !parsed.is_object() {
             return Err(ProtocolError::InvalidFunctionArguments);
         }
+        let native_name = required_nonempty_string(object, "name")?;
+        let name = match optional_nonempty_string(object, "namespace")? {
+            Some(namespace) => namespace_projection
+                .provider_name(&namespace, &native_name)
+                .ok_or(ProtocolError::InvalidRequestField("namespace"))?
+                .to_owned(),
+            None => native_name,
+        };
         Ok(Self {
-            name: required_nonempty_string(object, "name")?,
+            name,
             arguments,
             call_id: required_nonempty_string(object, "call_id")?,
         })
@@ -893,14 +937,17 @@ fn base64_value(byte: u8) -> Option<u8> {
     }
 }
 
-fn parse_input(values: &[Value]) -> Result<Vec<InputItem>, ProtocolError> {
+fn parse_input(
+    values: &[Value],
+    namespace_projection: &NamespaceToolProjection,
+) -> Result<Vec<InputItem>, ProtocolError> {
     let mut calls = HashSet::new();
     let mut outputs = HashSet::new();
     let mut reasoning_ids = HashSet::new();
     let mut assistant_output_started = false;
     let mut parsed = Vec::with_capacity(values.len());
     for value in values {
-        let item = InputItem::parse(value)?;
+        let item = InputItem::parse(value, namespace_projection)?;
         match &item {
             InputItem::Reasoning(reasoning) => {
                 if assistant_output_started || calls.len() != outputs.len() {
@@ -945,21 +992,140 @@ fn parse_input(values: &[Value]) -> Result<Vec<InputItem>, ProtocolError> {
     Ok(parsed)
 }
 
-fn parse_tools(value: Option<&Value>) -> Result<ToolsField, ProtocolError> {
-    match value {
-        None => Ok(ToolsField::Absent),
-        Some(Value::Null) => Ok(ToolsField::Null),
-        Some(Value::Array(tools)) => {
-            let mut names = HashSet::new();
-            let mut parsed = Vec::with_capacity(tools.len());
-            for tool in tools {
-                let tool = FunctionTool::parse(tool)?;
-                if !names.insert(tool.name.clone()) {
-                    return Err(ProtocolError::DuplicateToolName);
+impl NamespaceToolProjection {
+    fn provider_name(&self, namespace: &str, name: &str) -> Option<&str> {
+        self.native_to_provider
+            .get(&(namespace.to_owned(), name.to_owned()))
+            .map(String::as_str)
+    }
+
+    fn insert(
+        &mut self,
+        provider_name: String,
+        namespace: String,
+        name: String,
+    ) -> Result<(), ProtocolError> {
+        let native_key = (namespace.clone(), name.clone());
+        if self.native_to_provider.contains_key(&native_key)
+            || self.provider_to_native.contains_key(&provider_name)
+        {
+            return Err(ProtocolError::DuplicateToolName);
+        }
+        self.native_to_provider
+            .insert(native_key, provider_name.clone());
+        self.provider_to_native
+            .insert(provider_name, NativeToolName { namespace, name });
+        Ok(())
+    }
+
+    fn restore_function_item(&self, value: &mut Value) {
+        let Some(item) = value.as_object_mut() else {
+            return;
+        };
+        if item.get("type").and_then(Value::as_str) != Some("function_call") {
+            return;
+        }
+        let Some(provider_name) = item.get("name").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(native) = self.provider_to_native.get(provider_name) else {
+            return;
+        };
+        item.insert("name".into(), Value::String(native.name.clone()));
+        item.insert(
+            "namespace".into(),
+            Value::String(native.namespace.clone()),
+        );
+    }
+
+    fn restore_response_event(&self, value: &mut Value) {
+        if self.provider_to_native.is_empty() {
+            return;
+        }
+        let Some(event) = value.as_object_mut() else {
+            return;
+        };
+        match event.get("type").and_then(Value::as_str) {
+            Some("response.output_item.added" | "response.output_item.done") => {
+                if let Some(item) = event.get_mut("item") {
+                    self.restore_function_item(item);
                 }
-                parsed.push(tool);
             }
-            Ok(ToolsField::List(parsed))
+            Some("response.completed") => {
+                let Some(output) = event
+                    .get_mut("response")
+                    .and_then(Value::as_object_mut)
+                    .and_then(|response| response.get_mut("output"))
+                    .and_then(Value::as_array_mut)
+                else {
+                    return;
+                };
+                for item in output {
+                    self.restore_function_item(item);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn parse_tools(
+    value: Option<&Value>,
+) -> Result<(ToolsField, NamespaceToolProjection), ProtocolError> {
+    match value {
+        None => Ok((ToolsField::Absent, NamespaceToolProjection::default())),
+        Some(Value::Null) => Ok((ToolsField::Null, NamespaceToolProjection::default())),
+        Some(Value::Array(tools)) => {
+            let mut provider_names = HashSet::new();
+            let mut namespace_projection = NamespaceToolProjection::default();
+            let mut parsed = Vec::with_capacity(tools.len());
+            for value in tools {
+                let object = value.as_object().ok_or(ProtocolError::UnsupportedTools)?;
+                match required_string(object, "type")? {
+                    "function" => {
+                        let tool = FunctionTool::parse(value)?;
+                        if !provider_names.insert(tool.name.clone()) {
+                            return Err(ProtocolError::DuplicateToolName);
+                        }
+                        parsed.push(tool);
+                    }
+                    "namespace" => {
+                        if reject_unknown_keys_for(
+                            object,
+                            &["type", "name", "description", "tools"],
+                        )
+                        .is_err()
+                        {
+                            return Err(ProtocolError::UnsupportedTools);
+                        }
+                        let namespace = required_nonempty_string(object, "name")?;
+                        required_string(object, "description")?;
+                        let children = required_array(object, "tools")?;
+                        let mut native_names = HashSet::new();
+                        for child in children {
+                            let mut tool = FunctionTool::parse(child)?;
+                            if !native_names.insert(tool.name.clone()) {
+                                return Err(ProtocolError::DuplicateToolName);
+                            }
+                            let native_name = tool.name.clone();
+                            let provider_name =
+                                format!("{namespace}{NAMESPACE_DELIMITER}{native_name}");
+                            if !provider_names.insert(provider_name.clone()) {
+                                return Err(ProtocolError::DuplicateToolName);
+                            }
+                            namespace_projection.insert(
+                                provider_name.clone(),
+                                namespace.clone(),
+                                native_name,
+                            )?;
+                            tool.name = provider_name;
+                            parsed.push(tool);
+                        }
+                    }
+                    _ => return Err(ProtocolError::UnsupportedTools),
+                }
+            }
+            Ok((ToolsField::List(parsed), namespace_projection))
         }
         Some(_) => Err(ProtocolError::UnsupportedTools),
     }
@@ -1388,6 +1554,13 @@ impl ValidatedTextStreamEvent {
 
     pub fn into_original(self) -> Value {
         self.original
+    }
+
+    pub(crate) fn restore_namespaced_tool_calls(
+        &mut self,
+        namespace_projection: &NamespaceToolProjection,
+    ) {
+        namespace_projection.restore_response_event(&mut self.original);
     }
 }
 
@@ -3265,6 +3438,123 @@ mod tests {
         specific["input"][2].as_object_mut().unwrap().remove("id");
         specific["input"][3].as_object_mut().unwrap().remove("id");
         assert_eq!(normalized.into_xai_value(), specific);
+    }
+
+    #[test]
+    fn codex_namespace_functions_are_flattened_replayed_and_restored_by_exact_map() {
+        let mut request = request_fixture();
+        request["input"] = json!([
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "君は誰だ？"}]
+            },
+            {
+                "type": "function_call",
+                "id": "fc_history_1",
+                "namespace": "mcp__demo",
+                "name": "ping",
+                "call_id": "call_ping_1",
+                "arguments": "{}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_ping_1",
+                "output": "pong"
+            }
+        ]);
+        request["tools"] = json!([{
+            "type": "namespace",
+            "name": "mcp__demo",
+            "description": "Tools in the mcp__demo namespace.",
+            "tools": [{
+                "type": "function",
+                "name": "ping",
+                "description": "",
+                "strict": false,
+                "parameters": {"type": "object", "properties": {}}
+            }]
+        }]);
+
+        let normalized = NormalizedResponsesRequest::parse(request).unwrap();
+        let upstream = normalized.to_xai_value();
+        assert_eq!(upstream["tools"][0]["type"], "function");
+        assert_eq!(upstream["tools"][0]["name"], "mcp__demo__ping");
+        assert_eq!(upstream["input"][1]["name"], "mcp__demo__ping");
+        assert!(
+            upstream["input"][1]
+                .as_object()
+                .unwrap()
+                .get("namespace")
+                .is_none()
+        );
+
+        let projection = normalized.namespace_projection();
+        let mut added = json!({
+            "type": "response.output_item.added",
+            "sequence_number": 1,
+            "output_index": 0,
+            "item": {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "mcp__demo__ping",
+                "arguments": ""
+            }
+        });
+        projection.restore_response_event(&mut added);
+        assert_eq!(added["item"]["name"], "ping");
+        assert_eq!(added["item"]["namespace"], "mcp__demo");
+
+        let mut completed = json!({
+            "type": "response.completed",
+            "sequence_number": 5,
+            "response": {
+                "id": "resp_1",
+                "output": [{
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "mcp__demo__ping",
+                    "arguments": "{}"
+                }]
+            }
+        });
+        projection.restore_response_event(&mut completed);
+        assert_eq!(completed["response"]["output"][0]["name"], "ping");
+        assert_eq!(
+            completed["response"]["output"][0]["namespace"],
+            "mcp__demo"
+        );
+    }
+
+    #[test]
+    fn namespace_projection_fails_closed_on_flat_name_collision() {
+        let mut request = request_fixture();
+        request["tools"] = json!([
+            {
+                "type": "function",
+                "name": "mcp__demo__ping",
+                "description": "plain",
+                "parameters": {"type": "object", "properties": {}}
+            },
+            {
+                "type": "namespace",
+                "name": "mcp__demo",
+                "description": "demo",
+                "tools": [{
+                    "type": "function",
+                    "name": "ping",
+                    "description": "nested",
+                    "strict": false,
+                    "parameters": {"type": "object", "properties": {}}
+                }]
+            }
+        ]);
+        assert_eq!(
+            NormalizedResponsesRequest::parse(request).unwrap_err(),
+            ProtocolError::DuplicateToolName
+        );
     }
 
     #[test]

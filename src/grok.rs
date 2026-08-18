@@ -14,7 +14,8 @@ use uuid::Uuid;
 
 use crate::credential::SessionCredential;
 use crate::protocol::{
-    NormalizedResponsesRequest, ProtocolError, TextStreamValidator, ValidatedTextStreamEvent,
+    NamespaceToolProjection, NormalizedResponsesRequest, ProtocolError, TextStreamValidator,
+    ValidatedTextStreamEvent,
 };
 
 const OFFICIAL_INFERENCE_BASE: &str = "https://cli-chat-proxy.grok.com/v1/";
@@ -128,6 +129,7 @@ impl GrokClient {
         Ok(ResponsesByteStream {
             inner: Box::pin(stream),
             _credential: credential,
+            namespace_projection: request.body.namespace_projection(),
         })
     }
 
@@ -159,6 +161,7 @@ pub struct ResponsesTransportRequest<'a> {
 pub struct ResponsesByteStream {
     inner: Pin<Box<dyn Stream<Item = Result<Bytes, GrokError>> + Send>>,
     _credential: Arc<SessionCredential>,
+    namespace_projection: NamespaceToolProjection,
 }
 
 impl Stream for ResponsesByteStream {
@@ -174,6 +177,7 @@ impl Stream for ResponsesByteStream {
 
 impl ResponsesByteStream {
     pub fn validated_text_events(self) -> ValidatedTextEventStream {
+        let namespace_projection = self.namespace_projection.clone();
         let data = self.eventsource().map(|event| {
             event
                 .map(|event| event.data)
@@ -182,6 +186,7 @@ impl ResponsesByteStream {
         ValidatedTextEventStream {
             inner: Box::pin(data),
             validator: TextStreamValidator::new(),
+            namespace_projection,
             finished: false,
         }
     }
@@ -190,6 +195,7 @@ impl ResponsesByteStream {
 pub struct ValidatedTextEventStream {
     inner: Pin<Box<dyn Stream<Item = Result<String, GrokError>> + Send>>,
     validator: TextStreamValidator,
+    namespace_projection: NamespaceToolProjection,
     finished: bool,
 }
 
@@ -206,7 +212,10 @@ impl Stream for ValidatedTextEventStream {
 
         match self.inner.as_mut().poll_next(context) {
             std::task::Poll::Ready(Some(Ok(data))) => match self.validator.accept_data(&data) {
-                Ok(event) => std::task::Poll::Ready(Some(Ok(event))),
+                Ok(mut event) => {
+                    event.restore_namespaced_tool_calls(&self.namespace_projection);
+                    std::task::Poll::Ready(Some(Ok(event)))
+                }
                 Err(error) => {
                     self.finished = true;
                     std::task::Poll::Ready(Some(Err(GrokError::Protocol(error))))
@@ -523,6 +532,106 @@ mod tests {
             }
         }
         assert_eq!(deltas, "ok");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn responses_transport_projects_codex_namespace_tools_in_both_directions() {
+        async fn responses(Json(body): Json<Value>) -> Response<Body> {
+            assert_eq!(body["tools"][0]["type"], "function");
+            assert_eq!(body["tools"][0]["name"], "mcp__demo__ping");
+            let added = json!({
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "mcp__demo__ping",
+                "arguments": "",
+                "status": "in_progress"
+            });
+            let done = json!({
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "mcp__demo__ping",
+                "arguments": "{}",
+                "status": "completed"
+            });
+            let events = [
+                json!({"type":"response.created","sequence_number":0,"response":{"id":"resp_1","output":[]}}),
+                json!({"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":added}),
+                json!({"type":"response.function_call_arguments.delta","sequence_number":2,"item_id":"fc_1","output_index":0,"delta":"{}"}),
+                json!({"type":"response.function_call_arguments.done","sequence_number":3,"item_id":"fc_1","output_index":0,"arguments":"{}"}),
+                json!({"type":"response.output_item.done","sequence_number":4,"output_index":0,"item":done.clone()}),
+                json!({"type":"response.completed","sequence_number":5,"response":{"id":"resp_1","output":[done]}}),
+            ];
+            let stream_body = events
+                .into_iter()
+                .map(|event| format!("data: {event}\n\n"))
+                .collect::<String>();
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "text/event-stream; charset=utf-8")
+                .body(Body::from(stream_body))
+                .unwrap()
+        }
+
+        let (base, task) = start(Router::new().route("/v1/responses", post(responses))).await;
+        let client = GrokClient::for_test(base).unwrap();
+        let body = NormalizedResponsesRequest::parse(json!({
+            "model": "grok-4.6",
+            "instructions": "Use the admitted tool.",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "ping"}]
+            }],
+            "tools": [{
+                "type": "namespace",
+                "name": "mcp__demo",
+                "description": "Tools in the mcp__demo namespace.",
+                "tools": [{
+                    "type": "function",
+                    "name": "ping",
+                    "description": "",
+                    "strict": false,
+                    "parameters": {"type": "object", "properties": {}}
+                }]
+            }],
+            "tool_choice": "auto",
+            "parallel_tool_calls": false,
+            "reasoning": {"effort": "xhigh", "summary": "auto"},
+            "store": false,
+            "stream": true,
+            "include": ["reasoning.encrypted_content"]
+        }))
+        .unwrap();
+        let stream = client
+            .post_responses(
+                Arc::new(test_session_credential("stream-secret", "user-1")),
+                ResponsesTransportRequest {
+                    body: &body,
+                    conversation_id: Uuid::new_v4(),
+                    request_id: Uuid::new_v4(),
+                    agent_id: Uuid::new_v4(),
+                    turn_index: 1,
+                },
+            )
+            .await
+            .unwrap();
+        let events = stream
+            .validated_text_events()
+            .map(|event| event.unwrap().into_original())
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(events[1]["item"]["name"], "ping");
+        assert_eq!(events[1]["item"]["namespace"], "mcp__demo");
+        assert_eq!(events[4]["item"]["name"], "ping");
+        assert_eq!(events[4]["item"]["namespace"], "mcp__demo");
+        assert_eq!(events[5]["response"]["output"][0]["name"], "ping");
+        assert_eq!(
+            events[5]["response"]["output"][0]["namespace"],
+            "mcp__demo"
+        );
         task.abort();
     }
 }
