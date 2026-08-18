@@ -11,6 +11,7 @@ const PICKER_POLICY_VERSION: u32 = 2;
 const MANAGED_STATE_VERSION: u32 = 2;
 const GROK_ENTRY_DESCRIPTION: &str = "Grok model served through Grok Codex Bridge.";
 const GROK_BASE_INSTRUCTIONS: &str = "You are Codex, a coding agent using the selected Grok model through Grok Codex Bridge. Follow the developer and user instructions supplied by Codex, and use Codex tools when needed.";
+const GROK_CONTEXT_WINDOW: i64 = 272_000;
 
 /// A generated complete-replacement Codex catalog.
 ///
@@ -162,8 +163,8 @@ fn grok_picker_entry(id: &str, priority: i32) -> Value {
         },
         "supports_parallel_tool_calls": true,
         "supports_image_detail_original": false,
-        "context_window": null,
-        "max_context_window": null,
+        "context_window": GROK_CONTEXT_WINDOW,
+        "max_context_window": GROK_CONTEXT_WINDOW,
         "auto_compact_token_limit": null,
         "comp_hash": null,
         "effective_context_window_percent": 95,
@@ -705,7 +706,11 @@ mod tests {
         assert_eq!(after["models"][1]["slug"], "grok-4.6");
         assert!(after["models"][1].get("model_provider").is_none());
         assert_eq!(after["models"][1]["display_name"], "grok-4.6");
-        assert_eq!(after["models"][1]["context_window"], Value::Null);
+        assert_eq!(after["models"][1]["context_window"], GROK_CONTEXT_WINDOW);
+        assert_eq!(
+            after["models"][1]["max_context_window"],
+            GROK_CONTEXT_WINDOW
+        );
         assert_eq!(after["models"][1]["default_reasoning_level"], "high");
         assert_eq!(
             after["models"][1]["supported_reasoning_levels"],
