@@ -236,7 +236,13 @@ enum ToolChoice {
 enum ToolsField {
     Absent,
     Null,
-    List(Vec<FunctionTool>),
+    List(Vec<ProjectedTool>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum ProjectedTool {
+    Function(FunctionTool),
+    HostedWebSearch,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1077,6 +1083,7 @@ fn parse_tools(
         Some(Value::Null) => Ok((ToolsField::Null, NamespaceToolProjection::default())),
         Some(Value::Array(tools)) => {
             let mut provider_names = HashSet::new();
+            let mut has_hosted_web_search = false;
             let mut namespace_projection = NamespaceToolProjection::default();
             let mut parsed = Vec::with_capacity(tools.len());
             for value in tools {
@@ -1087,7 +1094,7 @@ fn parse_tools(
                         if !provider_names.insert(tool.name.clone()) {
                             return Err(ProtocolError::DuplicateToolName);
                         }
-                        parsed.push(tool);
+                        parsed.push(ProjectedTool::Function(tool));
                     }
                     "namespace" => {
                         if reject_unknown_keys_for(
@@ -1119,8 +1126,25 @@ fn parse_tools(
                                 native_name,
                             )?;
                             tool.name = provider_name;
-                            parsed.push(tool);
+                            parsed.push(ProjectedTool::Function(tool));
                         }
+                    }
+                    "web_search" => {
+                        if reject_unknown_keys_for(object, &["type", "external_web_access"])
+                            .is_err()
+                            || !matches!(object.get("external_web_access"), Some(Value::Bool(_)))
+                        {
+                            return Err(ProtocolError::UnsupportedTools);
+                        }
+                        if has_hosted_web_search {
+                            return Err(ProtocolError::DuplicateToolName);
+                        }
+                        has_hosted_web_search = true;
+                        // Codex distinguishes cached/live access with an OpenAI-only
+                        // field. Grok's Responses proxy exposes the same hosted tool
+                        // as a bare type tag, so the provider projection ends that
+                        // transport detail here instead of forwarding it upstream.
+                        parsed.push(ProjectedTool::HostedWebSearch);
                     }
                     _ => return Err(ProtocolError::UnsupportedTools),
                 }
@@ -1218,7 +1242,11 @@ fn validate_tool_choice(choice: &ToolChoice, tools: &ToolsField) -> Result<(), P
     };
     match choice {
         ToolChoice::Required if admitted.is_empty() => Err(ProtocolError::UnknownToolChoice),
-        ToolChoice::Function(name) if !admitted.iter().any(|tool| tool.name == *name) => {
+        ToolChoice::Function(name)
+            if !admitted.iter().any(
+                |tool| matches!(tool, ProjectedTool::Function(tool) if tool.name == *name),
+            ) =>
+        {
             Err(ProtocolError::UnknownToolChoice)
         }
         _ => Ok(()),
@@ -1234,7 +1262,17 @@ fn insert_tools(object: &mut Map<String, Value>, tools: &ToolsField) {
         ToolsField::List(tools) => {
             object.insert(
                 "tools".into(),
-                Value::Array(tools.iter().map(FunctionTool::to_value).collect()),
+                Value::Array(
+                    tools
+                        .iter()
+                        .map(|tool| match tool {
+                            ProjectedTool::Function(tool) => tool.to_value(),
+                            ProjectedTool::HostedWebSearch => {
+                                serde_json::json!({"type": "web_search"})
+                            }
+                        })
+                        .collect(),
+                ),
             );
         }
     }
@@ -3525,6 +3563,46 @@ mod tests {
         assert_eq!(
             completed["response"]["output"][0]["namespace"],
             "mcp__demo"
+        );
+    }
+
+    #[test]
+    fn codex_cached_web_search_is_projected_to_grok_hosted_search() {
+        let mut request = request_fixture();
+        request["tools"] = json!([
+            {
+                "type": "namespace",
+                "name": "mcp__demo",
+                "description": "Tools in the mcp__demo namespace.",
+                "tools": [{
+                    "type": "function",
+                    "name": "ping",
+                    "description": "",
+                    "strict": false,
+                    "parameters": {"type": "object", "properties": {}}
+                }]
+            },
+            {
+                "type": "web_search",
+                "external_web_access": false
+            }
+        ]);
+
+        let upstream = NormalizedResponsesRequest::parse(request)
+            .unwrap()
+            .to_xai_value();
+        assert_eq!(
+            upstream["tools"],
+            json!([
+                {
+                    "type": "function",
+                    "name": "mcp__demo__ping",
+                    "description": "",
+                    "strict": false,
+                    "parameters": {"type": "object", "properties": {}}
+                },
+                {"type": "web_search"}
+            ])
         );
     }
 
