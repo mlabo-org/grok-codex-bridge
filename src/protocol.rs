@@ -149,6 +149,8 @@ enum InputItem {
     FunctionCallOutput(FunctionCallOutput),
     ToolSearchCall(ToolSearchCall),
     ToolSearchOutput(ToolSearchOutput),
+    ForeignCustomToolCall,
+    ForeignCustomToolCallOutput,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -453,7 +455,9 @@ impl NormalizedResponsesRequest {
                 | InputItem::FunctionCall(_)
                 | InputItem::FunctionCallOutput(_)
                 | InputItem::ToolSearchCall(_)
-                | InputItem::ToolSearchOutput(_) => in_user_block = false,
+                | InputItem::ToolSearchOutput(_)
+                | InputItem::ForeignCustomToolCall
+                | InputItem::ForeignCustomToolCallOutput => in_user_block = false,
             }
         }
         if turn_index == 0 {
@@ -539,6 +543,7 @@ impl InputItem {
                         "id",
                         "role",
                         "content",
+                        "phase",
                         INTERNAL_MESSAGE_METADATA_FIELD,
                     ],
                 )?;
@@ -623,39 +628,94 @@ impl InputItem {
                     tools,
                 }))
             }
+            "custom_tool_call" => {
+                reject_unknown_keys(
+                    object,
+                    &[
+                        "type",
+                        "id",
+                        "status",
+                        "call_id",
+                        "name",
+                        "namespace",
+                        "input",
+                        INTERNAL_MESSAGE_METADATA_FIELD,
+                    ],
+                )?;
+                validate_internal_message_metadata(object)?;
+                optional_nonempty_string(object, "id")?;
+                match object.get("status") {
+                    None | Some(Value::Null) => {}
+                    Some(Value::String(status)) if status == "completed" => {}
+                    _ => return Err(ProtocolError::InvalidRequestField("status")),
+                }
+                required_nonempty_string(object, "call_id")?;
+                required_nonempty_string(object, "name")?;
+                validate_optional_nullable_nonempty_string(object, "namespace")?;
+                required_string(object, "input")?;
+                Ok(Self::ForeignCustomToolCall)
+            }
+            "custom_tool_call_output" => {
+                reject_unknown_keys(
+                    object,
+                    &[
+                        "type",
+                        "id",
+                        "call_id",
+                        "name",
+                        "output",
+                        INTERNAL_MESSAGE_METADATA_FIELD,
+                    ],
+                )?;
+                validate_internal_message_metadata(object)?;
+                optional_nonempty_string(object, "id")?;
+                required_nonempty_string(object, "call_id")?;
+                validate_optional_nullable_nonempty_string(object, "name")?;
+                validate_foreign_custom_tool_output(required_value(object, "output")?)?;
+                Ok(Self::ForeignCustomToolCallOutput)
+            }
             _ => Err(ProtocolError::UnsupportedInputItem),
-        }
-    }
-
-    fn to_value(&self) -> Value {
-        match self {
-            Self::Message(message) => message.to_value(),
-            Self::Reasoning(reasoning) => reasoning.to_value(),
-            Self::FunctionCall(call) => call.to_value(),
-            Self::FunctionCallOutput(output) => output.to_value(),
-            Self::ToolSearchCall(call) => serde_json::json!({
-                "type": "function_call",
-                "name": "tool_search",
-                "arguments": call.arguments.to_string(),
-                "call_id": call.call_id,
-            }),
-            Self::ToolSearchOutput(output) => serde_json::json!({
-                "type": "function_call_output",
-                "call_id": output.call_id,
-                "output": serde_json::json!({"tools": output.tools}).to_string(),
-            }),
         }
     }
 
     fn to_grok_value(&self) -> Option<Value> {
         match self {
+            Self::Message(message) => Some(message.to_value()),
             Self::Reasoning(reasoning)
-                if !matches!(reasoning.encrypted_content, PriorEncryptedContent::Grok(_)) =>
+                if matches!(reasoning.encrypted_content, PriorEncryptedContent::Grok(_)) =>
             {
-                None
+                Some(reasoning.to_value())
             }
-            _ => Some(self.to_value()),
+            Self::Reasoning(_)
+            | Self::ForeignCustomToolCall
+            | Self::ForeignCustomToolCallOutput => None,
+            Self::FunctionCall(call) => Some(call.to_value()),
+            Self::FunctionCallOutput(output) => Some(output.to_value()),
+            Self::ToolSearchCall(call) => Some(serde_json::json!({
+                "type": "function_call",
+                "name": "tool_search",
+                "arguments": call.arguments.to_string(),
+                "call_id": call.call_id,
+            })),
+            Self::ToolSearchOutput(output) => Some(serde_json::json!({
+                "type": "function_call_output",
+                "call_id": output.call_id,
+                "output": serde_json::json!({"tools": output.tools}).to_string(),
+            })),
         }
+    }
+}
+
+fn validate_foreign_custom_tool_output(value: &Value) -> Result<(), ProtocolError> {
+    match value {
+        Value::String(_) => Ok(()),
+        Value::Array(parts) => {
+            for part in parts {
+                InputContent::parse(part)?;
+            }
+            Ok(())
+        }
+        _ => Err(ProtocolError::InvalidRequestField("output")),
     }
 }
 
@@ -948,6 +1008,13 @@ impl TextMessage {
             "assistant" => MessageRole::Assistant,
             _ => return Err(ProtocolError::InvalidRequestField("role")),
         };
+        match object.get("phase") {
+            None => {}
+            Some(Value::String(phase))
+                if role == MessageRole::Assistant
+                    && matches!(phase.as_str(), "commentary" | "final_answer") => {}
+            _ => return Err(ProtocolError::InvalidRequestField("phase")),
+        }
         let content = required_array(object, "content")?
             .iter()
             .map(MessageContent::parse)
@@ -1246,6 +1313,10 @@ fn parse_input(
                     assistant_output_started = false;
                 }
             }
+            // Native custom tools are executed and recorded by the Codex
+            // harness. They are complete foreign history, not Grok tool-loop
+            // state, so validation terminates at the bridge boundary.
+            InputItem::ForeignCustomToolCall | InputItem::ForeignCustomToolCallOutput => {}
             InputItem::Message(message) => match message.role {
                 MessageRole::User | MessageRole::Developer => {
                     if calls.len() != outputs.len() {
@@ -2030,6 +2101,17 @@ fn optional_nonempty_string(
     match optional_string(object, key)? {
         Some(value) if value.trim().is_empty() => Err(ProtocolError::InvalidRequestField(key)),
         value => Ok(value),
+    }
+}
+
+fn validate_optional_nullable_nonempty_string(
+    object: &Map<String, Value>,
+    key: &'static str,
+) -> Result<(), ProtocolError> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::String(value)) if !value.trim().is_empty() => Ok(()),
+        _ => Err(ProtocolError::InvalidRequestField(key)),
     }
 }
 
@@ -4084,7 +4166,32 @@ mod tests {
             },
             {
                 "type": "message", "role": "assistant",
+                "phase": "commentary",
                 "content": [{"type": "output_text", "text": "working"}]
+            },
+            {
+                "type": "custom_tool_call",
+                "id": "ctc_native_1",
+                "status": "completed",
+                "call_id": "call_native_1",
+                "name": "exec",
+                "namespace": null,
+                "input": "const result = await tools.exec_command({cmd: \"pwd\"});",
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": "turn-native-1",
+                    "create_time": 1.0
+                }
+            },
+            {
+                "type": "custom_tool_call_output",
+                "id": "ctco_native_1",
+                "call_id": "call_native_1",
+                "name": null,
+                "output": [{"type": "input_text", "text": "workspace"}],
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": "turn-native-1",
+                    "create_time": 2.0
+                }
             },
             {
                 "type": "reasoning", "id": "rs_native_2",
@@ -4092,6 +4199,7 @@ mod tests {
             },
             {
                 "type": "message", "role": "assistant",
+                "phase": "final_answer",
                 "content": [{"type": "output_text", "text": "done"}]
             },
             {
@@ -4106,6 +4214,15 @@ mod tests {
         let input = upstream["input"].as_array().unwrap();
         assert_eq!(input.len(), 4);
         assert!(input.iter().all(|item| item["type"] != "reasoning"));
+        assert!(input.iter().all(|item| item["type"] != "custom_tool_call"));
+        assert!(
+            input
+                .iter()
+                .all(|item| item["type"] != "custom_tool_call_output")
+        );
+        assert!(input.iter().all(|item| item.get("phase").is_none()));
+        assert_eq!(input[1]["content"], "working");
+        assert_eq!(input[2]["content"], "done");
         assert_eq!(input[3]["content"][0]["text"], "continue with Grok");
     }
 
@@ -4260,18 +4377,6 @@ mod tests {
         assert_eq!(
             NormalizedResponsesRequest::parse(unknown).unwrap_err(),
             ProtocolError::UnsupportedTopLevelField
-        );
-
-        let mut custom_call = request_fixture();
-        custom_call["input"] = json!([{
-            "type": "custom_tool_call",
-            "name": "patch",
-            "call_id": "call_1",
-            "input": "payload"
-        }]);
-        assert_eq!(
-            NormalizedResponsesRequest::parse(custom_call).unwrap_err(),
-            ProtocolError::UnsupportedInputItem
         );
 
         let mut tools = request_fixture();
