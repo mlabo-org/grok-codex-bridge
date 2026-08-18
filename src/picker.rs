@@ -80,6 +80,14 @@ pub fn generate_picker_catalog(
             return Err(PickerError::DuplicateSlug(slug.to_owned()));
         }
     }
+    // Remote catalog metadata is not routing authority.  The generated local
+    // catalog makes the native provider explicit for every copied native row.
+    for model in native_models.iter_mut() {
+        model
+            .as_object_mut()
+            .expect("validated native picker entry must be an object")
+            .insert("model_provider".to_owned(), Value::String("openai".to_owned()));
+    }
 
     let native_model_count = native_models.len();
     let mut grok_ids = grok_catalog.models().to_vec();
@@ -108,6 +116,7 @@ pub fn generate_picker_catalog(
 fn grok_picker_entry(id: &str, priority: i32) -> Value {
     let mut entry = json!({
         "slug": id,
+        "model_provider": "grok_bridge",
         "display_name": id,
         "description": GROK_ENTRY_DESCRIPTION,
         "default_reasoning_level": "high",
@@ -528,6 +537,11 @@ impl PickerManagedState {
         &self.managed_config
     }
 
+    #[must_use]
+    pub fn config_rollback(&self) -> &ConfigRollbackOwnership {
+        &self.config_rollback
+    }
+
     fn validate(&self) -> Result<(), PickerError> {
         if self.version != MANAGED_STATE_VERSION || self.policy_version != PICKER_POLICY_VERSION {
             return Err(PickerError::InvalidManagedState(
@@ -558,7 +572,7 @@ impl PickerManagedState {
         } = &self.config_rollback
         {
             backup.validate()?;
-            if *original_mode != 0o600
+            if !matches!(*original_mode, 0o600 | 0o644)
                 || backup.path() == self.managed_config.path()
                 || backup.path().parent() != self.managed_config.path().parent()
                 || !backup
@@ -666,9 +680,12 @@ mod tests {
 
         assert_eq!(generated.native_model_count(), 1);
         assert_eq!(generated.grok_model_count(), 1);
-        assert_eq!(after["models"][0], before["models"][0]);
+        let mut expected_native = before["models"][0].clone();
+        expected_native["model_provider"] = json!("openai");
+        assert_eq!(after["models"][0], expected_native);
         assert_eq!(after["future_top_level"], before["future_top_level"]);
         assert_eq!(after["models"][1]["slug"], "grok-4.6");
+        assert_eq!(after["models"][1]["model_provider"], "grok_bridge");
         assert_eq!(after["models"][1]["display_name"], "grok-4.6");
         assert_eq!(after["models"][1]["context_window"], Value::Null);
         assert_eq!(after["models"][1]["default_reasoning_level"], "high");

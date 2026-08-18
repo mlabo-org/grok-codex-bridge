@@ -5,10 +5,13 @@ use std::path::{Component, Path, PathBuf};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::catalog::CatalogCache;
 use crate::credential::CredentialStore;
+use crate::picker::{ArtifactIdentity, ConfigRollbackOwnership, PickerManagedState, generate_picker_catalog};
 
 const MANIFEST_VERSION: u32 = 1;
 const CONFIG_VERSION: u32 = 1;
@@ -18,6 +21,10 @@ const PROFILE_PROVIDER_NAME: &str = "Grok Codex Bridge";
 const BINARY_FILE_NAME: &str = "grok-codex-bridge";
 const MAX_CONTROL_FILE_BYTES: u64 = 1024 * 1024;
 const CAPABILITY_LENGTH: usize = 64;
+const PICKER_CATALOG_FILE_NAME: &str = "picker-models.json";
+const PICKER_STATE_FILE_NAME: &str = "picker-managed-state.json";
+const PICKER_BEGIN: &str = "# >>> grok-codex-bridge picker begin >>>";
+const PICKER_END: &str = "# <<< grok-codex-bridge picker end <<<";
 
 /// Complete, explicit inputs owned by the filesystem lifecycle producer.
 pub struct InstallRequest {
@@ -55,6 +62,24 @@ pub struct UninstallReceipt {
     pub install_root: PathBuf,
     pub profile_restored: bool,
     pub launch_agent_restored: bool,
+}
+
+/// Inputs for the Phase J generated-catalog lifecycle. The caller supplies
+/// the authoritative local native catalog; it is copied, never edited.
+pub struct PickerInstallRequest {
+    pub install_root: PathBuf,
+    pub codex_home: PathBuf,
+    pub native_catalog_path: PathBuf,
+    pub bind: SocketAddr,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PickerInstallReceipt {
+    pub generated_catalog_path: PathBuf,
+    pub managed_state_path: PathBuf,
+    pub config_path: PathBuf,
+    pub native_model_count: usize,
+    pub grok_model_count: usize,
 }
 
 pub struct DoctorRequest {
@@ -259,6 +284,10 @@ pub fn uninstall(request: &UninstallRequest) -> Result<UninstallReceipt, Lifecyc
     validate_manifest(&manifest, request)?;
     let managed = validate_managed_install(&manifest, &raw_manifest)?;
 
+    // A picker install has its own exact rollback state, but full bridge
+    // uninstall is the terminal owner and must restore it first.
+    uninstall_picker_if_present(&request.install_root, &request.codex_home)?;
+
     let profile_restore = RestorePlan::new(
         &manifest.profile_path,
         manifest.profile_backup.as_ref(),
@@ -306,6 +335,131 @@ pub fn uninstall(request: &UninstallRequest) -> Result<UninstallReceipt, Lifecyc
         profile_restored: !manifest.profile_created,
         launch_agent_restored: !manifest.launch_agent_created,
     })
+}
+
+/// Creates or updates the non-secret Phase J generated picker state. It does
+/// not start a service or reload Codex; callers must cross that boundary
+/// explicitly with the exact accepted Codex binary.
+pub fn install_picker(request: &PickerInstallRequest) -> Result<PickerInstallReceipt, LifecycleError> {
+    validate_absolute_clean(&request.install_root)?;
+    validate_absolute_clean(&request.codex_home)?;
+    validate_absolute_clean(&request.native_catalog_path)?;
+    validate_safe_root(&request.install_root, &request.codex_home)?;
+    if !request.bind.ip().is_loopback() || request.bind.port() == 0 {
+        return Err(LifecycleError::NonLoopbackBind);
+    }
+    let manifest_request = UninstallRequest {
+        install_root: request.install_root.clone(),
+        codex_home: request.codex_home.clone(),
+        launch_agent_path: request.install_root.join(".picker-unused-launch-agent"),
+    };
+    let (install_manifest, _) = read_manifest(&request.install_root)?;
+    // Picker ownership is possible only on a valid V1.0 bridge root. The
+    // launch-agent path is checked separately by the root manifest, so use
+    // the deterministic V1.0 fields here rather than an external target.
+    if install_manifest.install_root != request.install_root
+        || install_manifest.profile_path != request.codex_home.join(PROFILE_FILE_NAME)
+        || install_manifest.catalog_cache_path != request.install_root.join("state/models.json")
+        || install_manifest.caller_token_path != request.install_root.join("secrets/caller-capability")
+    {
+        return Err(LifecycleError::InvalidManifest);
+    }
+    let _ = manifest_request;
+
+    let native_bytes = read_regular_file(&request.native_catalog_path, MAX_CONTROL_FILE_BYTES)?;
+    let grok_catalog = CatalogCache::new(&install_manifest.catalog_cache_path)
+        .load()
+        .map_err(LifecycleError::Catalog)?
+        .ok_or(LifecycleError::PickerCatalogUnavailable)?;
+    let generated = generate_picker_catalog(&native_bytes, &grok_catalog)
+        .map_err(LifecycleError::Picker)?;
+    let capability = read_private_control_file(&install_manifest.caller_token_path)?;
+    let capability = validate_capability_bytes(&capability)?;
+    let config_path = request.codex_home.join("config.toml");
+    let generated_path = request.install_root.join("state").join(PICKER_CATALOG_FILE_NAME);
+    let state_path = request.install_root.join("state").join(PICKER_STATE_FILE_NAME);
+
+    let prior_state = read_picker_state(&state_path)?;
+    let config_plan = prepare_picker_config(&config_path, prior_state.as_ref())?;
+    let config_contents = render_picker_config(
+        config_plan.current.as_deref().unwrap_or_default(),
+        &generated_path,
+        request.bind,
+        capability,
+    )?;
+
+    let previous_generated = read_optional_control_file(&generated_path, &[0o600])?;
+    let previous_state = read_optional_control_file(&state_path, &[0o600])?;
+    atomic_write(&generated_path, generated.bytes(), 0o600)?;
+    if let Err(error) = atomic_write(&config_path, config_contents.as_bytes(), 0o600) {
+        restore_optional_file(&generated_path, previous_generated.as_deref(), 0o600)?;
+        return Err(error);
+    }
+
+    let generated_identity = artifact_identity(&generated_path, generated.bytes())?;
+    let config_identity = artifact_identity(&config_path, config_contents.as_bytes())?;
+    let rollback = config_plan.rollback.clone();
+    let state = PickerManagedState::new(
+        artifact_identity(&request.native_catalog_path, &native_bytes)?,
+        &grok_catalog,
+        generated_identity,
+        config_identity,
+        rollback,
+    )
+    .map_err(LifecycleError::Picker)?;
+    let state_bytes = state.to_json().map_err(LifecycleError::Picker)?;
+    if let Err(error) = atomic_write(&state_path, &state_bytes, 0o600) {
+        restore_optional_file(&config_path, config_plan.current.as_deref(), config_plan.previous_mode)?;
+        restore_optional_file(&generated_path, previous_generated.as_deref(), 0o600)?;
+        restore_optional_file(&state_path, previous_state.as_deref(), 0o600)?;
+        return Err(error);
+    }
+
+    config_plan.finish()?;
+    Ok(PickerInstallReceipt {
+        generated_catalog_path: generated_path,
+        managed_state_path: state_path,
+        config_path,
+        native_model_count: generated.native_model_count(),
+        grok_model_count: generated.grok_model_count(),
+    })
+}
+
+pub fn uninstall_picker(install_root: &Path, codex_home: &Path) -> Result<bool, LifecycleError> {
+    validate_absolute_clean(install_root)?;
+    validate_absolute_clean(codex_home)?;
+    uninstall_picker_if_present(install_root, codex_home)
+}
+
+fn uninstall_picker_if_present(install_root: &Path, codex_home: &Path) -> Result<bool, LifecycleError> {
+    let state_path = install_root.join("state").join(PICKER_STATE_FILE_NAME);
+    let Some(bytes) = read_optional_control_file(&state_path, &[0o600])? else {
+        return Ok(false);
+    };
+    let state = PickerManagedState::from_json(&bytes).map_err(LifecycleError::Picker)?;
+    let config_path = codex_home.join("config.toml");
+    if state.managed_config().path() != config_path || state.generated_catalog().path() != install_root.join("state").join(PICKER_CATALOG_FILE_NAME) {
+        return Err(LifecycleError::InvalidPickerState);
+    }
+    validate_identity(state.managed_config())?;
+    validate_identity(state.generated_catalog())?;
+    match state.config_rollback() {
+        ConfigRollbackOwnership::RemoveCreated => {
+            fs::remove_file(&config_path).map_err(LifecycleError::RestoreExternalTarget)?;
+            sync_parent(&config_path)?;
+        }
+        ConfigRollbackOwnership::RestoreExactBackup { backup, original_mode } => {
+            validate_identity(backup)?;
+            let original = read_private_control_file(backup.path())?;
+            atomic_write(&config_path, &original, *original_mode)?;
+            fs::remove_file(backup.path()).map_err(LifecycleError::RemoveBackup)?;
+            sync_parent(backup.path())?;
+        }
+    }
+    fs::remove_file(state.generated_catalog().path()).map_err(LifecycleError::RemoveInstallRoot)?;
+    fs::remove_file(&state_path).map_err(LifecycleError::RemoveInstallRoot)?;
+    sync_parent(&state_path)?;
+    Ok(true)
 }
 
 pub fn doctor(request: &DoctorRequest) -> Result<DoctorReport, LifecycleError> {
@@ -464,6 +618,168 @@ fn check<E>(
     } else {
         failed(id, fail_message)
     });
+}
+
+struct PickerConfigPlan {
+    current: Option<Vec<u8>>,
+    previous_mode: u32,
+    rollback: ConfigRollbackOwnership,
+    fresh_backup: Option<PathBuf>,
+}
+
+impl PickerConfigPlan {
+    fn finish(self) -> Result<(), LifecycleError> {
+        // A pre-existing backup remains as the manifest-proven uninstall
+        // receipt. Fresh installs have no disposable backup.
+        let _ = self.fresh_backup;
+        Ok(())
+    }
+}
+
+fn prepare_picker_config(
+    config_path: &Path,
+    previous: Option<&PickerManagedState>,
+) -> Result<PickerConfigPlan, LifecycleError> {
+    if let Some(previous) = previous {
+        if previous.managed_config().path() != config_path {
+            return Err(LifecycleError::InvalidPickerState);
+        }
+        validate_identity(previous.managed_config())?;
+        let current = read_control_file_with_modes(config_path, &[0o600], MAX_CONTROL_FILE_BYTES)?;
+        return Ok(PickerConfigPlan {
+            current: Some(current),
+            previous_mode: 0o600,
+            rollback: previous.config_rollback().clone(),
+            fresh_backup: None,
+        });
+    }
+
+    match fs::symlink_metadata(config_path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+                return Err(LifecycleError::UnsafeExternalTarget);
+            }
+            let mode = file_mode(&metadata)?;
+            if !matches!(mode, 0o600 | 0o644) {
+                return Err(LifecycleError::UnsafeExternalPermissions);
+            }
+            let current = read_regular_file(config_path, MAX_CONTROL_FILE_BYTES)?;
+            let source = std::str::from_utf8(&current).map_err(|_| LifecycleError::InvalidPickerConfig)?;
+            let parsed: toml::Value = toml::from_str(source).map_err(|_| LifecycleError::InvalidPickerConfig)?;
+            if picker_marker_count(source) != 0
+                || parsed.get("model_catalog_json").is_some()
+                || parsed
+                    .get("model_providers")
+                    .and_then(toml::Value::as_table)
+                    .is_some_and(|providers| providers.contains_key("grok_bridge"))
+            {
+                return Err(LifecycleError::PickerConfigConflict);
+            }
+            let backup_path = unique_backup_path(config_path)?;
+            write_new_file(&backup_path, &current, 0o600)?;
+            let backup = artifact_identity(&backup_path, &current)?;
+            Ok(PickerConfigPlan {
+                current: Some(current),
+                previous_mode: mode,
+                rollback: ConfigRollbackOwnership::RestoreExactBackup {
+                    backup,
+                    original_mode: mode,
+                },
+                fresh_backup: Some(backup_path),
+            })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            validate_existing_parent(config_path)?;
+            Ok(PickerConfigPlan {
+                current: None,
+                previous_mode: 0o600,
+                rollback: ConfigRollbackOwnership::RemoveCreated,
+                fresh_backup: None,
+            })
+        }
+        Err(error) => Err(LifecycleError::InspectExternalTarget(error)),
+    }
+}
+
+fn render_picker_config(
+    current: &[u8],
+    generated_catalog: &Path,
+    bind: SocketAddr,
+    capability: &str,
+) -> Result<String, LifecycleError> {
+    let source = std::str::from_utf8(current).map_err(|_| LifecycleError::InvalidPickerConfig)?;
+    let generated_catalog = path_text(generated_catalog)?;
+    let base_url = format!("http://{bind}/_grok/{capability}/v1");
+    let block = format!(
+        "{PICKER_BEGIN}\nmodel_catalog_json = {generated_catalog:?}\n\n[model_providers.grok_bridge]\nname = {PROFILE_PROVIDER_NAME:?}\nbase_url = {base_url:?}\nwire_api = \"responses\"\nrequires_openai_auth = false\nsupports_websockets = false\n{PICKER_END}\n"
+    );
+    let markers = picker_marker_count(source);
+    if markers > 1 {
+        return Err(LifecycleError::PickerConfigConflict);
+    }
+    if markers == 1 {
+        let begin = source.find(PICKER_BEGIN).ok_or(LifecycleError::PickerConfigConflict)?;
+        let end = source.find(PICKER_END).ok_or(LifecycleError::PickerConfigConflict)? + PICKER_END.len();
+        return Ok(format!("{}{}{}", &source[..begin], block, &source[end..]));
+    }
+    let mut insertion = source.len();
+    let mut offset = 0;
+    for line in source.split_inclusive('\n') {
+        if line.trim_start().starts_with('[') {
+            insertion = offset;
+            break;
+        }
+        offset += line.len();
+    }
+    Ok(format!("{}{}{}", &source[..insertion], block, &source[insertion..]))
+}
+
+fn picker_marker_count(source: &str) -> usize {
+    match (source.matches(PICKER_BEGIN).count(), source.matches(PICKER_END).count()) {
+        (0, 0) => 0,
+        (1, 1) => 1,
+        _ => 2,
+    }
+}
+
+fn artifact_identity(path: &Path, bytes: &[u8]) -> Result<ArtifactIdentity, LifecycleError> {
+    ArtifactIdentity::new(path.to_path_buf(), bytes.len() as u64, format!("{:x}", Sha256::digest(bytes)))
+        .map_err(LifecycleError::Picker)
+}
+
+fn validate_identity(identity: &ArtifactIdentity) -> Result<(), LifecycleError> {
+    let bytes = read_regular_file(identity.path(), MAX_CONTROL_FILE_BYTES)?;
+    let observed = artifact_identity(identity.path(), &bytes)?;
+    if &observed != identity {
+        return Err(LifecycleError::InvalidPickerState);
+    }
+    Ok(())
+}
+
+fn read_picker_state(path: &Path) -> Result<Option<PickerManagedState>, LifecycleError> {
+    read_optional_control_file(path, &[0o600])?
+        .map(|bytes| PickerManagedState::from_json(&bytes).map_err(LifecycleError::Picker))
+        .transpose()
+}
+
+fn read_optional_control_file(path: &Path, modes: &[u32]) -> Result<Option<Vec<u8>>, LifecycleError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => read_control_file_with_modes(path, modes, MAX_CONTROL_FILE_BYTES).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(LifecycleError::InspectFile(error)),
+    }
+}
+
+fn restore_optional_file(path: &Path, previous: Option<&[u8]>, mode: u32) -> Result<(), LifecycleError> {
+    if let Some(previous) = previous {
+        atomic_write(path, previous, mode)
+    } else {
+        match fs::remove_file(path) {
+            Ok(()) => sync_parent(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(LifecycleError::RestoreExternalTarget(error)),
+        }
+    }
 }
 
 struct InstallPaths {
@@ -1452,6 +1768,18 @@ pub enum LifecycleError {
     InvalidLaunchAgent,
     #[error("the model catalog cache path is unsafe")]
     UnsafeCatalogPath,
+    #[error("the admitted Grok catalog is unavailable for picker generation")]
+    PickerCatalogUnavailable,
+    #[error("the Codex base configuration is invalid for managed picker state")]
+    InvalidPickerConfig,
+    #[error("the Codex base configuration already owns conflicting picker settings")]
+    PickerConfigConflict,
+    #[error("picker managed state or its recorded artifacts are invalid or altered")]
+    InvalidPickerState,
+    #[error(transparent)]
+    Picker(#[from] crate::picker::PickerError),
+    #[error(transparent)]
+    Catalog(#[from] crate::catalog::CatalogError),
     #[error("test-only injected install failure")]
     InjectedInstallFailure,
     #[cfg(not(unix))]
@@ -1464,6 +1792,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+    use crate::catalog::CatalogSnapshot;
 
     struct Fixture {
         _temporary: tempfile::TempDir,
@@ -1644,6 +1973,48 @@ mod tests {
         assert!(!fixture.launch_agent.exists());
         assert!(!fixture.install_root.exists());
         assert_eq!(fs::read_to_string(unrelated).unwrap(), "native = true\n");
+    }
+
+    #[test]
+    fn picker_lifecycle_generates_provider_catalog_preserves_config_and_rolls_back_exactly() {
+        let fixture = Fixture::new();
+        install(&fixture.install_request()).unwrap();
+        let catalog = CatalogSnapshot::new(["grok-4.6"], Some("\"v1\"".to_owned())).unwrap();
+        CatalogCache::new(fixture.install_root.join("state/models.json"))
+            .persist(&catalog)
+            .unwrap();
+        let native_catalog = fixture.home.join("native-models.json");
+        fs::write(
+            &native_catalog,
+            br#"{"models":[{"slug":"gpt-native","display_name":"Native GPT","supported_reasoning_levels":[{"effort":"medium","description":"Balanced"}],"shell_type":"default","visibility":"list","supported_in_api":true,"priority":1,"base_instructions":"native","support_verbosity":true,"truncation_policy":{"mode":"tokens","limit":1000},"experimental_supported_tools":[]}]}"#,
+        )
+        .unwrap();
+        fs::set_permissions(&native_catalog, fs::Permissions::from_mode(0o600)).unwrap();
+        let config = fixture.codex_home.join("config.toml");
+        let original = b"# keep this comment\nmodel = \"gpt-native\"\n\n[features]\nfuture = true\n";
+        fs::write(&config, original).unwrap();
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let receipt = install_picker(&PickerInstallRequest {
+            install_root: fixture.install_root.clone(),
+            codex_home: fixture.codex_home.clone(),
+            native_catalog_path: native_catalog,
+            bind: "127.0.0.1:4545".parse().unwrap(),
+        })
+        .unwrap();
+        let generated: serde_json::Value = serde_json::from_slice(&fs::read(&receipt.generated_catalog_path).unwrap()).unwrap();
+        assert_eq!(generated["models"][0]["model_provider"], "openai");
+        assert_eq!(generated["models"][1]["model_provider"], "grok_bridge");
+        let managed = fs::read_to_string(&config).unwrap();
+        assert!(managed.starts_with("# keep this comment\nmodel = \"gpt-native\"\n\n"));
+        assert!(managed.contains(PICKER_BEGIN));
+        assert!(managed.ends_with("[features]\nfuture = true\n"));
+        assert_eq!(mode(&config), 0o600);
+
+        assert!(uninstall_picker(&fixture.install_root, &fixture.codex_home).unwrap());
+        assert_eq!(fs::read(&config).unwrap(), original);
+        assert!(!receipt.generated_catalog_path.exists());
+        assert!(!receipt.managed_state_path.exists());
     }
 
     #[test]
