@@ -29,6 +29,7 @@ const PICKER_BEGIN: &str = "# >>> grok-codex-bridge picker begin >>>";
 const PICKER_END: &str = "# <<< grok-codex-bridge picker end <<<";
 const PICKER_PROVIDER_ID: &str = "grok_codex_picker";
 const PICKER_PROVIDER_NAME: &str = "Grok Codex Picker Bridge";
+pub(crate) const PICKER_CALLER_HEADER: &str = "x-grok-caller-capability";
 
 /// Complete, explicit inputs owned by the filesystem lifecycle producer.
 pub struct InstallRequest {
@@ -772,9 +773,9 @@ fn render_picker_config(
 ) -> Result<String, LifecycleError> {
     let source = std::str::from_utf8(current).map_err(|_| LifecycleError::InvalidPickerConfig)?;
     let generated_catalog = path_text(generated_catalog)?;
-    let base_url = format!("http://{bind}/_grok/{capability}/v1");
+    let base_url = format!("http://{bind}/v1");
     let block = format!(
-        "{PICKER_BEGIN}\nmodel_provider = {PICKER_PROVIDER_ID:?}\nmodel_catalog_json = {generated_catalog:?}\n\n[model_providers.{PICKER_PROVIDER_ID}]\nname = {PICKER_PROVIDER_NAME:?}\nbase_url = {base_url:?}\nwire_api = \"responses\"\nrequires_openai_auth = true\nsupports_websockets = false\n{PICKER_END}\n"
+        "{PICKER_BEGIN}\nmodel_provider = {PICKER_PROVIDER_ID:?}\nmodel_catalog_json = {generated_catalog:?}\n\n[model_providers.{PICKER_PROVIDER_ID}]\nname = {PICKER_PROVIDER_NAME:?}\nbase_url = {base_url:?}\nhttp_headers = {{ {PICKER_CALLER_HEADER:?} = {capability:?} }}\nwire_api = \"responses\"\nrequires_openai_auth = true\nsupports_websockets = false\n{PICKER_END}\n"
     );
     let markers = picker_marker_count(source);
     if markers > 1 {
@@ -2088,11 +2089,26 @@ mod tests {
         assert!(parsed.get("openai_base_url").is_none());
         let provider = &parsed["model_providers"][PICKER_PROVIDER_ID];
         assert_eq!(provider["name"].as_str(), Some(PICKER_PROVIDER_NAME));
+        assert_eq!(
+            provider["base_url"].as_str(),
+            Some("http://127.0.0.1:4545/v1")
+        );
+        let capability = fs::read_to_string(
+            fixture
+                .install_root
+                .join("secrets")
+                .join("caller-capability"),
+        )
+        .unwrap();
+        assert_eq!(
+            provider["http_headers"][PICKER_CALLER_HEADER].as_str(),
+            Some(capability.as_str())
+        );
         assert!(
-            provider["base_url"]
+            !provider["base_url"]
                 .as_str()
                 .unwrap()
-                .starts_with("http://127.0.0.1:4545/_grok/")
+                .contains(capability.as_str())
         );
         assert_eq!(provider["wire_api"].as_str(), Some("responses"));
         assert_eq!(provider["requires_openai_auth"].as_bool(), Some(true));

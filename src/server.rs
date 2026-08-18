@@ -18,6 +18,7 @@ use crate::catalog::ModelCatalog;
 use crate::config::{CapabilityToken, RuntimeConfig};
 use crate::credential::{CredentialError, CredentialStore};
 use crate::grok::{GrokClient, GrokError, ResponsesTransportRequest};
+use crate::lifecycle::PICKER_CALLER_HEADER;
 use crate::native::{
     NativeClient, NativeError, NativeResponsesPath, NativeRouteState, is_hop_by_hop_response_header,
 };
@@ -86,6 +87,13 @@ fn build_router_with_services(
     };
 
     Router::new()
+        .route("/v1/healthz", get(picker_healthz))
+        .route("/v1/models", get(picker_models))
+        .route(
+            "/v1/responses",
+            get(picker_responses_websocket_not_supported).post(picker_responses),
+        )
+        .route("/v1/responses/compact", post(picker_responses_compact))
         .route("/_grok/{capability}/healthz", get(healthz))
         .route("/_grok/{capability}/v1/models", get(models))
         .route(
@@ -141,6 +149,24 @@ async fn healthz(State(state): State<ServiceState>, Path(capability): Path<Strin
     .into_response()
 }
 
+async fn picker_healthz(State(state): State<ServiceState>, headers: HeaderMap) -> Response {
+    if !picker_authorized(&state, &headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    tracing::debug!(
+        route = "picker_healthz",
+        status = 200_u16,
+        "request complete"
+    );
+    Json(HealthResponse {
+        status: "ok",
+        service: "grok-codex-bridge",
+        version: env!("CARGO_PKG_VERSION"),
+    })
+    .into_response()
+}
+
 async fn models(State(state): State<ServiceState>, Path(capability): Path<String>) -> Response {
     if !state.capability.matches(&capability) {
         return StatusCode::NOT_FOUND.into_response();
@@ -148,6 +174,20 @@ async fn models(State(state): State<ServiceState>, Path(capability): Path<String
 
     let response = state.catalog.response().await;
     tracing::debug!(route = "models", status = 200_u16, "request complete");
+    Json(response).into_response()
+}
+
+async fn picker_models(State(state): State<ServiceState>, headers: HeaderMap) -> Response {
+    if !picker_authorized(&state, &headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let response = state.catalog.response().await;
+    tracing::debug!(
+        route = "picker_models",
+        status = 200_u16,
+        "request complete"
+    );
     Json(response).into_response()
 }
 
@@ -159,6 +199,10 @@ async fn responses(
     route_responses(state, capability, request, NativeResponsesPath::Responses).await
 }
 
+async fn picker_responses(State(state): State<ServiceState>, request: Request<Body>) -> Response {
+    route_picker_responses(state, request, NativeResponsesPath::Responses).await
+}
+
 async fn responses_compact(
     State(state): State<ServiceState>,
     Path(capability): Path<String>,
@@ -167,12 +211,29 @@ async fn responses_compact(
     route_responses(state, capability, request, NativeResponsesPath::Compact).await
 }
 
+async fn picker_responses_compact(
+    State(state): State<ServiceState>,
+    request: Request<Body>,
+) -> Response {
+    route_picker_responses(state, request, NativeResponsesPath::Compact).await
+}
+
 async fn responses_websocket_not_supported(
     State(state): State<ServiceState>,
     Path(capability): Path<String>,
 ) -> Response {
     if !state.capability.matches(&capability) {
         return StatusCode::NOT_FOUND.into_response();
+    }
+    StatusCode::UPGRADE_REQUIRED.into_response()
+}
+
+async fn picker_responses_websocket_not_supported(
+    State(state): State<ServiceState>,
+    headers: HeaderMap,
+) -> Response {
+    if !picker_authorized(&state, &headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
     }
     StatusCode::UPGRADE_REQUIRED.into_response()
 }
@@ -187,6 +248,34 @@ async fn route_responses(
         return StatusCode::NOT_FOUND.into_response();
     }
 
+    route_authorized_responses(state, request, path).await
+}
+
+async fn route_picker_responses(
+    state: ServiceState,
+    request: Request<Body>,
+    path: NativeResponsesPath,
+) -> Response {
+    if !picker_authorized(&state, request.headers()) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    route_authorized_responses(state, request, path).await
+}
+
+fn picker_authorized(state: &ServiceState, headers: &HeaderMap) -> bool {
+    let candidate = headers
+        .get(PICKER_CALLER_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    state.capability.matches(candidate)
+}
+
+async fn route_authorized_responses(
+    state: ServiceState,
+    request: Request<Body>,
+    path: NativeResponsesPath,
+) -> Response {
     let (parts, body) = request.into_parts();
     let body = match to_bytes(body, MAX_RESPONSES_BODY_BYTES).await {
         Ok(body) => body,
@@ -787,6 +876,20 @@ mod tests {
             .unwrap()
     }
 
+    async fn send_picker_with_headers(
+        app: Router,
+        headers: &[(&str, &str)],
+        body: impl Into<Body>,
+    ) -> Response {
+        let mut builder = Request::builder().method("POST").uri("/v1/responses");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        app.oneshot(builder.body(body.into()).unwrap())
+            .await
+            .unwrap()
+    }
+
     fn test_app(
         config: RuntimeConfig,
         catalog: ModelCatalog,
@@ -1180,6 +1283,46 @@ mod tests {
             .remove("client_metadata");
         assert_eq!(upstream_body, &expected_upstream);
         drop(observed);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn picker_header_authenticates_v1_1_without_a_capability_url_and_preserves_v1_0_path() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (client, mock, task) = start_mock(MockReply::Valid).await;
+        let app = test_app(
+            runtime_config(temporary.path()),
+            ModelCatalog::bootstrap().unwrap(),
+            CredentialStore::new(write_auth(temporary.path())).unwrap(),
+            client,
+        );
+
+        let accepted = send_picker_with_headers(
+            app.clone(),
+            &[(PICKER_CALLER_HEADER, TOKEN)],
+            request_body("grok-4.6").to_string(),
+        )
+        .await;
+        assert_eq!(accepted.status(), StatusCode::OK);
+        to_bytes(accepted.into_body(), 64 * 1024).await.unwrap();
+
+        let legacy = send(app.clone(), TOKEN, request_body("grok-4.6").to_string()).await;
+        assert_eq!(legacy.status(), StatusCode::OK);
+        to_bytes(legacy.into_body(), 64 * 1024).await.unwrap();
+
+        let missing =
+            send_picker_with_headers(app.clone(), &[], request_body("grok-4.6").to_string())
+                .await;
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+
+        let wrong = send_picker_with_headers(
+            app,
+            &[(PICKER_CALLER_HEADER, "not-the-token")],
+            request_body("grok-4.6").to_string(),
+        )
+        .await;
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(mock.hits.load(Ordering::SeqCst), 2);
         task.abort();
     }
 
