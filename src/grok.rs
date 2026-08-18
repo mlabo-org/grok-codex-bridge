@@ -313,7 +313,11 @@ fn normalize_base_url(value: &str) -> &str {
 fn ensure_success(response: &reqwest::Response) -> Result<(), GrokError> {
     match response.status() {
         status if status.is_success() => Ok(()),
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(GrokError::AuthenticationRejected),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+            Err(GrokError::AuthenticationRejected {
+                upstream_status: response.status().as_u16(),
+            })
+        }
         StatusCode::TOO_MANY_REQUESTS => Err(GrokError::RateLimited {
             retry_after_seconds: response
                 .headers()
@@ -336,7 +340,7 @@ pub enum GrokError {
     #[error("xAI model catalog request exceeded its bounded timeout")]
     ModelsTimeout,
     #[error("xAI rejected the session credential; run the official Grok login flow")]
-    AuthenticationRejected,
+    AuthenticationRejected { upstream_status: u16 },
     #[error("xAI rate limited the request")]
     RateLimited { retry_after_seconds: Option<u64> },
     #[error("xAI returned unsuccessful status {0}")]
@@ -363,6 +367,29 @@ pub enum GrokError {
     Protocol(#[from] ProtocolError),
     #[error("xAI Responses stream failed")]
     Stream(#[source] reqwest::Error),
+}
+
+impl GrokError {
+    /// Safe classification for the HTTP response boundary. It deliberately
+    /// excludes upstream headers and bodies.
+    pub(crate) fn response_boundary_class(&self) -> &'static str {
+        match self {
+            Self::AuthenticationRejected { .. }
+            | Self::RateLimited { .. }
+            | Self::UpstreamStatus(_) => "upstream_http_status",
+            Self::UnexpectedResponseContentType => "upstream_content_type",
+            _ => "upstream_response",
+        }
+    }
+
+    pub(crate) fn upstream_status(&self) -> Option<u16> {
+        match self {
+            Self::AuthenticationRejected { upstream_status } => Some(*upstream_status),
+            Self::RateLimited { .. } => Some(StatusCode::TOO_MANY_REQUESTS.as_u16()),
+            Self::UpstreamStatus(status) => Some(*status),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -437,6 +464,68 @@ mod tests {
             Err(GrokError::UpstreamStatus(302))
         ));
         assert_eq!(hits.load(Ordering::SeqCst), 0);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn upstream_http_boundary_errors_have_safe_static_classes() {
+        let non_success =
+            Router::new().route("/v1/responses", post(|| async { StatusCode::IM_A_TEAPOT }));
+        let (base, task) = start(non_success).await;
+        let client = GrokClient::for_test(base).unwrap();
+        let credential = Arc::new(test_session_credential("stream-secret", "user-1"));
+        let body = NormalizedResponsesRequest::parse(json!({
+            "model": "grok-4.7", "input": [], "tools": [], "tool_choice": "auto",
+            "parallel_tool_calls": false, "store": false, "stream": true, "include": []
+        }))
+        .unwrap();
+        let request = ResponsesTransportRequest {
+            body: &body,
+            conversation_id: Uuid::new_v4(),
+            request_id: Uuid::new_v4(),
+            agent_id: Uuid::new_v4(),
+            turn_index: 0,
+        };
+        let error = match client.post_responses(credential, request).await {
+            Err(error) => error,
+            Ok(_) => panic!("non-success response must not start an SSE stream"),
+        };
+        assert_eq!(error.response_boundary_class(), "upstream_http_status");
+        assert_eq!(error.upstream_status(), Some(418));
+        assert!(matches!(error, GrokError::UpstreamStatus(418)));
+        task.abort();
+
+        let invalid_content_type = Router::new().route(
+            "/v1/responses",
+            post(|| async { (StatusCode::OK, [(CONTENT_TYPE, "application/json")]) }),
+        );
+        let (base, task) = start(invalid_content_type).await;
+        let client = GrokClient::for_test(base).unwrap();
+        let credential = Arc::new(test_session_credential("stream-secret", "user-1"));
+        let body = NormalizedResponsesRequest::parse(json!({
+            "model": "grok-4.7", "input": [], "tools": [], "tool_choice": "auto",
+            "parallel_tool_calls": false, "store": false, "stream": true, "include": []
+        }))
+        .unwrap();
+        let error = match client
+            .post_responses(
+                credential,
+                ResponsesTransportRequest {
+                    body: &body,
+                    conversation_id: Uuid::new_v4(),
+                    request_id: Uuid::new_v4(),
+                    agent_id: Uuid::new_v4(),
+                    turn_index: 0,
+                },
+            )
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("invalid Content-Type must not start an SSE stream"),
+        };
+        assert_eq!(error.response_boundary_class(), "upstream_content_type");
+        assert_eq!(error.upstream_status(), None);
+        assert!(matches!(error, GrokError::UnexpectedResponseContentType));
         task.abort();
     }
 

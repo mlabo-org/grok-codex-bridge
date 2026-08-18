@@ -633,14 +633,15 @@ fn route_error(
 }
 
 fn upstream_error(error: GrokError) -> Response {
+    let error_class = error.response_boundary_class();
+    let diagnostic_upstream_status = error.upstream_status();
     let upstream_status = match &error {
         GrokError::UpstreamStatus(status) => Some(*status),
         _ => None,
     };
-    let (status, error_class, error_type, code, message, retry_after) = match error {
-        GrokError::AuthenticationRejected => (
+    let (status, error_type, code, message, retry_after) = match error {
+        GrokError::AuthenticationRejected { .. } => (
             StatusCode::UNAUTHORIZED,
-            "upstream_authentication",
             "authentication_error",
             "grok_login_required",
             "xAI rejected the Grok credential; run the official Grok login flow",
@@ -650,7 +651,6 @@ fn upstream_error(error: GrokError) -> Response {
             retry_after_seconds,
         } => (
             StatusCode::TOO_MANY_REQUESTS,
-            "upstream_rate_limit",
             "rate_limit_error",
             "rate_limited",
             "xAI rate limited the Grok request",
@@ -658,7 +658,6 @@ fn upstream_error(error: GrokError) -> Response {
         ),
         GrokError::Transport(_) | GrokError::UpstreamStatus(500..=599) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            "upstream_unavailable",
             "server_error",
             "upstream_unavailable",
             "xAI Responses service is temporarily unavailable",
@@ -666,7 +665,6 @@ fn upstream_error(error: GrokError) -> Response {
         ),
         GrokError::UnexpectedResponseContentType => (
             StatusCode::BAD_GATEWAY,
-            "upstream_content_type",
             "server_error",
             "invalid_upstream_response",
             "xAI returned an invalid Responses stream",
@@ -674,14 +672,30 @@ fn upstream_error(error: GrokError) -> Response {
         ),
         _ => (
             StatusCode::BAD_GATEWAY,
-            "upstream_response",
             "server_error",
             "invalid_upstream_response",
             "xAI returned an invalid Responses response",
             None,
         ),
     };
-    let mut response = route_error(status, error_class, error_type, code, message);
+    tracing::warn!(
+        route = "responses",
+        status = status.as_u16(),
+        error_class,
+        upstream_status = ?diagnostic_upstream_status,
+        "request failed"
+    );
+    let mut response = (
+        status,
+        Json(ErrorEnvelope {
+            error: ErrorBody {
+                error_type,
+                code,
+                message,
+            },
+        }),
+    )
+        .into_response();
     if let Some(seconds) = retry_after
         && let Ok(value) = HeaderValue::from_str(&seconds.to_string())
     {
@@ -1613,7 +1627,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upstream_auth_rate_limit_and_server_errors_are_typed() {
+    async fn upstream_http_boundary_auth_rate_limit_and_server_errors_are_typed() {
         for (reply, expected_status, expected_code, retry_after) in [
             (
                 MockReply::Unauthorized,
@@ -1694,7 +1708,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_error_classifier_distinguishes_safe_static_classes() {
+    fn upstream_http_boundary_and_stream_error_classifiers_are_distinct() {
         assert_eq!(
             stream_error_class(&GrokError::Protocol(
                 crate::protocol::ProtocolError::StreamNotCompleted
@@ -1717,6 +1731,24 @@ mod tests {
         assert_eq!(
             stream_error_class(&GrokError::ModelsTimeout),
             "upstream_stream_other"
+        );
+    }
+
+    #[test]
+    fn upstream_http_boundary_classifier_is_safe_and_distinct() {
+        assert_eq!(
+            GrokError::UpstreamStatus(418).response_boundary_class(),
+            "upstream_http_status"
+        );
+        assert_eq!(
+            GrokError::UnexpectedResponseContentType.response_boundary_class(),
+            "upstream_content_type"
+        );
+        assert_eq!(
+            stream_error_class(&GrokError::Protocol(
+                crate::protocol::ProtocolError::StreamNotCompleted
+            )),
+            "upstream_stream_protocol"
         );
     }
 }
