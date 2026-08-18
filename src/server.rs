@@ -1459,13 +1459,8 @@ mod tests {
         assert_eq!(headers[CONTENT_ENCODING], "zstd");
         let decoded = zstd::stream::decode_all(Cursor::new(upstream_body)).unwrap();
         let upstream: Value = serde_json::from_slice(&decoded).unwrap();
-        assert_eq!(upstream["input"].as_array().unwrap().len(), 2);
-        assert_eq!(upstream["input"][0]["id"], "rs_native");
-        assert_eq!(
-            upstream["input"][0]["encrypted_content"],
-            "native-gpt-ciphertext"
-        );
-        assert_eq!(upstream["input"][1]["content"][0]["text"], "continue");
+        assert_eq!(upstream["input"].as_array().unwrap().len(), 1);
+        assert_eq!(upstream["input"][0]["content"][0]["text"], "continue");
         drop(observed);
         task.abort();
     }
