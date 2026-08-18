@@ -8,6 +8,30 @@
 
 Codexプラグイン、汎用LLMルーター、エージェントハーネスではありません。
 
+## Codexにインストールを任せる
+
+このリポジトリには、coding agentが守る安全境界とライフサイクル契約を [AGENTS.md](AGENTS.md) に収録しています。Codex自身にソースを確認させ、ネイティブ実行ファイルをbuildし、安全側のV1.0分離プロファイルをinstallさせる場合は、リポジトリをcloneしてrootからCodexを起動します。
+
+```sh
+git clone https://github.com/mlabo-org/grok-codex-bridge.git
+cd grok-codex-bridge
+codex
+```
+
+起動したCodexへ、次のように依頼してください。
+
+```text
+AGENTS.mdを最後まで読み、その契約に従ってください。このMacへV1.0の分離型
+grok-bridgeプロファイルをbuild・installしてください。platformと前提条件を確認し、
+既存差分を保持し、./scripts/materialize-macos.shとrepo所有のlifecycle commandだけを
+使用して、最小のprimary-path checkを実行してください。実験的V1.1統合pickerの有効化、
+Codex本体binary・Codex設定・Grok認証・LaunchAgent fileの直接編集、commit、push、
+publishは行わないでください。Apple Silicon搭載macOSでない場合、または必要な
+authoritative inputを確認できない場合は停止して不足境界を説明してください。
+```
+
+この依頼文は、意図的にV1.0分離ルートだけを選びます。V1.1統合ピッカーの有効化はactiveなCodexモデルカタログを変更し、検証済みNative Codex入力を必要とするため、別の明示操作として扱ってください。
+
 ## 謝辞
 
 本プロジェクトは、[duolahypercho/codex-router](https://github.com/duolahypercho/codex-router/tree/9995c77278608640759982c98ec5bdaeb371c174) から多くの重要な知見を得ています。その実装とドキュメントは実現可能性を確認するうえで大切な先行事例であり、公式Grok認証情報の鮮度、プロバイダー境界に閉じるメタデータ、xAI Responses/SSEイベント体系、ネイティブモデルピッカー統合、可逆な有効化方式の設計判断に大きく役立ちました。MIT Licenseでこの成果を公開された作者とコントリビューターの皆様に、心より敬意と感謝を表します。
