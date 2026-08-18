@@ -782,10 +782,12 @@ impl PriorReasoning {
     }
 }
 
-/// Removes reasoning state that cannot be resolved by a `store: false`
-/// Native GPT request. Bridge-enveloped items came from Grok; explicit null
-/// items are legacy Grok history that was already made non-decryptable.
-/// Native GPT ciphertext remains byte-for-byte intact.
+/// Removes the complete reasoning history when a `store: false` Native GPT
+/// request contains evidence of a Grok turn. Bridge-enveloped items came from
+/// current Grok output; explicit null items identify repaired legacy Grok
+/// history. Removing the whole reasoning family also covers older untagged
+/// Grok items from the same mixed-provider session instead of failing once per
+/// historical item. Native-only GPT sessions remain byte-for-byte intact.
 pub fn remove_unreplayable_reasoning_for_native(request: &mut Value) -> bool {
     let Some(object) = request.as_object_mut() else {
         return false;
@@ -796,21 +798,29 @@ pub fn remove_unreplayable_reasoning_for_native(request: &mut Value) -> bool {
     let Some(input) = object.get_mut("input").and_then(Value::as_array_mut) else {
         return false;
     };
-    let original_len = input.len();
-    input.retain(|item| {
+    let contains_grok_reasoning = input.iter().any(|item| {
         let Some(item) = item.as_object() else {
-            return true;
+            return false;
         };
         if item.get("type").and_then(Value::as_str) != Some("reasoning") {
-            return true;
+            return false;
         }
         match item.get("encrypted_content") {
-            Some(Value::Null) => false,
-            Some(Value::String(value)) => !value.starts_with(GROK_REASONING_ENVELOPE_PREFIX),
-            _ => true,
+            Some(Value::Null) => true,
+            Some(Value::String(value)) => value.starts_with(GROK_REASONING_ENVELOPE_PREFIX),
+            _ => false,
         }
     });
-    input.len() != original_len
+    if !contains_grok_reasoning {
+        return false;
+    }
+    input.retain(|item| {
+        item.as_object()
+            .and_then(|item| item.get("type"))
+            .and_then(Value::as_str)
+            != Some("reasoning")
+    });
+    true
 }
 
 fn parse_prior_reasoning_parts(
@@ -4032,6 +4042,26 @@ mod tests {
                 .iter()
                 .all(|item| item["type"] != "reasoning")
         );
+    }
+
+    #[test]
+    fn model_switch_native_cleanup_requires_grok_history_evidence() {
+        let mut native_only = json!({
+            "store": false,
+            "input": [
+                {
+                    "type": "reasoning", "id": "rs_native",
+                    "summary": [], "encrypted_content": "native-gpt-ciphertext"
+                },
+                {
+                    "type": "message", "role": "user",
+                    "content": [{"type": "input_text", "text": "continue"}]
+                }
+            ]
+        });
+        let original = native_only.clone();
+        assert!(!remove_unreplayable_reasoning_for_native(&mut native_only));
+        assert_eq!(native_only, original);
     }
 
     #[test]
