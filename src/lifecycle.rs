@@ -411,10 +411,16 @@ pub fn install_picker(
     let previous_generated = read_optional_control_file(&generated_path, &[0o600])?;
     let previous_native_route = read_optional_control_file(&native_route_path, &[0o600])?;
     let previous_state = read_optional_control_file(&state_path, &[0o600])?;
-    let config_plan = prepare_picker_config(&config_path, prior_state.as_ref())?;
+    let config_plan = prepare_picker_config(
+        &config_path,
+        prior_state.as_ref(),
+        &generated_path,
+        request.bind,
+        capability,
+    )?;
     let prepared = (|| {
         let config_contents = render_picker_config(
-            config_plan.current.as_deref().unwrap_or_default(),
+            &config_plan.render_base,
             &generated_path,
             request.bind,
             capability,
@@ -508,13 +514,88 @@ fn uninstall_picker_if_present(
     {
         return Err(LifecycleError::InvalidPickerState);
     }
-    validate_identity(state.managed_config())?;
+    validate_read_only_picker_input(state.native_catalog())?;
     validate_identity(state.generated_catalog())?;
     validate_identity(state.native_route())?;
-    match state.config_rollback() {
+    rollback_picker_config(install_root, &config_path, &state)?;
+    fs::remove_file(state.generated_catalog().path()).map_err(LifecycleError::RemoveInstallRoot)?;
+    fs::remove_file(state.native_route().path()).map_err(LifecycleError::RemoveInstallRoot)?;
+    fs::remove_file(&state_path).map_err(LifecycleError::RemoveInstallRoot)?;
+    sync_parent(&state_path)?;
+    Ok(true)
+}
+
+fn rollback_picker_config(
+    install_root: &Path,
+    config_path: &Path,
+    state: &PickerManagedState,
+) -> Result<(), LifecycleError> {
+    let metadata =
+        fs::symlink_metadata(config_path).map_err(LifecycleError::InspectExternalTarget)?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(LifecycleError::UnsafeExternalTarget);
+    }
+    let mode = file_mode(&metadata)?;
+    if !matches!(mode, 0o600 | 0o644) {
+        return Err(LifecycleError::UnsafeExternalPermissions);
+    }
+    let current = read_control_file_with_modes(config_path, &[mode], MAX_CONTROL_FILE_BYTES)?;
+    if artifact_identity(config_path, &current)? == *state.managed_config() {
+        return restore_exact_picker_config(config_path, state.config_rollback());
+    }
+
+    let expectation = picker_config_expectation(install_root)?;
+    let recovered = remove_rewritten_picker_config(
+        &current,
+        &state.generated_catalog().path(),
+        expectation.bind,
+        &expectation.capability,
+    )?;
+    atomic_write(config_path, &recovered, mode)?;
+    remove_picker_config_backup(state.config_rollback())
+}
+
+struct PickerConfigExpectation {
+    bind: SocketAddr,
+    capability: String,
+}
+
+fn picker_config_expectation(
+    install_root: &Path,
+) -> Result<PickerConfigExpectation, LifecycleError> {
+    let (manifest, raw_manifest) = read_manifest(install_root)?;
+    if manifest.version != MANIFEST_VERSION
+        || manifest.install_root != install_root
+        || manifest.caller_token_path != install_root.join("secrets").join("caller-capability")
+    {
+        return Err(LifecycleError::InvalidPickerState);
+    }
+    let bind: SocketAddr = manifest
+        .bind
+        .parse()
+        .map_err(|_| LifecycleError::InvalidPickerState)?;
+    if !bind.ip().is_loopback() || bind.port() == 0 {
+        return Err(LifecycleError::InvalidPickerState);
+    }
+    let capability = read_private_control_file(&manifest.caller_token_path)?;
+    let capability = validate_capability_bytes(&capability)?;
+    if raw_manifest.contains(capability) {
+        return Err(LifecycleError::ManifestContainsCapability);
+    }
+    Ok(PickerConfigExpectation {
+        bind,
+        capability: capability.to_owned(),
+    })
+}
+
+fn restore_exact_picker_config(
+    config_path: &Path,
+    rollback: &ConfigRollbackOwnership,
+) -> Result<(), LifecycleError> {
+    match rollback {
         ConfigRollbackOwnership::RemoveCreated => {
-            fs::remove_file(&config_path).map_err(LifecycleError::RestoreExternalTarget)?;
-            sync_parent(&config_path)?;
+            fs::remove_file(config_path).map_err(LifecycleError::RestoreExternalTarget)?;
+            sync_parent(config_path)
         }
         ConfigRollbackOwnership::RestoreExactBackup {
             backup,
@@ -522,16 +603,20 @@ fn uninstall_picker_if_present(
         } => {
             validate_identity(backup)?;
             let original = read_private_control_file(backup.path())?;
-            atomic_write(&config_path, &original, *original_mode)?;
+            atomic_write(config_path, &original, *original_mode)?;
             fs::remove_file(backup.path()).map_err(LifecycleError::RemoveBackup)?;
-            sync_parent(backup.path())?;
+            sync_parent(backup.path())
         }
     }
-    fs::remove_file(state.generated_catalog().path()).map_err(LifecycleError::RemoveInstallRoot)?;
-    fs::remove_file(state.native_route().path()).map_err(LifecycleError::RemoveInstallRoot)?;
-    fs::remove_file(&state_path).map_err(LifecycleError::RemoveInstallRoot)?;
-    sync_parent(&state_path)?;
-    Ok(true)
+}
+
+fn remove_picker_config_backup(rollback: &ConfigRollbackOwnership) -> Result<(), LifecycleError> {
+    if let ConfigRollbackOwnership::RestoreExactBackup { backup, .. } = rollback {
+        validate_identity(backup)?;
+        fs::remove_file(backup.path()).map_err(LifecycleError::RemoveBackup)?;
+        sync_parent(backup.path())?;
+    }
+    Ok(())
 }
 
 pub fn doctor(request: &DoctorRequest) -> Result<DoctorReport, LifecycleError> {
@@ -694,16 +779,23 @@ fn check<E>(
 
 struct PickerConfigPlan {
     current: Option<Vec<u8>>,
+    render_base: Vec<u8>,
     previous_mode: u32,
     rollback: ConfigRollbackOwnership,
     fresh_backup: Option<PathBuf>,
+    superseded_backup: Option<ArtifactIdentity>,
 }
 
 impl PickerConfigPlan {
     fn finish(self) -> Result<(), LifecycleError> {
-        // A pre-existing backup remains as the manifest-proven uninstall
-        // receipt. Fresh installs have no disposable backup.
-        let _ = self.fresh_backup;
+        // A rewrite-resilient update snapshots the current foreign-only
+        // configuration before it writes a new managed block. Once that new
+        // state is published, its predecessor is no longer a rollback receipt.
+        if let Some(backup) = self.superseded_backup {
+            validate_identity(&backup)?;
+            fs::remove_file(backup.path()).map_err(LifecycleError::RemoveBackup)?;
+            sync_parent(backup.path())?;
+        }
         Ok(())
     }
 
@@ -719,18 +811,57 @@ impl PickerConfigPlan {
 fn prepare_picker_config(
     config_path: &Path,
     previous: Option<&PickerManagedState>,
+    generated_catalog: &Path,
+    bind: SocketAddr,
+    capability: &str,
 ) -> Result<PickerConfigPlan, LifecycleError> {
     if let Some(previous) = previous {
         if previous.managed_config().path() != config_path {
             return Err(LifecycleError::InvalidPickerState);
         }
-        validate_identity(previous.managed_config())?;
-        let current = read_control_file_with_modes(config_path, &[0o600], MAX_CONTROL_FILE_BYTES)?;
+        let metadata =
+            fs::symlink_metadata(config_path).map_err(LifecycleError::InspectExternalTarget)?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            return Err(LifecycleError::UnsafeExternalTarget);
+        }
+        let mode = file_mode(&metadata)?;
+        if !matches!(mode, 0o600 | 0o644) {
+            return Err(LifecycleError::UnsafeExternalPermissions);
+        }
+        let current = read_control_file_with_modes(config_path, &[mode], MAX_CONTROL_FILE_BYTES)?;
+        if artifact_identity(config_path, &current)? == *previous.managed_config() {
+            return Ok(PickerConfigPlan {
+                render_base: current.clone(),
+                current: Some(current),
+                previous_mode: mode,
+                rollback: previous.config_rollback().clone(),
+                fresh_backup: None,
+                superseded_backup: None,
+            });
+        }
+
+        let render_base =
+            remove_rewritten_picker_config(&current, generated_catalog, bind, capability)?;
+        let backup_path = unique_backup_path(config_path)?;
+        write_new_file(&backup_path, &render_base, 0o600)?;
+        let backup = artifact_identity(&backup_path, &render_base)?;
+        let superseded_backup = match previous.config_rollback() {
+            ConfigRollbackOwnership::RemoveCreated => None,
+            ConfigRollbackOwnership::RestoreExactBackup { backup, .. } => {
+                validate_identity(backup)?;
+                Some(backup.clone())
+            }
+        };
         return Ok(PickerConfigPlan {
             current: Some(current),
-            previous_mode: 0o600,
-            rollback: previous.config_rollback().clone(),
-            fresh_backup: None,
+            render_base,
+            previous_mode: mode,
+            rollback: ConfigRollbackOwnership::RestoreExactBackup {
+                backup,
+                original_mode: mode,
+            },
+            fresh_backup: Some(backup_path),
+            superseded_backup,
         });
     }
 
@@ -764,6 +895,7 @@ fn prepare_picker_config(
             write_new_file(&backup_path, &current, 0o600)?;
             let backup = artifact_identity(&backup_path, &current)?;
             Ok(PickerConfigPlan {
+                render_base: current.clone(),
                 current: Some(current),
                 previous_mode: mode,
                 rollback: ConfigRollbackOwnership::RestoreExactBackup {
@@ -771,19 +903,107 @@ fn prepare_picker_config(
                     original_mode: mode,
                 },
                 fresh_backup: Some(backup_path),
+                superseded_backup: None,
             })
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             validate_existing_parent(config_path)?;
             Ok(PickerConfigPlan {
                 current: None,
+                render_base: Vec::new(),
                 previous_mode: 0o600,
                 rollback: ConfigRollbackOwnership::RemoveCreated,
                 fresh_backup: None,
+                superseded_backup: None,
             })
         }
         Err(error) => Err(LifecycleError::InspectExternalTarget(error)),
     }
+}
+
+fn remove_rewritten_picker_config(
+    current: &[u8],
+    generated_catalog: &Path,
+    bind: SocketAddr,
+    capability: &str,
+) -> Result<Vec<u8>, LifecycleError> {
+    let source = std::str::from_utf8(current).map_err(|_| LifecycleError::InvalidPickerConfig)?;
+    if source.matches(PICKER_BEGIN).count() > 1 || source.matches(PICKER_END).count() > 1 {
+        return Err(LifecycleError::InvalidPickerState);
+    }
+    let mut parsed: toml::Value =
+        toml::from_str(source).map_err(|_| LifecycleError::InvalidPickerConfig)?;
+    let table = parsed
+        .as_table_mut()
+        .ok_or(LifecycleError::InvalidPickerConfig)?;
+    let expected = picker_config_value(generated_catalog, bind, capability)?;
+    let expected_table = expected
+        .as_table()
+        .expect("generated picker TOML is always a root table");
+    for key in ["model_provider", "model_catalog_json"] {
+        if table.get(key) != expected_table.get(key) {
+            return Err(LifecycleError::InvalidPickerState);
+        }
+    }
+    let providers = table
+        .get("model_providers")
+        .and_then(toml::Value::as_table)
+        .ok_or(LifecycleError::InvalidPickerState)?;
+    let provider = providers
+        .get(PICKER_PROVIDER_ID)
+        .ok_or(LifecycleError::InvalidPickerState)?;
+    if !picker_provider_matches(provider, expected_table, bind, capability)? {
+        return Err(LifecycleError::InvalidPickerState);
+    }
+
+    table.remove("model_provider");
+    table.remove("model_catalog_json");
+    let providers = table
+        .get_mut("model_providers")
+        .and_then(toml::Value::as_table_mut)
+        .expect("validated picker provider table must remain a TOML table");
+    providers.remove(PICKER_PROVIDER_ID);
+    toml::to_string(&parsed)
+        .map_err(LifecycleError::SerializeConfig)
+        .map(Vec::from)
+}
+
+fn picker_config_value(
+    generated_catalog: &Path,
+    bind: SocketAddr,
+    capability: &str,
+) -> Result<toml::Value, LifecycleError> {
+    let rendered = render_picker_config(&[], generated_catalog, bind, capability)?;
+    toml::from_str(&rendered).map_err(|_| LifecycleError::InvalidPickerConfig)
+}
+
+fn picker_provider_matches(
+    provider: &toml::Value,
+    expected: &toml::map::Map<String, toml::Value>,
+    bind: SocketAddr,
+    capability: &str,
+) -> Result<bool, LifecycleError> {
+    let current_header = expected
+        .get("model_providers")
+        .and_then(toml::Value::as_table)
+        .and_then(|providers| providers.get(PICKER_PROVIDER_ID))
+        .expect("generated picker TOML must include its provider");
+    if provider == current_header {
+        return Ok(true);
+    }
+
+    let legacy_base_url = format!("http://{bind}/_grok/{capability}/v1");
+    let legacy = format!(
+        "[model_providers.{PICKER_PROVIDER_ID}]\nname = {PICKER_PROVIDER_NAME:?}\nbase_url = {legacy_base_url:?}\nwire_api = \"responses\"\nrequires_openai_auth = true\nsupports_websockets = false\n"
+    );
+    let legacy: toml::Value =
+        toml::from_str(&legacy).map_err(|_| LifecycleError::InvalidPickerConfig)?;
+    let legacy_provider = legacy
+        .get("model_providers")
+        .and_then(toml::Value::as_table)
+        .and_then(|providers| providers.get(PICKER_PROVIDER_ID))
+        .expect("legacy picker TOML must include its provider");
+    Ok(provider == legacy_provider)
 }
 
 fn render_picker_config(
@@ -855,6 +1075,14 @@ fn validate_identity(identity: &ArtifactIdentity) -> Result<(), LifecycleError> 
     if &observed != identity {
         return Err(LifecycleError::InvalidPickerState);
     }
+    Ok(())
+}
+
+fn validate_read_only_picker_input(identity: &ArtifactIdentity) -> Result<(), LifecycleError> {
+    // The native Codex model cache belongs to Codex. It is an external input,
+    // so uninstall proves only that its recorded path remains safe to read;
+    // Desktop is free to refresh its bytes while picker state is installed.
+    let _ = read_regular_file(identity.path(), MAX_CONTROL_FILE_BYTES)?;
     Ok(())
 }
 
@@ -1988,6 +2216,36 @@ mod tests {
         read_manifest(&fixture.install_root).unwrap()
     }
 
+    fn install_test_picker(
+        fixture: &Fixture,
+        original_config: &[u8],
+    ) -> (PickerInstallReceipt, PathBuf) {
+        install(&fixture.install_request()).unwrap();
+        let catalog = CatalogSnapshot::new(["grok-4.6"], Some("\"v1\"".to_owned())).unwrap();
+        CatalogCache::new(fixture.install_root.join("state/models.json"))
+            .persist(&catalog)
+            .unwrap();
+        let native_catalog = fixture.home.join("native-models.json");
+        fs::write(
+            &native_catalog,
+            br#"{"models":[{"slug":"gpt-native","display_name":"Native GPT","supported_reasoning_levels":[{"effort":"medium","description":"Balanced"}],"shell_type":"default","visibility":"list","supported_in_api":true,"priority":1,"base_instructions":"native","support_verbosity":true,"truncation_policy":{"mode":"tokens","limit":1000},"experimental_supported_tools":[]}]}"#,
+        )
+        .unwrap();
+        fs::set_permissions(&native_catalog, fs::Permissions::from_mode(0o600)).unwrap();
+        let config = fixture.codex_home.join("config.toml");
+        fs::write(&config, original_config).unwrap();
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+        let receipt = install_picker(&PickerInstallRequest {
+            install_root: fixture.install_root.clone(),
+            codex_home: fixture.codex_home.clone(),
+            native_catalog_path: native_catalog.clone(),
+            native_upstream: NativeUpstream::ChatgptCodex,
+            bind: "127.0.0.1:4545".parse().unwrap(),
+        })
+        .unwrap();
+        (receipt, native_catalog)
+    }
+
     #[test]
     fn fresh_install_materializes_exact_private_safe_provider_layout() {
         let fixture = Fixture::new();
@@ -2170,6 +2428,171 @@ mod tests {
         assert!(!receipt.generated_catalog_path.exists());
         assert!(!receipt.native_route_path.exists());
         assert!(!receipt.managed_state_path.exists());
+    }
+
+    #[test]
+    fn picker_update_and_uninstall_recover_desktop_rewrite_and_native_catalog_refresh() {
+        let fixture = Fixture::new();
+        let original = b"model = \"gpt-native\"\n\n[features]\nfuture = true\n";
+        let (receipt, native_catalog) = install_test_picker(&fixture, original);
+        let config = fixture.codex_home.join("config.toml");
+
+        let desktop_value: toml::Value =
+            toml::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+        let desktop_rewrite = format!(
+            "{}\n[marketplace]\nlast_refresh = \"desktop-current\"\n",
+            toml::to_string(&desktop_value).unwrap()
+        );
+        assert!(!desktop_rewrite.contains(PICKER_BEGIN));
+        fs::write(&config, desktop_rewrite).unwrap();
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let native_before = fs::read_to_string(&native_catalog).unwrap();
+        let native_refreshed = native_before.replace("Native GPT", "Native GTP");
+        assert_eq!(native_before.len(), native_refreshed.len());
+        fs::write(&native_catalog, &native_refreshed).unwrap();
+        fs::set_permissions(&native_catalog, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let updated = install_picker(&PickerInstallRequest {
+            install_root: fixture.install_root.clone(),
+            codex_home: fixture.codex_home.clone(),
+            native_catalog_path: native_catalog.clone(),
+            native_upstream: NativeUpstream::ChatgptCodex,
+            bind: "127.0.0.1:4545".parse().unwrap(),
+        })
+        .unwrap();
+        assert_eq!(updated.config_path, receipt.config_path);
+
+        assert!(uninstall_picker(&fixture.install_root, &fixture.codex_home).unwrap());
+        let recovered: toml::Value = toml::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+        assert_eq!(recovered["model"].as_str(), Some("gpt-native"));
+        assert_eq!(recovered["features"]["future"].as_bool(), Some(true));
+        assert_eq!(
+            recovered["marketplace"]["last_refresh"].as_str(),
+            Some("desktop-current")
+        );
+        assert!(recovered.get("model_provider").is_none());
+        assert!(recovered.get("model_catalog_json").is_none());
+        assert!(
+            recovered
+                .get("model_providers")
+                .and_then(toml::Value::as_table)
+                .is_none_or(|providers| !providers.contains_key(PICKER_PROVIDER_ID))
+        );
+        assert_eq!(
+            fs::read_to_string(&native_catalog).unwrap(),
+            native_refreshed
+        );
+        assert_eq!(mode(&config), 0o644);
+        assert!(!updated.generated_catalog_path.exists());
+        assert!(!updated.native_route_path.exists());
+        assert!(!updated.managed_state_path.exists());
+    }
+
+    #[test]
+    fn picker_uninstall_directly_recovers_desktop_rewrite_and_native_catalog_refresh() {
+        let fixture = Fixture::new();
+        let (receipt, native_catalog) = install_test_picker(&fixture, b"model = \"gpt-native\"\n");
+        let config = fixture.codex_home.join("config.toml");
+        let desktop_value: toml::Value =
+            toml::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+        let desktop_rewrite = format!(
+            "{}\n[app]\nlast_opened = \"desktop-current\"\n",
+            toml::to_string(&desktop_value).unwrap()
+        );
+        assert!(!desktop_rewrite.contains(PICKER_BEGIN));
+        fs::write(&config, desktop_rewrite).unwrap();
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let native_before = fs::read_to_string(&native_catalog).unwrap();
+        let native_refreshed = native_before.replace("Native GPT", "Native GTP");
+        assert_eq!(native_before.len(), native_refreshed.len());
+        fs::write(&native_catalog, &native_refreshed).unwrap();
+        fs::set_permissions(&native_catalog, fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(uninstall_picker(&fixture.install_root, &fixture.codex_home).unwrap());
+        let recovered: toml::Value = toml::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+        assert_eq!(recovered["model"].as_str(), Some("gpt-native"));
+        assert_eq!(
+            recovered["app"]["last_opened"].as_str(),
+            Some("desktop-current")
+        );
+        assert!(recovered.get("model_provider").is_none());
+        assert!(recovered.get("model_catalog_json").is_none());
+        assert!(
+            recovered
+                .get("model_providers")
+                .and_then(toml::Value::as_table)
+                .is_none_or(|providers| !providers.contains_key(PICKER_PROVIDER_ID))
+        );
+        assert_eq!(
+            fs::read_to_string(&native_catalog).unwrap(),
+            native_refreshed
+        );
+        assert_eq!(mode(&config), 0o644);
+        assert!(!receipt.generated_catalog_path.exists());
+        assert!(!receipt.native_route_path.exists());
+        assert!(!receipt.managed_state_path.exists());
+    }
+
+    #[test]
+    fn picker_uninstall_rejects_rewritten_managed_provider_tampering() {
+        let fixture = Fixture::new();
+        let (receipt, _native_catalog) = install_test_picker(&fixture, b"model = \"gpt-native\"\n");
+        let config = fixture.codex_home.join("config.toml");
+        let mut tampered: toml::Value =
+            toml::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+        tampered["model_providers"][PICKER_PROVIDER_ID]["base_url"] =
+            toml::Value::String("http://127.0.0.1:9999/v1".to_owned());
+        fs::write(&config, toml::to_string(&tampered).unwrap()).unwrap();
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(matches!(
+            uninstall_picker(&fixture.install_root, &fixture.codex_home),
+            Err(LifecycleError::InvalidPickerState)
+        ));
+        assert!(receipt.generated_catalog_path.exists());
+        assert!(receipt.native_route_path.exists());
+        assert!(receipt.managed_state_path.exists());
+        assert_eq!(
+            toml::from_str::<toml::Value>(&fs::read_to_string(&config).unwrap())
+                .unwrap()["model_providers"][PICKER_PROVIDER_ID]["base_url"]
+                .as_str(),
+            Some("http://127.0.0.1:9999/v1")
+        );
+    }
+
+    #[test]
+    fn picker_uninstall_recovers_the_concrete_pre_header_v1_1_provider_block() {
+        let fixture = Fixture::new();
+        let (receipt, _native_catalog) = install_test_picker(&fixture, b"model = \"gpt-native\"\n");
+        let config = fixture.codex_home.join("config.toml");
+        let generated_catalog = receipt.generated_catalog_path.to_str().unwrap();
+        let capability = fs::read_to_string(
+            fixture
+                .install_root
+                .join("secrets")
+                .join("caller-capability"),
+        )
+        .unwrap();
+        let legacy = format!(
+            "model = \"gpt-native\"\nmodel_provider = {PICKER_PROVIDER_ID:?}\nmodel_catalog_json = {generated_catalog:?}\n\n[model_providers.{PICKER_PROVIDER_ID}]\nname = {PICKER_PROVIDER_NAME:?}\nbase_url = \"http://127.0.0.1:4545/_grok/{capability}/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nsupports_websockets = false\n\n[desktop]\nreparsed = true\n"
+        );
+        fs::write(&config, legacy).unwrap();
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(uninstall_picker(&fixture.install_root, &fixture.codex_home).unwrap());
+        let recovered: toml::Value = toml::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+        assert_eq!(recovered["model"].as_str(), Some("gpt-native"));
+        assert_eq!(recovered["desktop"]["reparsed"].as_bool(), Some(true));
+        assert!(recovered.get("model_provider").is_none());
+        assert!(recovered.get("model_catalog_json").is_none());
+        assert!(
+            recovered
+                .get("model_providers")
+                .and_then(toml::Value::as_table)
+                .is_none_or(|providers| !providers.contains_key(PICKER_PROVIDER_ID))
+        );
     }
 
     #[test]
