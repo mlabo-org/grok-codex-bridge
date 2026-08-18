@@ -240,6 +240,12 @@ enum ToolsField {
     List(Vec<ProjectedTool>),
 }
 
+impl ToolsField {
+    fn has_projected_tools(&self) -> bool {
+        matches!(self, Self::List(tools) if !tools.is_empty())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum ProjectedTool {
     Function(FunctionTool),
@@ -429,7 +435,11 @@ impl NormalizedResponsesRequest {
             Value::Array(self.input.iter().map(InputItem::to_value).collect()),
         );
         insert_tools(&mut object, &self.tools);
-        object.insert("tool_choice".into(), self.tool_choice.to_value());
+        // xAI rejects `tool_choice` when no projected tool is present, even
+        // though Codex requires and validates the field on its side.
+        if self.tools.has_projected_tools() {
+            object.insert("tool_choice".into(), self.tool_choice.to_value());
+        }
         object.insert(
             "parallel_tool_calls".into(),
             Value::Bool(self.parallel_tool_calls),
@@ -3152,6 +3162,10 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("client_metadata");
+        expected_upstream
+            .as_object_mut()
+            .unwrap()
+            .remove("tool_choice");
         expected_upstream["input"][0]
             .as_object_mut()
             .unwrap()
@@ -3159,6 +3173,25 @@ mod tests {
         expected_upstream["input"][1]["content"] = json!("prior answer");
         assert_eq!(request.to_xai_value(), expected_upstream);
         assert_eq!(request.into_xai_value(), expected_upstream);
+    }
+
+    #[test]
+    fn upstream_omits_tool_choice_for_absent_null_and_empty_tools() {
+        for tools in [None, Some(Value::Null), Some(json!([]))] {
+            let mut request = request_fixture();
+            match tools {
+                None => {
+                    request.as_object_mut().unwrap().remove("tools");
+                }
+                Some(tools) => request["tools"] = tools,
+            }
+
+            let upstream = NormalizedResponsesRequest::parse(request)
+                .unwrap()
+                .to_xai_value();
+            assert!(upstream.get("tool_choice").is_none());
+            assert_eq!(upstream["parallel_tool_calls"], false);
+        }
     }
 
     #[test]
@@ -3245,6 +3278,7 @@ mod tests {
         let normalized = NormalizedResponsesRequest::parse(original.clone()).unwrap();
         let mut expected = original;
         expected.as_object_mut().unwrap().remove("client_metadata");
+        expected.as_object_mut().unwrap().remove("tool_choice");
         expected["input"][2].as_object_mut().unwrap().remove("id");
         expected["input"][3].as_object_mut().unwrap().remove("id");
         expected["input"][4].as_object_mut().unwrap().remove("id");
@@ -3497,6 +3531,7 @@ mod tests {
         ]);
         let normalized = NormalizedResponsesRequest::parse(url_image.clone()).unwrap();
         url_image.as_object_mut().unwrap().remove("client_metadata");
+        url_image.as_object_mut().unwrap().remove("tool_choice");
         url_image["input"][0].as_object_mut().unwrap().remove("id");
         url_image["input"][1]["content"] = json!("prior answer");
         assert_eq!(normalized.to_xai_value(), url_image);
@@ -3512,6 +3547,7 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("client_metadata");
+        data_image.as_object_mut().unwrap().remove("tool_choice");
         data_image["input"][0].as_object_mut().unwrap().remove("id");
         data_image["input"][1]["content"] = json!("prior answer");
         assert_eq!(normalized.into_xai_value(), data_image);
@@ -3592,6 +3628,7 @@ mod tests {
         required["input"][2].as_object_mut().unwrap().remove("id");
         required["input"][3].as_object_mut().unwrap().remove("id");
         assert_eq!(normalized.to_xai_value(), required);
+        assert_eq!(normalized.to_xai_value()["tool_choice"], "required");
 
         let mut specific = function_request_fixture();
         specific["tool_choice"] = json!({"type": "function", "name": "search"});
