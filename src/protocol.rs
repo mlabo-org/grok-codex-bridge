@@ -30,6 +30,22 @@ const MAX_ENCRYPTED_REASONING_BYTES: usize = 16 * 1024 * 1024;
 const MAX_REASONING_PARTS: usize = 64;
 const NAMESPACE_DELIMITER: &str = "__";
 const INTERNAL_MESSAGE_METADATA_FIELD: &str = "internal_chat_message_metadata_passthrough";
+const MAX_TOOL_SCHEMA_DEPTH: usize = 8;
+const MAX_TOOL_SCHEMA_LITERAL_DEPTH: usize = 32;
+const TOOL_SCHEMA_UNION_KEYWORDS: &[&str] = &["anyOf", "oneOf", "allOf"];
+const TOOL_SCHEMA_MAP_KEYWORDS: &[&str] =
+    &["properties", "patternProperties", "$defs", "definitions"];
+const TOOL_SCHEMA_LIST_KEYWORDS: &[&str] = &["anyOf", "oneOf", "allOf", "prefixItems"];
+const TOOL_SCHEMA_CHILD_KEYWORDS: &[&str] = &[
+    "items",
+    "additionalProperties",
+    "contains",
+    "not",
+    "if",
+    "then",
+    "else",
+    "propertyNames",
+];
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ProtocolError {
@@ -1282,12 +1298,288 @@ impl FunctionTool {
             "description".into(),
             Value::String(self.description.clone()),
         );
-        object.insert("parameters".into(), Value::Object(self.parameters.clone()));
+        object.insert(
+            "parameters".into(),
+            Value::Object(provider_tool_schema(&self.parameters)),
+        );
         if let Some(strict) = self.strict {
             object.insert("strict".into(), Value::Bool(strict));
         }
         Value::Object(object)
     }
+}
+
+/// xAI rejects a whole Responses request when even one function parameter
+/// schema has a union or nullable-object root. Codex's app tool catalog
+/// includes such a schema for `codex_app__automation_update`. This is the
+/// provider-only projection: Codex parsing and the native route keep the
+/// original schema intact.
+fn provider_tool_schema(schema: &Map<String, Value>) -> Map<String, Value> {
+    let normalized = normalize_schema_literals(schema, 0);
+    if !has_root_union(&normalized) && !has_nullable_object_root(&normalized) {
+        return normalized;
+    }
+    object_root_tool_schema(&normalized)
+}
+
+fn normalize_schema_literals(schema: &Map<String, Value>, depth: usize) -> Map<String, Value> {
+    if depth > MAX_TOOL_SCHEMA_LITERAL_DEPTH {
+        return schema.clone();
+    }
+
+    let mut next = schema.clone();
+    let declared_types = declared_schema_types(schema);
+    if !declared_types.is_empty() {
+        if let Some(Value::Array(values)) = schema.get("enum") {
+            let kept: Vec<Value> = values
+                .iter()
+                .filter(|value| matches_declared_schema_type(value, &declared_types))
+                .cloned()
+                .collect();
+            if kept.len() != values.len() {
+                if kept.is_empty() {
+                    next.remove("enum");
+                } else {
+                    next.insert("enum".into(), Value::Array(kept));
+                }
+            }
+        }
+        if let Some(value) = schema.get("const") {
+            if !matches_declared_schema_type(value, &declared_types) {
+                next.remove("const");
+            }
+        }
+    }
+
+    for key in TOOL_SCHEMA_MAP_KEYWORDS {
+        let Some(children) = schema.get(*key).and_then(Value::as_object) else {
+            continue;
+        };
+        let rewritten = children
+            .iter()
+            .map(|(name, child)| (name.clone(), normalize_schema_value(child, depth + 1)))
+            .collect();
+        if &rewritten != children {
+            next.insert((*key).into(), Value::Object(rewritten));
+        }
+    }
+
+    for key in TOOL_SCHEMA_LIST_KEYWORDS {
+        let Some(Value::Array(children)) = schema.get(*key) else {
+            continue;
+        };
+        let rewritten: Vec<Value> = children
+            .iter()
+            .map(|child| normalize_schema_value(child, depth + 1))
+            .collect();
+        if &rewritten != children {
+            next.insert((*key).into(), Value::Array(rewritten));
+        }
+    }
+
+    for key in TOOL_SCHEMA_CHILD_KEYWORDS {
+        let Some(child) = schema.get(*key) else {
+            continue;
+        };
+        match child {
+            Value::Array(children) => {
+                let rewritten: Vec<Value> = children
+                    .iter()
+                    .map(|child| normalize_schema_value(child, depth + 1))
+                    .collect();
+                if &rewritten != children {
+                    next.insert((*key).into(), Value::Array(rewritten));
+                }
+            }
+            Value::Object(_) => {
+                let rewritten = normalize_schema_value(child, depth + 1);
+                if &rewritten != child {
+                    next.insert((*key).into(), rewritten);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    next
+}
+
+fn normalize_schema_value(value: &Value, depth: usize) -> Value {
+    match value.as_object() {
+        Some(schema) => Value::Object(normalize_schema_literals(schema, depth)),
+        None => value.clone(),
+    }
+}
+
+fn declared_schema_types(schema: &Map<String, Value>) -> Vec<&str> {
+    match schema.get("type") {
+        Some(Value::String(value)) => vec![value.as_str()],
+        Some(Value::Array(values)) => values.iter().filter_map(Value::as_str).collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn matches_declared_schema_type(value: &Value, types: &[&str]) -> bool {
+    let actual = match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+        Value::Number(number) if number.is_i64() || number.is_u64() => "integer",
+        Value::Number(_) => "number",
+    };
+    types.contains(&actual) || (actual == "integer" && types.contains(&"number"))
+}
+
+fn has_root_union(schema: &Map<String, Value>) -> bool {
+    TOOL_SCHEMA_UNION_KEYWORDS
+        .iter()
+        .any(|key| matches!(schema.get(*key), Some(Value::Array(_))))
+}
+
+fn has_nullable_object_root(schema: &Map<String, Value>) -> bool {
+    matches!(schema.get("type"), Some(Value::Array(types)) if types.iter().any(|value| value == "object"))
+}
+
+fn object_root_tool_schema(schema: &Map<String, Value>) -> Map<String, Value> {
+    let mut seen_refs = HashSet::new();
+    let mut branches = Vec::new();
+    collect_object_schema_branches(schema, schema, &mut seen_refs, 0, true, &mut branches);
+
+    let mut properties = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let root_required = required_schema_values(schema);
+    let union_branches: Vec<&Map<String, Value>> = branches
+        .iter()
+        .filter_map(|branch| (!branch.is_root).then_some(&branch.schema))
+        .collect();
+    for branch in &branches {
+        let Some(branch_properties) = branch.schema.get("properties").and_then(Value::as_object)
+        else {
+            continue;
+        };
+        for (name, property) in branch_properties {
+            properties
+                .entry(name.clone())
+                .or_insert_with(|| property.clone());
+        }
+    }
+
+    let mut required = root_required;
+    if let Some((first, rest)) = union_branches.split_first() {
+        let mut shared = required_schema_values(first);
+        for branch in rest {
+            let branch_required = required_schema_values(branch);
+            shared.retain(|name| branch_required.contains(name));
+        }
+        for name in shared {
+            if !required.contains(&name) {
+                required.push(name);
+            }
+        }
+    }
+
+    let mut rewritten = Map::new();
+    for key in ["$schema", "$defs", "definitions"] {
+        if let Some(value) = schema.get(key) {
+            rewritten.insert(key.into(), value.clone());
+        }
+    }
+    if let Some(Value::String(description)) = schema.get("description") {
+        rewritten.insert("description".into(), Value::String(description.clone()));
+    }
+    rewritten.insert("type".into(), Value::String("object".into()));
+    rewritten.insert("properties".into(), Value::Object(properties));
+    if !required.is_empty() {
+        rewritten.insert("required".into(), Value::Array(required));
+    }
+    let additional_properties =
+        if !union_branches.is_empty() || !schema.contains_key("additionalProperties") {
+            Value::Bool(true)
+        } else {
+            schema
+                .get("additionalProperties")
+                .cloned()
+                .expect("checked above")
+        };
+    rewritten.insert("additionalProperties".into(), additional_properties);
+    rewritten
+}
+
+#[derive(Debug)]
+struct ObjectSchemaBranch {
+    schema: Map<String, Value>,
+    is_root: bool,
+}
+
+fn collect_object_schema_branches(
+    schema: &Map<String, Value>,
+    root: &Map<String, Value>,
+    seen_refs: &mut HashSet<String>,
+    depth: usize,
+    is_root: bool,
+    branches: &mut Vec<ObjectSchemaBranch>,
+) {
+    if depth > MAX_TOOL_SCHEMA_DEPTH {
+        return;
+    }
+    if let Some(Value::String(reference)) = schema.get("$ref") {
+        if !seen_refs.insert(reference.clone()) {
+            return;
+        }
+        if let Some(resolved) = resolve_local_schema_ref(reference, root) {
+            collect_object_schema_branches(&resolved, root, seen_refs, depth + 1, false, branches);
+        }
+        return;
+    }
+    for key in TOOL_SCHEMA_UNION_KEYWORDS {
+        let Some(Value::Array(children)) = schema.get(*key) else {
+            continue;
+        };
+        for child in children {
+            if let Some(child) = child.as_object() {
+                collect_object_schema_branches(child, root, seen_refs, depth + 1, false, branches);
+            }
+        }
+    }
+    if matches!(schema.get("type"), Some(Value::String(kind)) if kind == "object")
+        || matches!(schema.get("properties"), Some(Value::Object(_)))
+    {
+        branches.push(ObjectSchemaBranch {
+            schema: schema.clone(),
+            is_root,
+        });
+    }
+}
+
+fn resolve_local_schema_ref(
+    reference: &str,
+    root: &Map<String, Value>,
+) -> Option<Map<String, Value>> {
+    let pointer = reference.strip_prefix("#/")?;
+    let mut segments = pointer.split('/').peekable();
+    let mut current = root;
+    while let Some(raw_segment) = segments.next() {
+        let segment = raw_segment.replace("~1", "/").replace("~0", "~");
+        let value = current.get(&segment)?;
+        if segments.peek().is_none() {
+            return value.as_object().cloned();
+        }
+        current = value.as_object()?;
+    }
+    None
+}
+
+fn required_schema_values(schema: &Map<String, Value>) -> Vec<Value> {
+    schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|values| values.iter().cloned().collect())
+        .unwrap_or_default()
 }
 
 impl ToolChoice {
@@ -3722,6 +4014,112 @@ mod tests {
         projection.restore_response_event(&mut completed);
         assert_eq!(completed["response"]["output"][0]["name"], "ping");
         assert_eq!(completed["response"]["output"][0]["namespace"], "mcp__demo");
+    }
+
+    #[test]
+    fn xai_projection_normalizes_union_rooted_app_tool_schemas_without_mutating_clean_tools() {
+        let mut request = request_fixture();
+        request["tools"] = json!([
+            {
+                "type": "namespace",
+                "name": "codex_app",
+                "description": "Codex app tools.",
+                "tools": [{
+                    "type": "function",
+                    "name": "automation_update",
+                    "description": "Create, update, view, or delete an automation.",
+                    "parameters": {
+                        "$schema": "https://json-schema.org/draft/2020-12/schema",
+                        "$defs": {
+                            "create": {
+                                "type": "object",
+                                "properties": {
+                                    "action": {"type": "string", "enum": ["create", true]},
+                                    "payload": {"type": "string", "const": true}
+                                },
+                                "required": ["action", "payload"]
+                            },
+                            "delete": {
+                                "type": "object",
+                                "properties": {
+                                    "action": {"type": "string", "enum": ["delete"]},
+                                    "id": {"type": "string"}
+                                },
+                                "required": ["action", "id"]
+                            }
+                        },
+                        "description": "Automation command.",
+                        "type": "object",
+                        "properties": {"request_id": {"type": "string"}},
+                        "required": ["request_id"],
+                        "additionalProperties": false,
+                        "oneOf": [
+                            {"$ref": "#/$defs/create"},
+                            {"$ref": "#/$defs/delete"}
+                        ]
+                    }
+                }, {
+                    "type": "function",
+                    "name": "clean",
+                    "description": "A normal MCP tool.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string", "enum": ["README.md"]}},
+                        "required": ["path"],
+                        "additionalProperties": false
+                    }
+                }]
+            }
+        ]);
+
+        let upstream = NormalizedResponsesRequest::parse(request)
+            .unwrap()
+            .to_xai_value();
+        assert_eq!(upstream["tools"][0]["name"], "codex_app__automation_update");
+        assert_eq!(
+            upstream["tools"][0]["parameters"],
+            json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "$defs": {
+                    "create": {
+                        "type": "object",
+                        "properties": {
+                            "action": {"type": "string", "enum": ["create"]},
+                            "payload": {"type": "string"}
+                        },
+                        "required": ["action", "payload"]
+                    },
+                    "delete": {
+                        "type": "object",
+                        "properties": {
+                            "action": {"type": "string", "enum": ["delete"]},
+                            "id": {"type": "string"}
+                        },
+                        "required": ["action", "id"]
+                    }
+                },
+                "description": "Automation command.",
+                "type": "object",
+                "properties": {
+                    "request_id": {"type": "string"},
+                    "action": {"type": "string", "enum": ["create"]},
+                    "payload": {"type": "string"},
+                    "id": {"type": "string"}
+                },
+                "required": ["request_id", "action"],
+                "additionalProperties": true
+            })
+        );
+        assert_eq!(upstream["tools"][1]["name"], "codex_app__clean");
+        assert_eq!(
+            upstream["tools"][1]["parameters"],
+            json!({
+                "type": "object",
+                "properties": {"path": {"type": "string", "enum": ["README.md"]}},
+                "required": ["path"],
+                "additionalProperties": false
+            })
+        );
     }
 
     #[test]
