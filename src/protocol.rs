@@ -29,6 +29,7 @@ const MAX_REASONING_TEXT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ENCRYPTED_REASONING_BYTES: usize = 16 * 1024 * 1024;
 const MAX_REASONING_PARTS: usize = 64;
 const NAMESPACE_DELIMITER: &str = "__";
+const MAX_XAI_TOOLS: usize = 128;
 const INTERNAL_MESSAGE_METADATA_FIELD: &str = "internal_chat_message_metadata_passthrough";
 const MAX_TOOL_SCHEMA_DEPTH: usize = 8;
 const MAX_TOOL_SCHEMA_LITERAL_DEPTH: usize = 32;
@@ -67,6 +68,8 @@ pub enum ProtocolError {
     UnsupportedTools,
     #[error("responses tool name must be unique")]
     DuplicateToolName,
+    #[error("responses request exceeds the upstream tool limit")]
+    TooManyTools,
     #[error("responses tool choice is unsupported in this phase")]
     UnsupportedToolChoice,
     #[error("responses specific tool choice does not reference an admitted tool")]
@@ -143,6 +146,8 @@ enum InputItem {
     Reasoning(PriorReasoning),
     FunctionCall(FunctionCall),
     FunctionCallOutput(FunctionCallOutput),
+    ToolSearchCall(ToolSearchCall),
+    ToolSearchOutput(ToolSearchOutput),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -188,12 +193,25 @@ struct NativeToolName {
 pub(crate) struct NamespaceToolProjection {
     provider_to_native: HashMap<String, NativeToolName>,
     native_to_provider: HashMap<(String, String), String>,
+    tool_search_provider_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 struct FunctionCallOutput {
     call_id: String,
     output: FunctionCallOutputBody,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ToolSearchCall {
+    call_id: String,
+    arguments: Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ToolSearchOutput {
+    call_id: String,
+    tools: Vec<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -324,8 +342,13 @@ impl NormalizedResponsesRequest {
 
         let model = required_nonempty_string(object, "model")?;
         let instructions = optional_string(object, "instructions")?;
-        let (tools, namespace_projection) = parse_tools(object.get("tools"))?;
-        let input = parse_input(required_array(object, "input")?, &namespace_projection)?;
+        let (mut tools, mut namespace_projection) = parse_tools(object.get("tools"))?;
+        let input_values = required_array(object, "input")?;
+        // Discovery output is part of the request history.  Project it before
+        // parsing later function calls so a namespace discovered in an earlier
+        // tool_search turn is available to the same request's replayed call.
+        merge_discovered_tool_search_specs(&mut tools, &mut namespace_projection, input_values)?;
+        let input = parse_input(input_values, &namespace_projection)?;
         let tool_choice = parse_tool_choice(required_value(object, "tool_choice")?)?;
         validate_tool_choice(&tool_choice, &tools)?;
         let parallel_tool_calls = required_bool(object, "parallel_tool_calls")?;
@@ -426,7 +449,9 @@ impl NormalizedResponsesRequest {
                 })
                 | InputItem::Reasoning(_)
                 | InputItem::FunctionCall(_)
-                | InputItem::FunctionCallOutput(_) => in_user_block = false,
+                | InputItem::FunctionCallOutput(_)
+                | InputItem::ToolSearchCall(_)
+                | InputItem::ToolSearchOutput(_) => in_user_block = false,
             }
         }
         if turn_index == 0 {
@@ -561,6 +586,36 @@ impl InputItem {
                 validate_internal_message_metadata(object)?;
                 Ok(Self::FunctionCallOutput(FunctionCallOutput::parse(object)?))
             }
+            "tool_search_call" => {
+                reject_unknown_keys(object, &["type", "call_id", "execution", "arguments"])?;
+                if required_string(object, "execution")? != "client" {
+                    return Err(ProtocolError::InvalidRequestField("execution"));
+                }
+                let arguments = required_value(object, "arguments")?.clone();
+                if !arguments.is_object() {
+                    return Err(ProtocolError::InvalidFunctionArguments);
+                }
+                Ok(Self::ToolSearchCall(ToolSearchCall {
+                    call_id: required_nonempty_string(object, "call_id")?.to_owned(),
+                    arguments,
+                }))
+            }
+            "tool_search_output" => {
+                reject_unknown_keys(object, &["type", "call_id", "status", "execution", "tools"])?;
+                if required_string(object, "status")? != "completed"
+                    || required_string(object, "execution")? != "client"
+                {
+                    return Err(ProtocolError::InvalidRequestField("tool_search_output"));
+                }
+                let tools = required_array(object, "tools")?.to_vec();
+                if tools.iter().any(|tool| !tool.is_object()) {
+                    return Err(ProtocolError::UnsupportedTools);
+                }
+                Ok(Self::ToolSearchOutput(ToolSearchOutput {
+                    call_id: required_nonempty_string(object, "call_id")?.to_owned(),
+                    tools,
+                }))
+            }
             _ => Err(ProtocolError::UnsupportedInputItem),
         }
     }
@@ -571,6 +626,17 @@ impl InputItem {
             Self::Reasoning(reasoning) => reasoning.to_value(),
             Self::FunctionCall(call) => call.to_value(),
             Self::FunctionCallOutput(output) => output.to_value(),
+            Self::ToolSearchCall(call) => serde_json::json!({
+                "type": "function_call",
+                "name": "tool_search",
+                "arguments": call.arguments.to_string(),
+                "call_id": call.call_id,
+            }),
+            Self::ToolSearchOutput(output) => serde_json::json!({
+                "type": "function_call_output",
+                "call_id": output.call_id,
+                "output": serde_json::json!({"tools": output.tools}).to_string(),
+            }),
         }
     }
 }
@@ -1077,7 +1143,24 @@ fn parse_input(
                 }
                 assistant_output_started = true;
             }
+            InputItem::ToolSearchCall(call) => {
+                if !calls.insert(call.call_id.clone()) {
+                    return Err(ProtocolError::DuplicateCallId);
+                }
+                assistant_output_started = true;
+            }
             InputItem::FunctionCallOutput(output) => {
+                if !calls.contains(&output.call_id) {
+                    return Err(ProtocolError::UnmatchedFunctionOutput);
+                }
+                if !outputs.insert(output.call_id.clone()) {
+                    return Err(ProtocolError::DuplicateFunctionOutput);
+                }
+                if calls.len() == outputs.len() {
+                    assistant_output_started = false;
+                }
+            }
+            InputItem::ToolSearchOutput(output) => {
                 if !calls.contains(&output.call_id) {
                     return Err(ProtocolError::UnmatchedFunctionOutput);
                 }
@@ -1149,16 +1232,23 @@ impl NamespaceToolProjection {
     }
 
     fn restore_response_event(&self, value: &mut Value) {
-        if self.provider_to_native.is_empty() {
+        if self.provider_to_native.is_empty() && self.tool_search_provider_name.is_none() {
             return;
         }
         let Some(event) = value.as_object_mut() else {
             return;
         };
         match event.get("type").and_then(Value::as_str) {
-            Some("response.output_item.added" | "response.output_item.done") => {
+            Some("response.output_item.added") => {
                 if let Some(item) = event.get_mut("item") {
                     self.restore_function_item(item);
+                }
+            }
+            Some("response.output_item.done") => {
+                if let Some(item) = event.get_mut("item") {
+                    if !self.restore_tool_search_item(item) {
+                        self.restore_function_item(item);
+                    }
                 }
             }
             Some("response.completed") => {
@@ -1171,11 +1261,43 @@ impl NamespaceToolProjection {
                     return;
                 };
                 for item in output {
-                    self.restore_function_item(item);
+                    if !self.restore_tool_search_item(item) {
+                        self.restore_function_item(item);
+                    }
                 }
             }
             _ => {}
         }
+    }
+
+    fn restore_tool_search_item(&self, item: &mut Value) -> bool {
+        let Some(provider_name) = self.tool_search_provider_name.as_deref() else {
+            return false;
+        };
+        let Some(object) = item.as_object_mut() else {
+            return false;
+        };
+        if object.get("type").and_then(Value::as_str) != Some("function_call")
+            || object.get("name").and_then(Value::as_str) != Some(provider_name)
+        {
+            return false;
+        }
+        let Some(arguments) = object.get("arguments").and_then(Value::as_str) else {
+            return false;
+        };
+        let Ok(arguments) = serde_json::from_str::<Value>(arguments) else {
+            return false;
+        };
+        if !arguments.is_object() {
+            return false;
+        }
+        object.insert("type".into(), Value::String("tool_search_call".into()));
+        object.insert("execution".into(), Value::String("client".into()));
+        object.insert("arguments".into(), arguments);
+        object.remove("name");
+        object.remove("id");
+        object.remove("status");
+        true
     }
 }
 
@@ -1199,6 +1321,33 @@ fn parse_tools(
                             return Err(ProtocolError::DuplicateToolName);
                         }
                         parsed.push(ProjectedTool::Function(tool));
+                    }
+                    "tool_search" => {
+                        if reject_unknown_keys_for(
+                            object,
+                            &["type", "execution", "description", "parameters"],
+                        )
+                        .is_err()
+                            || required_string(object, "execution")? != "client"
+                        {
+                            return Err(ProtocolError::UnsupportedTools);
+                        }
+                        let parameters = required_value(object, "parameters")?
+                            .as_object()
+                            .ok_or(ProtocolError::InvalidRequestField("parameters"))?
+                            .clone();
+                        let provider_name = "tool_search".to_owned();
+                        if !provider_names.insert(provider_name.clone()) {
+                            return Err(ProtocolError::DuplicateToolName);
+                        }
+                        namespace_projection.tool_search_provider_name =
+                            Some(provider_name.clone());
+                        parsed.push(ProjectedTool::Function(FunctionTool {
+                            name: provider_name,
+                            description: required_string(object, "description")?.to_owned(),
+                            parameters: provider_tool_schema(&parameters),
+                            strict: Some(false),
+                        }));
                     }
                     "namespace" => {
                         if reject_unknown_keys_for(
@@ -1253,10 +1402,71 @@ fn parse_tools(
                     _ => return Err(ProtocolError::UnsupportedTools),
                 }
             }
+            if parsed.len() > MAX_XAI_TOOLS {
+                return Err(ProtocolError::TooManyTools);
+            }
             Ok((ToolsField::List(parsed), namespace_projection))
         }
         Some(_) => Err(ProtocolError::UnsupportedTools),
     }
+}
+
+fn merge_discovered_tool_search_specs(
+    tools: &mut ToolsField,
+    projection: &mut NamespaceToolProjection,
+    input: &[Value],
+) -> Result<(), ProtocolError> {
+    let mut values = Vec::new();
+    for item in input {
+        let Some(object) = item.as_object() else {
+            continue;
+        };
+        if object.get("type").and_then(Value::as_str) != Some("tool_search_output") {
+            continue;
+        }
+        let output = object
+            .get("tools")
+            .and_then(Value::as_array)
+            .ok_or(ProtocolError::InvalidRequestField("tool_search_output"))?;
+        values.extend(output.iter().cloned().map(strip_defer_loading));
+    }
+    if values.is_empty() {
+        return Ok(());
+    }
+    let (discovered_tools, discovered_projection) = parse_tools(Some(&Value::Array(values)))?;
+    let ToolsField::List(existing) = tools else {
+        return Err(ProtocolError::InvalidRequestField("tool_search_output"));
+    };
+    let ToolsField::List(mut additions) = discovered_tools else {
+        unreachable!();
+    };
+    if existing.len() + additions.len() > MAX_XAI_TOOLS {
+        return Err(ProtocolError::TooManyTools);
+    }
+    for (name, native) in discovered_projection.provider_to_native {
+        if projection.provider_to_native.contains_key(&name) {
+            return Err(ProtocolError::DuplicateToolName);
+        }
+        projection
+            .provider_to_native
+            .insert(name.clone(), native.clone());
+        projection
+            .native_to_provider
+            .insert((native.namespace.clone(), native.name.clone()), name);
+    }
+    existing.append(&mut additions);
+    Ok(())
+}
+
+fn strip_defer_loading(value: Value) -> Value {
+    let Some(mut object) = value.as_object().cloned() else {
+        return value;
+    };
+    object.remove("defer_loading");
+    if let Some(Value::Array(children)) = object.get_mut("tools") {
+        *children = children.drain(..).map(strip_defer_loading).collect();
+    }
+    Value::Object(object)
 }
 
 impl FunctionTool {
@@ -3465,6 +3675,100 @@ mod tests {
         expected_upstream["input"][1]["content"] = json!("prior answer");
         assert_eq!(request.to_xai_value(), expected_upstream);
         assert_eq!(request.into_xai_value(), expected_upstream);
+    }
+
+    #[test]
+    fn tool_search_is_projected_as_one_provider_function() {
+        let mut request = request_fixture();
+        request["tools"] = json!([{
+            "type": "tool_search",
+            "execution": "client",
+            "description": "Search deferred tools.",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"]
+            }
+        }]);
+        let normalized = NormalizedResponsesRequest::parse(request).unwrap();
+        assert_eq!(
+            normalized.to_xai_value()["tools"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(normalized.to_xai_value()["tools"][0]["name"], "tool_search");
+    }
+
+    #[test]
+    fn discovered_tool_search_namespace_is_replayed_and_projected() {
+        let mut request = request_fixture();
+        request["tools"] = json!([{
+            "type": "tool_search",
+            "execution": "client",
+            "description": "Search deferred tools.",
+            "parameters": {"type": "object", "properties": {}}
+        }]);
+        request["input"] = json!([
+            {"type": "tool_search_call", "call_id": "search-1", "execution": "client", "arguments": {"query": "calendar"}},
+            {"type": "tool_search_output", "call_id": "search-1", "status": "completed", "execution": "client", "tools": [{
+                "type": "namespace", "name": "mcp__calendar", "description": "Calendar tools.", "tools": [{
+                    "type": "function", "name": "create", "description": "Create event.",
+                    "parameters": {"type": "object", "properties": {}}, "defer_loading": true
+                }]
+            }]},
+            {"type": "function_call", "call_id": "call-1", "name": "create", "namespace": "mcp__calendar", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call-1", "output": "ok"}
+        ]);
+        let upstream = NormalizedResponsesRequest::parse(request)
+            .unwrap()
+            .to_xai_value();
+        assert_eq!(upstream["tools"].as_array().unwrap().len(), 2);
+        assert_eq!(upstream["tools"][1]["name"], "mcp__calendar__create");
+        assert_eq!(upstream["input"][2]["name"], "mcp__calendar__create");
+        assert_eq!(upstream["input"][0]["name"], "tool_search");
+    }
+
+    #[test]
+    fn tool_search_sse_function_call_is_restored_to_native_shape() {
+        let mut request = request_fixture();
+        request["tools"] = json!([{
+            "type": "tool_search", "execution": "client",
+            "description": "Search deferred tools.",
+            "parameters": {"type": "object", "properties": {}}
+        }]);
+        let projection = NormalizedResponsesRequest::parse(request)
+            .unwrap()
+            .namespace_projection();
+        let mut event = json!({
+            "type": "response.output_item.done", "sequence_number": 1,
+            "output_index": 0, "item": {
+                "type": "function_call", "id": "fc-1", "call_id": "search-1",
+                "name": "tool_search", "arguments": "{\"query\":\"calendar\"}", "status": "completed"
+            }
+        });
+        projection.restore_response_event(&mut event);
+        assert_eq!(event["item"]["type"], "tool_search_call");
+        assert_eq!(event["item"]["execution"], "client");
+        assert_eq!(event["item"]["arguments"]["query"], "calendar");
+        assert!(event["item"].get("name").is_none());
+    }
+
+    #[test]
+    fn provider_tool_limit_fails_closed_before_upstream() {
+        let mut request = request_fixture();
+        request["tools"] = Value::Array(
+            (0..129)
+                .map(|index| {
+                    json!({
+                        "type": "function", "name": format!("tool_{index}"), "description": "",
+                        "parameters": {"type": "object", "properties": {}}
+                    })
+                })
+                .collect(),
+        );
+        assert_eq!(
+            NormalizedResponsesRequest::parse(request).unwrap_err(),
+            ProtocolError::TooManyTools
+        );
     }
 
     #[test]
