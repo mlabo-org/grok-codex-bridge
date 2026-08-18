@@ -1197,7 +1197,9 @@ fn parse_input(
     for value in values {
         let item = InputItem::parse(value, namespace_projection)?;
         match &item {
-            InputItem::Reasoning(reasoning) => {
+            InputItem::Reasoning(reasoning)
+                if matches!(reasoning.encrypted_content, PriorEncryptedContent::Grok(_)) =>
+            {
                 if assistant_output_started || calls.len() != outputs.len() {
                     return Err(ProtocolError::InvalidRequestField("input"));
                 }
@@ -1206,6 +1208,10 @@ fn parse_input(
                 }
                 assistant_output_started = true;
             }
+            // Native GPT and legacy untagged reasoning are provider-bound and
+            // are removed before the Grok request is serialized. They must not
+            // impose Grok's assistant-output ordering on a mixed-model history.
+            InputItem::Reasoning(_) => {}
             InputItem::FunctionCall(call) => {
                 if !calls.insert(call.call_id.clone()) {
                     return Err(ProtocolError::DuplicateCallId);
@@ -4062,6 +4068,45 @@ mod tests {
         let original = native_only.clone();
         assert!(!remove_unreplayable_reasoning_for_native(&mut native_only));
         assert_eq!(native_only, original);
+    }
+
+    #[test]
+    fn model_switch_ignores_foreign_reasoning_order_before_grok() {
+        let mut request = request_fixture();
+        request["input"] = json!([
+            {
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "first"}]
+            },
+            {
+                "type": "reasoning", "id": "rs_native_1",
+                "summary": [], "encrypted_content": "native-gpt-ciphertext-1"
+            },
+            {
+                "type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": "working"}]
+            },
+            {
+                "type": "reasoning", "id": "rs_native_2",
+                "summary": [], "encrypted_content": "native-gpt-ciphertext-2"
+            },
+            {
+                "type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": "done"}]
+            },
+            {
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "continue with Grok"}]
+            }
+        ]);
+
+        let upstream = NormalizedResponsesRequest::parse(request)
+            .unwrap()
+            .to_xai_value();
+        let input = upstream["input"].as_array().unwrap();
+        assert_eq!(input.len(), 4);
+        assert!(input.iter().all(|item| item["type"] != "reasoning"));
+        assert_eq!(input[3]["content"][0]["text"], "continue with Grok");
     }
 
     #[test]
