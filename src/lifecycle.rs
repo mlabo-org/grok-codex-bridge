@@ -11,8 +11,10 @@ use uuid::Uuid;
 
 use crate::catalog::CatalogCache;
 use crate::credential::CredentialStore;
-use crate::picker::{ArtifactIdentity, ConfigRollbackOwnership, PickerManagedState, generate_picker_catalog};
 use crate::native::{NativeRouteState, NativeUpstream};
+use crate::picker::{
+    ArtifactIdentity, ConfigRollbackOwnership, PickerManagedState, generate_picker_catalog,
+};
 
 const MANIFEST_VERSION: u32 = 1;
 const CONFIG_VERSION: u32 = 1;
@@ -347,7 +349,9 @@ pub fn uninstall(request: &UninstallRequest) -> Result<UninstallReceipt, Lifecyc
 /// Creates or updates the non-secret Phase J generated picker state. It does
 /// not start a service or reload Codex; callers must cross that boundary
 /// explicitly with the exact accepted Codex binary.
-pub fn install_picker(request: &PickerInstallRequest) -> Result<PickerInstallReceipt, LifecycleError> {
+pub fn install_picker(
+    request: &PickerInstallRequest,
+) -> Result<PickerInstallReceipt, LifecycleError> {
     validate_absolute_clean(&request.install_root)?;
     validate_absolute_clean(&request.codex_home)?;
     validate_absolute_clean(&request.native_catalog_path)?;
@@ -367,7 +371,8 @@ pub fn install_picker(request: &PickerInstallRequest) -> Result<PickerInstallRec
     if install_manifest.install_root != request.install_root
         || install_manifest.profile_path != request.codex_home.join(PROFILE_FILE_NAME)
         || install_manifest.catalog_cache_path != request.install_root.join("state/models.json")
-        || install_manifest.caller_token_path != request.install_root.join("secrets/caller-capability")
+        || install_manifest.caller_token_path
+            != request.install_root.join("secrets/caller-capability")
     {
         return Err(LifecycleError::InvalidManifest);
     }
@@ -378,8 +383,8 @@ pub fn install_picker(request: &PickerInstallRequest) -> Result<PickerInstallRec
         .load()
         .map_err(LifecycleError::Catalog)?
         .ok_or(LifecycleError::PickerCatalogUnavailable)?;
-    let generated = generate_picker_catalog(&native_bytes, &grok_catalog)
-        .map_err(LifecycleError::Picker)?;
+    let generated =
+        generate_picker_catalog(&native_bytes, &grok_catalog).map_err(LifecycleError::Picker)?;
     let native_route = NativeRouteState::new(
         request.native_upstream,
         generated.native_model_slugs().iter().cloned(),
@@ -389,12 +394,18 @@ pub fn install_picker(request: &PickerInstallRequest) -> Result<PickerInstallRec
     let capability = read_private_control_file(&install_manifest.caller_token_path)?;
     let capability = validate_capability_bytes(&capability)?;
     let config_path = request.codex_home.join("config.toml");
-    let generated_path = request.install_root.join("state").join(PICKER_CATALOG_FILE_NAME);
-    let state_path = request.install_root.join("state").join(PICKER_STATE_FILE_NAME);
+    let generated_path = request
+        .install_root
+        .join("state")
+        .join(PICKER_CATALOG_FILE_NAME);
     let native_route_path = request
         .install_root
         .join("state")
         .join(PICKER_NATIVE_ROUTE_FILE_NAME);
+    let state_path = request
+        .install_root
+        .join("state")
+        .join(PICKER_STATE_FILE_NAME);
 
     let prior_state = read_picker_state(&state_path)?;
     let previous_generated = read_optional_control_file(&generated_path, &[0o600])?;
@@ -448,7 +459,11 @@ pub fn install_picker(request: &PickerInstallRequest) -> Result<PickerInstallRec
     }
 
     if let Err(error) = atomic_write(&state_path, &state_bytes, 0o600) {
-        restore_optional_file(&config_path, config_plan.current.as_deref(), config_plan.previous_mode)?;
+        restore_optional_file(
+            &config_path,
+            config_plan.current.as_deref(),
+            config_plan.previous_mode,
+        )?;
         restore_optional_file(&generated_path, previous_generated.as_deref(), 0o600)?;
         restore_optional_file(&native_route_path, previous_native_route.as_deref(), 0o600)?;
         restore_optional_file(&state_path, previous_state.as_deref(), 0o600)?;
@@ -473,7 +488,10 @@ pub fn uninstall_picker(install_root: &Path, codex_home: &Path) -> Result<bool, 
     uninstall_picker_if_present(install_root, codex_home)
 }
 
-fn uninstall_picker_if_present(install_root: &Path, codex_home: &Path) -> Result<bool, LifecycleError> {
+fn uninstall_picker_if_present(
+    install_root: &Path,
+    codex_home: &Path,
+) -> Result<bool, LifecycleError> {
     let state_path = install_root.join("state").join(PICKER_STATE_FILE_NAME);
     let Some(bytes) = read_optional_control_file(&state_path, &[0o600])? else {
         return Ok(false);
@@ -498,7 +516,10 @@ fn uninstall_picker_if_present(install_root: &Path, codex_home: &Path) -> Result
             fs::remove_file(&config_path).map_err(LifecycleError::RestoreExternalTarget)?;
             sync_parent(&config_path)?;
         }
-        ConfigRollbackOwnership::RestoreExactBackup { backup, original_mode } => {
+        ConfigRollbackOwnership::RestoreExactBackup {
+            backup,
+            original_mode,
+        } => {
             validate_identity(backup)?;
             let original = read_private_control_file(backup.path())?;
             atomic_write(&config_path, &original, *original_mode)?;
@@ -723,8 +744,10 @@ fn prepare_picker_config(
                 return Err(LifecycleError::UnsafeExternalPermissions);
             }
             let current = read_regular_file(config_path, MAX_CONTROL_FILE_BYTES)?;
-            let source = std::str::from_utf8(&current).map_err(|_| LifecycleError::InvalidPickerConfig)?;
-            let parsed: toml::Value = toml::from_str(source).map_err(|_| LifecycleError::InvalidPickerConfig)?;
+            let source =
+                std::str::from_utf8(&current).map_err(|_| LifecycleError::InvalidPickerConfig)?;
+            let parsed: toml::Value =
+                toml::from_str(source).map_err(|_| LifecycleError::InvalidPickerConfig)?;
             if picker_marker_count(source) != 0
                 || parsed.get("model_catalog_json").is_some()
                 || parsed.get("openai_base_url").is_some()
@@ -782,8 +805,13 @@ fn render_picker_config(
         return Err(LifecycleError::PickerConfigConflict);
     }
     if markers == 1 {
-        let begin = source.find(PICKER_BEGIN).ok_or(LifecycleError::PickerConfigConflict)?;
-        let end = source.find(PICKER_END).ok_or(LifecycleError::PickerConfigConflict)? + PICKER_END.len();
+        let begin = source
+            .find(PICKER_BEGIN)
+            .ok_or(LifecycleError::PickerConfigConflict)?;
+        let end = source
+            .find(PICKER_END)
+            .ok_or(LifecycleError::PickerConfigConflict)?
+            + PICKER_END.len();
         return Ok(format!("{}{}{}", &source[..begin], block, &source[end..]));
     }
     let mut insertion = source.len();
@@ -795,11 +823,19 @@ fn render_picker_config(
         }
         offset += line.len();
     }
-    Ok(format!("{}{}{}", &source[..insertion], block, &source[insertion..]))
+    Ok(format!(
+        "{}{}{}",
+        &source[..insertion],
+        block,
+        &source[insertion..]
+    ))
 }
 
 fn picker_marker_count(source: &str) -> usize {
-    match (source.matches(PICKER_BEGIN).count(), source.matches(PICKER_END).count()) {
+    match (
+        source.matches(PICKER_BEGIN).count(),
+        source.matches(PICKER_END).count(),
+    ) {
         (0, 0) => 0,
         (1, 1) => 1,
         _ => 2,
@@ -807,8 +843,12 @@ fn picker_marker_count(source: &str) -> usize {
 }
 
 fn artifact_identity(path: &Path, bytes: &[u8]) -> Result<ArtifactIdentity, LifecycleError> {
-    ArtifactIdentity::new(path.to_path_buf(), bytes.len() as u64, format!("{:x}", Sha256::digest(bytes)))
-        .map_err(LifecycleError::Picker)
+    ArtifactIdentity::new(
+        path.to_path_buf(),
+        bytes.len() as u64,
+        format!("{:x}", Sha256::digest(bytes)),
+    )
+    .map_err(LifecycleError::Picker)
 }
 
 fn validate_identity(identity: &ArtifactIdentity) -> Result<(), LifecycleError> {
@@ -826,7 +866,10 @@ fn read_picker_state(path: &Path) -> Result<Option<PickerManagedState>, Lifecycl
         .transpose()
 }
 
-fn read_optional_control_file(path: &Path, modes: &[u32]) -> Result<Option<Vec<u8>>, LifecycleError> {
+fn read_optional_control_file(
+    path: &Path,
+    modes: &[u32],
+) -> Result<Option<Vec<u8>>, LifecycleError> {
     match fs::symlink_metadata(path) {
         Ok(_) => read_control_file_with_modes(path, modes, MAX_CONTROL_FILE_BYTES).map(Some),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -834,7 +877,11 @@ fn read_optional_control_file(path: &Path, modes: &[u32]) -> Result<Option<Vec<u
     }
 }
 
-fn restore_optional_file(path: &Path, previous: Option<&[u8]>, mode: u32) -> Result<(), LifecycleError> {
+fn restore_optional_file(
+    path: &Path,
+    previous: Option<&[u8]>,
+    mode: u32,
+) -> Result<(), LifecycleError> {
     if let Some(previous) = previous {
         atomic_write(path, previous, mode)
     } else {
@@ -2057,7 +2104,8 @@ mod tests {
         .unwrap();
         fs::set_permissions(&native_catalog, fs::Permissions::from_mode(0o600)).unwrap();
         let config = fixture.codex_home.join("config.toml");
-        let original = b"# keep this comment\nmodel = \"gpt-native\"\n\n[features]\nfuture = true\n";
+        let original =
+            b"# keep this comment\nmodel = \"gpt-native\"\n\n[features]\nfuture = true\n";
         fs::write(&config, original).unwrap();
         fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
 
@@ -2069,7 +2117,8 @@ mod tests {
             bind: "127.0.0.1:4545".parse().unwrap(),
         })
         .unwrap();
-        let generated: serde_json::Value = serde_json::from_slice(&fs::read(&receipt.generated_catalog_path).unwrap()).unwrap();
+        let generated: serde_json::Value =
+            serde_json::from_slice(&fs::read(&receipt.generated_catalog_path).unwrap()).unwrap();
         assert!(generated["models"][0].get("model_provider").is_none());
         assert!(generated["models"][1].get("model_provider").is_none());
         let native_route =
