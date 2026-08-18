@@ -169,7 +169,7 @@ fn grok_picker_entry(id: &str, priority: i32) -> Value {
         "effective_context_window_percent": 95,
         "experimental_supported_tools": [],
         "input_modalities": ["text", "image"],
-        "supports_search_tool": false,
+        "supports_search_tool": true,
         "use_responses_lite": false,
         "node_repl_auto_review_required": false,
         "node_repl_disabled": false,
