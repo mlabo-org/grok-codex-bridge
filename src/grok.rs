@@ -178,7 +178,7 @@ impl Stream for ResponsesByteStream {
 impl ResponsesByteStream {
     pub fn validated_text_events(self) -> ValidatedTextEventStream {
         let namespace_projection = self.namespace_projection.clone();
-        let data = self.eventsource().map(|event| {
+        let data = SseEofBoundaryStream::new(self).eventsource().map(|event| {
             event
                 .map(|event| event.data)
                 .map_err(|_| GrokError::InvalidSseFraming)
@@ -188,6 +188,56 @@ impl ResponsesByteStream {
             validator: TextStreamValidator::new(),
             namespace_projection,
             finished: false,
+        }
+    }
+}
+
+/// Terminates a final unterminated SSE block when the upstream closes cleanly.
+///
+/// Grok can end the response immediately after the final `response.completed`
+/// data line. `eventsource-stream` retains that block as incomplete and drops it
+/// at EOF, whereas the Grok CLI-compatible parser used by codex-router drains
+/// the remaining block. Appending one empty-line boundary preserves the same
+/// behavior without treating a genuinely missing terminal event as success.
+struct SseEofBoundaryStream<S> {
+    inner: S,
+    ended: bool,
+}
+
+impl<S> SseEofBoundaryStream<S> {
+    fn new(inner: S) -> Self {
+        Self {
+            inner,
+            ended: false,
+        }
+    }
+}
+
+impl<S> Stream for SseEofBoundaryStream<S>
+where
+    S: Stream<Item = Result<Bytes, GrokError>> + Unpin,
+{
+    type Item = Result<Bytes, GrokError>;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.ended {
+            return std::task::Poll::Ready(None);
+        }
+
+        match Pin::new(&mut this.inner).poll_next(context) {
+            std::task::Poll::Ready(Some(Err(error))) => {
+                this.ended = true;
+                std::task::Poll::Ready(Some(Err(error)))
+            }
+            std::task::Poll::Ready(None) => {
+                this.ended = true;
+                std::task::Poll::Ready(Some(Ok(Bytes::from_static(b"\n\n"))))
+            }
+            poll => poll,
         }
     }
 }
@@ -438,6 +488,56 @@ mod tests {
             axum::serve(listener, router).await.unwrap();
         });
         (Url::parse(&format!("http://{address}/v1/")).unwrap(), task)
+    }
+
+    #[tokio::test]
+    async fn response_completed_without_trailing_sse_boundary_is_flushed() {
+        let item_added = json!({
+            "type": "message", "id": "msg_1", "role": "assistant",
+            "status": "in_progress", "content": []
+        });
+        let item_done = json!({
+            "type": "message", "id": "msg_1", "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "ok", "annotations": []}]
+        });
+        let events = [
+            json!({"type":"response.created","sequence_number":0,"response":{"id":"resp_1","output":[]}}),
+            json!({"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":item_added}),
+            json!({"type":"response.content_part.added","sequence_number":2,"item_id":"msg_1","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}),
+            json!({"type":"response.output_text.delta","sequence_number":3,"item_id":"msg_1","output_index":0,"content_index":0,"delta":"ok"}),
+            json!({"type":"response.output_text.done","sequence_number":4,"item_id":"msg_1","output_index":0,"content_index":0,"text":"ok"}),
+            json!({"type":"response.content_part.done","sequence_number":5,"item_id":"msg_1","output_index":0,"content_index":0,"part":{"type":"output_text","text":"ok","annotations":[]}}),
+            json!({"type":"response.output_item.done","sequence_number":6,"output_index":0,"item":item_done.clone()}),
+            json!({"type":"response.completed","sequence_number":7,"response":{"id":"resp_1","output":[item_done]}}),
+        ];
+        let stream_body = events
+            .into_iter()
+            .enumerate()
+            .map(|(index, event)| {
+                if index == 7 {
+                    format!("data: {event}")
+                } else {
+                    format!("data: {event}\n\n")
+                }
+            })
+            .collect::<String>();
+        let stream = ResponsesByteStream {
+            inner: Box::pin(futures_util::stream::iter([Ok(Bytes::from(stream_body))])),
+            _credential: Arc::new(test_session_credential("stream-secret", "user-1")),
+            namespace_projection: NamespaceToolProjection::default(),
+        };
+
+        let events = stream
+            .validated_text_events()
+            .map(|event| event.unwrap())
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(matches!(
+            events.last().map(ValidatedTextStreamEvent::kind),
+            Some(crate::protocol::TextStreamEventKind::ResponseCompleted { .. })
+        ));
     }
 
     #[tokio::test]
