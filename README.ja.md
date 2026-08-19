@@ -4,7 +4,7 @@
 
 **Native GPTを置き換えず、Codexハーネスの中でGrokを動かすための、Rust製ネイティブResponses-to-Responsesブリッジです。**
 
-`grok-codex-bridge` はApple Silicon搭載macOS向けの、スタンドアロンかつループバック専用のプロバイダーブリッジです。エージェントループ、ツール、権限、MCPサーバー、Skills、セッション状態は引き続きCodexが担当します。本プロジェクトが担当するのは、ローカルのプロバイダー境界、厳密なResponsesプロトコル変換、検証付きSSEストリーミング、Grok認証情報の読み取り専用利用、xAIへの上流接続だけです。
+`grok-codex-bridge` はApple Silicon搭載macOS向けの、スタンドアロンかつループバック専用のプロバイダーブリッジです。エージェントループ、ツール、権限、MCPサーバー、Skills、セッション状態は引き続きCodexが担当します。本プロジェクトが担当するのは、ローカルのプロバイダー境界、Responses transportの許容的なprovider projection、Codexが消費するSSE抽出、Grok認証情報の読み取り専用利用、xAIへの上流接続だけです。
 
 Codexプラグイン、汎用LLMルーター、エージェントハーネスではありません。
 
@@ -57,7 +57,7 @@ rollback commandを報告してください。
 
 ## 謝辞
 
-本プロジェクトは、[duolahypercho/codex-router](https://github.com/duolahypercho/codex-router/tree/9995c77278608640759982c98ec5bdaeb371c174) から多くの重要な知見を得ています。その実装とドキュメントは実現可能性を確認するうえで大切な先行事例であり、公式Grok認証情報の鮮度、プロバイダー境界に閉じるメタデータ、xAI Responses/SSEイベント体系、ネイティブモデルピッカー統合、可逆な有効化方式の設計判断に大きく役立ちました。MIT Licenseでこの成果を公開された作者とコントリビューターの皆様に、心より敬意と感謝を表します。
+本プロジェクトは、[duolahypercho/codex-router](https://github.com/duolahypercho/codex-router/tree/9995c77278608640759982c98ec5bdaeb371c174) から多くの重要な知見を得ています。その実装とドキュメントは実現可能性を確認するうえで大切な先行事例であり、公式Grok認証情報の鮮度、プロバイダー境界に閉じるメタデータ、許容的なResponses/SSE transport投影、ネイティブモデルピッカー統合、可逆な有効化方式の設計判断に大きく役立ちました。MIT Licenseでこの成果を公開された作者とコントリビューターの皆様に、心より敬意と感謝を表します。
 
 本リポジトリには `codex-router` のソースコードをコピーしていません。`grok-codex-bridge` は、LiteLLM/Chatの多段変換ではなく直接的なResponses-to-Responses転送を行う、独立したRust実装です。
 
@@ -76,14 +76,14 @@ Codexハーネス
         | capabilityで保護されたResponsesリクエスト
         v
 grok-codex-bridge（Rust製ネイティブ実行ファイル）
-  ローカル認証 · リクエスト正規化 · SSE検証
+  ローカル認証 · provider projection · Codex向けSSE抽出
         |
         | 接続先を固定したResponses転送
         v
 Grok / xAI
 ```
 
-ブリッジ自身はツールを実行しません。関数定義、順序付きツール呼び出しと結果、テキスト、画像URLとdata URI、reasoning item、対応済みResponses制御値を保持し、実行責任はCodexに残します。
+ブリッジ自身はツールを実行しません。validな関数定義、順序付きツール呼び出しと結果、テキスト、画像URLとdata URI、reasoning summary、必要なResponses制御値を保持し、実行責任はCodexに残します。providerで再生できないlocal/foreign transport artifactだけを狭く除外し、Codexのsession/replay状態や、既存の混在provider履歴をブリッジが再構成することは保証しません。
 
 ## 現在の状態
 
@@ -91,7 +91,7 @@ Grok / xAI
 | --- | --- |
 | V1.0 分離型 `grok-bridge` プロファイル | 実装済み・Codex CLIで検証済み |
 | Rustネイティブビルドと可逆なユーザーサービス | 実装済み・検証済み |
-| V1.1 Native GPT/Grok統合モデルピッカー | 実装済み・CLIでの切替と履歴継承を検証済み |
+| V1.1 Native GPT/Grok統合モデルピッカー | 実装済み・CLIでの切替を検証済み。混在providerの継続性はCodexが所有 |
 | V1.1 Skillsメタデータ予算 | Grokカタログに272,000トークンを設定し、Codex標準の2%計算を使用 |
 | Desktopピッカーと最終rollback受け入れ | 最終検証待ち |
 | 公開リリースバイナリ | 提供しません。ソースからbuild・materializeしてください |
@@ -100,8 +100,8 @@ V1.0は保守的な公開ルートです。Codexの分離プロファイルを�
 
 ## 主な機能
 
-- Codex ResponsesからxAI Responsesへの厳密な正規化。旧Chat Completions形式への変換は行いません。
-- 安定したID、座標、シーケンス番号、完了テキスト、ツール引数、終端状態をイベント単位で検証するSSE処理。
+- `store: false`と全入力履歴を使う、Codex ResponsesからxAI Responsesへの許容的なprovider projection。旧Chat Completions形式への変換は行いません。
+- text、reasoning summary、function call、terminal/usageをCodex向けに抽出するSSE処理。unknownな補助eventでstreamを終了させません。
 - 画像をダウンロード・再エンコードせず、順序付き関数呼び出し/結果とテキスト・画像混在入力を保持。
 - 公式Grokセッション認証情報を読み取り専用で利用し、変更時はゼロ化対応メモリキャッシュを再読み込み。
 - rustlsで公式xAI接続先に固定し、リダイレクトを禁止。認証、レート制限、HTTP状態、stream障害を型付きで処理。
@@ -263,7 +263,7 @@ src/config.rs                 version付きruntime設定
 src/credential.rs             読み取り専用Grok認証境界
 src/catalog.rs                atomicなmetadata-onlyモデルカタログ
 src/grok.rs                   xAI接続先を固定したtransport
-src/protocol.rs               Responses正規化とSSE検証
+src/protocol.rs               Responses provider projectionとSSE抽出
 src/server.rs                 capability保護されたloopback service
 src/lifecycle.rs              可逆なinstallとrollbackの所有者
 src/picker.rs                 Native GPT/Grok統合catalog生成

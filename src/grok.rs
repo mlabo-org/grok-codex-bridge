@@ -22,7 +22,10 @@ const OFFICIAL_INFERENCE_BASE: &str = "https://cli-chat-proxy.grok.com/v1/";
 const MODELS_TIMEOUT: Duration = Duration::from_secs(20);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const CLIENT_MODE: &str = "headless";
-const CLIENT_IDENTIFIER: &str = "grok-codex-bridge";
+// Match the first-party Grok CLI transport identity.  The bridge remains a
+// separate local binary, but cli-chat-proxy gates request compatibility on
+// this client family and its lockstepped version.
+const CLIENT_IDENTIFIER: &str = "grok-shell";
 // `x-grok-client-version` is a cli-chat-proxy compatibility gate, not this
 // bridge's package version. Keep the truthful bridge identity in User-Agent
 // and `x-grok-client-identifier`; this value tracks xAI's lockstepped

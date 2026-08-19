@@ -4,7 +4,7 @@
 
 **A native Rust Responses-to-Responses bridge that lets Grok run inside the Codex harness without replacing Native GPT.**
 
-`grok-codex-bridge` is a standalone, loopback-only provider bridge for macOS on Apple Silicon. Codex continues to own the agent loop, tools, permissions, MCP servers, Skills, and session state. This project owns only the local provider boundary, strict Responses protocol translation, validated SSE streaming, read-only Grok authentication, and the upstream connection to xAI.
+`grok-codex-bridge` is a standalone, loopback-only provider bridge for macOS on Apple Silicon. Codex continues to own the agent loop, tools, permissions, MCP servers, Skills, and session state. This project owns only the local provider boundary, tolerant provider projection for Responses transport, Codex-consumed SSE extraction, read-only Grok authentication, and the upstream connection to xAI.
 
 It is not a Codex plugin, a general-purpose LLM router, or an agent harness.
 
@@ -60,7 +60,7 @@ A first-time install can run from Codex. Do not stop or replace an already runni
 
 ## Acknowledgements
 
-This project owes a substantial design debt to [duolahypercho/codex-router](https://github.com/duolahypercho/codex-router/tree/9995c77278608640759982c98ec5bdaeb371c174). Its implementation and documentation were an important feasibility reference and materially informed our decisions around official Grok credential freshness, provider-bound metadata, xAI Responses/SSE taxonomy, native picker integration, and reversible activation. We sincerely thank the author and contributors for publishing that work under the MIT License.
+This project owes a substantial design debt to [duolahypercho/codex-router](https://github.com/duolahypercho/codex-router/tree/9995c77278608640759982c98ec5bdaeb371c174). Its implementation and documentation were an important feasibility reference and materially informed our decisions around official Grok credential freshness, provider-bound metadata, tolerant Responses/SSE transport projection, native picker integration, and reversible activation. We sincerely thank the author and contributors for publishing that work under the MIT License.
 
 No `codex-router` source code is copied into this repository. `grok-codex-bridge` remains an independent Rust implementation with a direct Responses-to-Responses transport rather than a LiteLLM/Chat multi-hop.
 
@@ -79,14 +79,14 @@ Codex harness
         | capability-scoped Responses request
         v
 grok-codex-bridge (native Rust executable)
-  local authentication · request normalization · SSE validation
+  local authentication · provider projection · Codex SSE extraction
         |
         | origin-locked Responses transport
         v
 Grok / xAI
 ```
 
-The bridge does not execute tool calls. It preserves function definitions, ordered tool calls and results, text, image URLs and data URIs, reasoning items, and supported Responses controls while Codex remains responsible for execution.
+The bridge does not execute tool calls. It preserves valid function definitions, ordered tool calls and results, text, image URLs and data URIs, reasoning summaries, and required Responses controls while Codex remains responsible for execution. Provider-unreplayable local or foreign transport artifacts are excluded narrowly; the bridge does not reconstruct the complete Codex session/replay state or legacy mixed-provider continuity.
 
 ## Project status
 
@@ -94,7 +94,7 @@ The bridge does not execute tool calls. It preserves function definitions, order
 | --- | --- |
 | V1.0 isolated `grok-bridge` profile | Implemented and validated in the Codex CLI |
 | Native Rust build and reversible user service | Implemented and validated |
-| V1.1 merged Native GPT/Grok model picker | Implemented; CLI switching and history continuity validated |
+| V1.1 merged Native GPT/Grok model picker | Implemented; CLI switching validated; mixed-provider continuity remains Codex-owned |
 | V1.1 skill metadata budget | Grok catalog entries publish a 272,000-token context window, using Codex's native 2% calculation |
 | Desktop picker and final rollback acceptance | Pending final verification |
 | Public release binaries | Not published; build and materialize from source |
@@ -103,8 +103,8 @@ V1.0 is the conservative public route: it uses a separate Codex profile and leav
 
 ## Features
 
-- Strict Codex Responses-to-xAI Responses normalization; no legacy Chat Completions conversion.
-- Event-by-event SSE validation with stable IDs, coordinates, sequence numbers, completed text, tool arguments, and terminal state.
+- Tolerant Codex Responses-to-xAI Responses provider projection with `store: false` and full input history; no legacy Chat Completions conversion.
+- Codex-consumed SSE extraction for text, reasoning summaries, function calls, terminal/usage events, while unknown auxiliary events do not terminate the stream.
 - Ordered function calls/results and mixed text/image inputs without downloading or re-encoding image data.
 - Read-only use of the official Grok session credential, with in-memory zeroizing cache reload when the source changes.
 - Fixed official xAI origin through rustls, redirects disabled, and typed authentication, rate-limit, status, and stream failures.
@@ -266,7 +266,7 @@ src/config.rs                 versioned runtime configuration
 src/credential.rs             read-only Grok credential boundary
 src/catalog.rs                atomic metadata-only model catalog
 src/grok.rs                   origin-locked xAI transport
-src/protocol.rs               Responses normalization and SSE validation
+src/protocol.rs               Responses provider projection and SSE extraction
 src/server.rs                 capability-scoped loopback service
 src/lifecycle.rs              reversible install and rollback ownership
 src/picker.rs                 merged Native GPT/Grok catalog generation
