@@ -218,6 +218,7 @@ impl Stream for ValidatedTextEventStream {
                 }
                 Err(error) => {
                     self.finished = true;
+                    log_rejected_sse_event(&data, &error);
                     std::task::Poll::Ready(Some(Err(GrokError::Protocol(error))))
                 }
             },
@@ -235,6 +236,26 @@ impl Stream for ValidatedTextEventStream {
             std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
+}
+
+fn log_rejected_sse_event(data: &str, error: &ProtocolError) {
+    let value = serde_json::from_str::<Value>(data).ok();
+    let sse_event_type = value
+        .as_ref()
+        .and_then(|value| value.get("type"))
+        .and_then(Value::as_str);
+    let item_type = value
+        .as_ref()
+        .and_then(|value| value.get("item"))
+        .and_then(|item| item.get("type"))
+        .and_then(Value::as_str);
+    tracing::warn!(
+        route = "responses",
+        sse_event_type,
+        item_type,
+        protocol_error = %error,
+        "upstream SSE event rejected"
+    );
 }
 
 pub struct FetchModelsResult {

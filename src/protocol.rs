@@ -2266,6 +2266,8 @@ pub enum TextStreamState {
     ContentDone,
     OutputItemDone,
     Completed,
+    Failed,
+    Incomplete,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2377,6 +2379,25 @@ pub enum TextStreamEventKind {
         output_index: u64,
         encrypted_content: Option<String>,
     },
+    OpaqueItemAdded {
+        item_id: String,
+        output_index: u64,
+        item_type: String,
+    },
+    OpaqueItemDone {
+        item_id: String,
+        output_index: u64,
+        item_type: String,
+    },
+    ResponseFailed {
+        response_id: String,
+    },
+    ResponseIncomplete {
+        response_id: String,
+    },
+    Passthrough {
+        event_type: String,
+    },
     ResponseCompleted {
         response_id: String,
     },
@@ -2476,6 +2497,7 @@ pub struct TextStreamValidator {
     message_stage: Option<MessageItemStage>,
     reasoning_item: Option<ReasoningStreamItem>,
     function_items: Vec<FunctionStreamItem>,
+    opaque_items: Vec<OpaqueStreamItem>,
 }
 
 #[derive(Debug, Clone)]
@@ -2527,7 +2549,22 @@ struct FunctionStreamItem {
     call_id: String,
     name: String,
     arguments: String,
+    output_index: u64,
     stage: FunctionItemStage,
+}
+
+#[derive(Debug, Clone)]
+struct OpaqueStreamItem {
+    item_id: String,
+    item_type: String,
+    output_index: u64,
+    stage: OpaqueItemStage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpaqueItemStage {
+    Added,
+    Done,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2557,6 +2594,7 @@ impl TextStreamValidator {
             message_stage: None,
             reasoning_item: None,
             function_items: Vec::new(),
+            opaque_items: Vec::new(),
         }
     }
 
@@ -2568,8 +2606,15 @@ impl TextStreamValidator {
         self.state == TextStreamState::Completed
     }
 
+    fn is_terminal(&self) -> bool {
+        matches!(
+            self.state,
+            TextStreamState::Completed | TextStreamState::Failed | TextStreamState::Incomplete
+        )
+    }
+
     pub fn finish(&self) -> Result<(), ProtocolError> {
-        if self.is_completed() {
+        if self.is_terminal() {
             Ok(())
         } else {
             Err(ProtocolError::StreamNotCompleted)
@@ -2587,7 +2632,7 @@ impl TextStreamValidator {
         value: Value,
     ) -> Result<ValidatedTextStreamEvent, ProtocolError> {
         let object = value.as_object().ok_or(ProtocolError::InvalidSsePayload)?;
-        if self.state == TextStreamState::Completed {
+        if self.is_terminal() {
             return Err(ProtocolError::EventAfterCompletion);
         }
 
@@ -2630,7 +2675,14 @@ impl TextStreamValidator {
             "response.reasoning_text.done" => self.validate_reasoning_text_done(object)?,
             "response.output_item.done" => self.validate_output_item_done(object)?,
             "response.completed" => self.validate_completed(object)?,
-            _ => return Err(ProtocolError::UnsupportedSseEvent),
+            "response.failed" => self.validate_failed(object)?,
+            "response.incomplete" => self.validate_incomplete(object)?,
+            event_type => (
+                TextStreamEventKind::Passthrough {
+                    event_type: event_type.to_owned(),
+                },
+                self.state,
+            ),
         };
 
         self.last_sequence = Some(sequence_number);
@@ -2665,7 +2717,6 @@ impl TextStreamValidator {
         object: &Map<String, Value>,
     ) -> Result<(TextStreamEventKind, TextStreamState), ProtocolError> {
         self.require_state(&[TextStreamState::Created])?;
-        reject_sse_unknown_keys(object, &["type", "sequence_number", "response"])?;
         let response = event_object(object, "response")?;
         let response_id = event_nonempty_string(response, "id")?.to_owned();
         if self.response_id.as_deref() != Some(response_id.as_str()) {
@@ -2699,7 +2750,8 @@ impl TextStreamValidator {
                     TextStreamState::ReasoningDone,
                 ])?;
                 self.require_reasoning_ready_for_next_item()?;
-                let expected_index = u64::from(self.reasoning_item.is_some());
+                let expected_index =
+                    u64::from(self.reasoning_item.is_some()) + self.opaque_items.len() as u64;
                 if !self.function_items.is_empty() || output_index != expected_index {
                     return Err(ProtocolError::InvalidOutputIndexOrder);
                 }
@@ -2707,11 +2759,7 @@ impl TextStreamValidator {
                 if !text.is_empty() {
                     return Err(ProtocolError::InvalidSseField("item.content"));
                 }
-                if self
-                    .reasoning_item
-                    .as_ref()
-                    .is_some_and(|reasoning| reasoning.item_id == item_id)
-                {
+                if self.item_id_taken(&item_id) {
                     return Err(ProtocolError::DuplicateItemId);
                 }
                 self.item_id = Some(item_id.clone());
@@ -2727,7 +2775,7 @@ impl TextStreamValidator {
             }
             "function_call" => self.validate_function_item_added(item, output_index),
             "reasoning" => self.validate_reasoning_item_added(item, output_index),
-            _ => Err(ProtocolError::UnsupportedSseEvent),
+            item_type => self.validate_opaque_item_added(item, output_index, item_type),
         }
     }
 
@@ -2740,6 +2788,7 @@ impl TextStreamValidator {
         if self.reasoning_item.is_some()
             || self.item_id.is_some()
             || !self.function_items.is_empty()
+            || !self.opaque_items.is_empty()
             || output_index != 0
         {
             return Err(ProtocolError::InvalidOutputIndexOrder);
@@ -2786,10 +2835,7 @@ impl TextStreamValidator {
             return Err(ProtocolError::InvalidSseOrder);
         }
         self.require_reasoning_ready_for_next_item()?;
-        let expected_index = self.function_items.len() as u64
-            + u64::from(self.reasoning_item.is_some())
-            + u64::from(self.item_id.is_some());
-        if output_index != expected_index {
+        if output_index != self.next_output_index() {
             return Err(ProtocolError::InvalidOutputIndexOrder);
         }
         let parsed = validate_sse_function_call(item)?;
@@ -2801,12 +2847,7 @@ impl TextStreamValidator {
         }) {
             return Err(ProtocolError::DuplicateCallId);
         }
-        if self.item_id.as_deref() == Some(parsed.item_id.as_str())
-            || self
-                .reasoning_item
-                .as_ref()
-                .is_some_and(|reasoning| reasoning.item_id == parsed.item_id)
-        {
+        if self.item_id_taken(&parsed.item_id) {
             return Err(ProtocolError::DuplicateItemId);
         }
         self.function_items.push(FunctionStreamItem {
@@ -2814,6 +2855,7 @@ impl TextStreamValidator {
             call_id: parsed.call_id.clone(),
             name: parsed.name.clone(),
             arguments: String::new(),
+            output_index,
             stage: FunctionItemStage::Added,
         });
         Ok((
@@ -2981,17 +3023,6 @@ impl TextStreamValidator {
         &mut self,
         object: &Map<String, Value>,
     ) -> Result<(TextStreamEventKind, TextStreamState), ProtocolError> {
-        reject_sse_unknown_keys(
-            object,
-            &[
-                "type",
-                "sequence_number",
-                "item_id",
-                "output_index",
-                "summary_index",
-                "part",
-            ],
-        )?;
         let (item_id, output_index) = reasoning_event_coordinates(object)?;
         let summary_index = event_u64(object, "summary_index")?;
         let part = event_object(object, "part")?;
@@ -3029,17 +3060,6 @@ impl TextStreamValidator {
         &mut self,
         object: &Map<String, Value>,
     ) -> Result<(TextStreamEventKind, TextStreamState), ProtocolError> {
-        reject_sse_unknown_keys(
-            object,
-            &[
-                "type",
-                "sequence_number",
-                "item_id",
-                "output_index",
-                "summary_index",
-                "delta",
-            ],
-        )?;
         let (item_id, output_index) = reasoning_event_coordinates(object)?;
         let summary_index = event_u64(object, "summary_index")?;
         let delta = event_string(object, "delta")?.to_owned();
@@ -3075,17 +3095,6 @@ impl TextStreamValidator {
         &mut self,
         object: &Map<String, Value>,
     ) -> Result<(TextStreamEventKind, TextStreamState), ProtocolError> {
-        reject_sse_unknown_keys(
-            object,
-            &[
-                "type",
-                "sequence_number",
-                "item_id",
-                "output_index",
-                "summary_index",
-                "text",
-            ],
-        )?;
         let (item_id, output_index) = reasoning_event_coordinates(object)?;
         let summary_index = event_u64(object, "summary_index")?;
         let text = event_string(object, "text")?.to_owned();
@@ -3125,17 +3134,6 @@ impl TextStreamValidator {
         &mut self,
         object: &Map<String, Value>,
     ) -> Result<(TextStreamEventKind, TextStreamState), ProtocolError> {
-        reject_sse_unknown_keys(
-            object,
-            &[
-                "type",
-                "sequence_number",
-                "item_id",
-                "output_index",
-                "summary_index",
-                "part",
-            ],
-        )?;
         let (item_id, output_index) = reasoning_event_coordinates(object)?;
         let summary_index = event_u64(object, "summary_index")?;
         let part = event_object(object, "part")?;
@@ -3165,17 +3163,6 @@ impl TextStreamValidator {
         &mut self,
         object: &Map<String, Value>,
     ) -> Result<(TextStreamEventKind, TextStreamState), ProtocolError> {
-        reject_sse_unknown_keys(
-            object,
-            &[
-                "type",
-                "sequence_number",
-                "item_id",
-                "output_index",
-                "content_index",
-                "delta",
-            ],
-        )?;
         let (item_id, output_index) = reasoning_event_coordinates(object)?;
         let content_index = event_u64(object, "content_index")?;
         let delta = event_string(object, "delta")?.to_owned();
@@ -3209,17 +3196,6 @@ impl TextStreamValidator {
         &mut self,
         object: &Map<String, Value>,
     ) -> Result<(TextStreamEventKind, TextStreamState), ProtocolError> {
-        reject_sse_unknown_keys(
-            object,
-            &[
-                "type",
-                "sequence_number",
-                "item_id",
-                "output_index",
-                "content_index",
-                "text",
-            ],
-        )?;
         let (item_id, output_index) = reasoning_event_coordinates(object)?;
         let content_index = event_u64(object, "content_index")?;
         let text = event_string(object, "text")?.to_owned();
@@ -3278,7 +3254,7 @@ impl TextStreamValidator {
             }
             "function_call" => self.validate_function_item_done(item, output_index),
             "reasoning" => self.validate_reasoning_item_done(item, output_index),
-            _ => Err(ProtocolError::UnsupportedSseEvent),
+            item_type => self.validate_opaque_item_done(item, output_index, item_type),
         }
     }
 
@@ -3352,76 +3328,224 @@ impl TextStreamValidator {
         if self.response_id.as_deref() != Some(response_id.as_str()) {
             return Err(ProtocolError::ResponseIdMismatch);
         }
-        let output = event_array(response, "output")?;
-        let mut output_offset = 0usize;
-        if let Some(expected) = &self.reasoning_item {
-            if expected.explicitly_added && expected.stage != ReasoningItemStage::Done {
-                return Err(ProtocolError::InvalidSseOrder);
-            }
-            let item = output
-                .first()
-                .and_then(Value::as_object)
-                .ok_or(ProtocolError::InvalidSseField("response.output"))?;
-            let parsed = validate_sse_reasoning_item(item, ReasoningItemShape::Done)?;
-            require_matching_reasoning(expected, &parsed)?;
-            output_offset = 1;
-        }
-
-        if self.item_id.is_some() {
-            self.require_message_stage(&[MessageItemStage::Done])?;
-            let item = output
-                .get(output_offset)
-                .and_then(Value::as_object)
-                .ok_or(ProtocolError::InvalidSseField("response.output"))?;
-            let (item_id, text) = validate_sse_message(item, MessageShape::Done)?;
-            self.require_item_id(&item_id)?;
-            self.require_matching_text(&text)?;
-            output_offset += 1;
-        }
-
-        if !self.function_items.is_empty() {
-            if self
-                .function_items
-                .iter()
-                .any(|item| item.stage != FunctionItemStage::Done)
-            {
-                return Err(ProtocolError::InvalidSseOrder);
-            }
-            if output.len() != output_offset + self.function_items.len() {
-                return Err(ProtocolError::InvalidSseField("response.output"));
-            }
-            for (value, expected) in output[output_offset..].iter().zip(&self.function_items) {
-                let object = value
-                    .as_object()
-                    .ok_or(ProtocolError::InvalidSseField("response.output"))?;
-                let parsed = validate_sse_function_call(object)?;
-                validate_arguments_object(&parsed.arguments)?;
-                require_matching_function(expected, &parsed)?;
-            }
-        } else {
-            if output.len() != output_offset
-                || (self.reasoning_item.is_none() && self.item_id.is_none())
-            {
-                return Err(ProtocolError::InvalidSseField("response.output"));
-            }
-        }
+        self.validate_completed_output(event_array(response, "output")?)?;
         Ok((
             TextStreamEventKind::ResponseCompleted { response_id },
             TextStreamState::Completed,
         ))
     }
 
+    fn validate_failed(
+        &mut self,
+        object: &Map<String, Value>,
+    ) -> Result<(TextStreamEventKind, TextStreamState), ProtocolError> {
+        let response_id = self.admit_terminal_failure(object, "failed")?;
+        Ok((
+            TextStreamEventKind::ResponseFailed { response_id },
+            TextStreamState::Failed,
+        ))
+    }
+
+    fn validate_incomplete(
+        &mut self,
+        object: &Map<String, Value>,
+    ) -> Result<(TextStreamEventKind, TextStreamState), ProtocolError> {
+        let response_id = self.admit_terminal_failure(object, "incomplete")?;
+        Ok((
+            TextStreamEventKind::ResponseIncomplete { response_id },
+            TextStreamState::Incomplete,
+        ))
+    }
+
+    fn admit_terminal_failure(
+        &mut self,
+        object: &Map<String, Value>,
+        expected_status: &str,
+    ) -> Result<String, ProtocolError> {
+        let response = event_object(object, "response")?;
+        let response_id = event_nonempty_string(response, "id")?.to_owned();
+        if let Some(expected) = self.response_id.as_deref() {
+            if expected != response_id {
+                return Err(ProtocolError::ResponseIdMismatch);
+            }
+        } else {
+            self.response_id = Some(response_id.clone());
+        }
+        if let Some(status) = response.get("status") {
+            if status.as_str() != Some(expected_status) {
+                return Err(ProtocolError::InvalidSseField("response.status"));
+            }
+        }
+        Ok(response_id)
+    }
+
+    fn validate_opaque_item_added(
+        &mut self,
+        item: &Map<String, Value>,
+        output_index: u64,
+        item_type: &str,
+    ) -> Result<(TextStreamEventKind, TextStreamState), ProtocolError> {
+        if self.response_id.is_none() {
+            return Err(ProtocolError::InvalidSseOrder);
+        }
+        self.require_reasoning_ready_for_next_item()?;
+        if output_index != self.next_output_index() {
+            return Err(ProtocolError::InvalidOutputIndexOrder);
+        }
+        let item_id = event_nonempty_string(item, "id")?.to_owned();
+        if self.item_id_taken(&item_id) {
+            return Err(ProtocolError::DuplicateItemId);
+        }
+        let item_type = item_type.to_owned();
+        self.opaque_items.push(OpaqueStreamItem {
+            item_id: item_id.clone(),
+            item_type: item_type.clone(),
+            output_index,
+            stage: OpaqueItemStage::Added,
+        });
+        Ok((
+            TextStreamEventKind::OpaqueItemAdded {
+                item_id,
+                output_index,
+                item_type,
+            },
+            TextStreamState::OutputItemStarted,
+        ))
+    }
+
+    fn validate_opaque_item_done(
+        &mut self,
+        item: &Map<String, Value>,
+        output_index: u64,
+        item_type: &str,
+    ) -> Result<(TextStreamEventKind, TextStreamState), ProtocolError> {
+        let item_id = event_nonempty_string(item, "id")?.to_owned();
+        let opaque = self
+            .opaque_items
+            .iter_mut()
+            .find(|candidate| candidate.output_index == output_index)
+            .ok_or(ProtocolError::OutputIndexMismatch)?;
+        if opaque.stage != OpaqueItemStage::Added {
+            return Err(ProtocolError::InvalidSseOrder);
+        }
+        if opaque.item_id != item_id {
+            return Err(ProtocolError::ItemIdMismatch);
+        }
+        if opaque.item_type != item_type {
+            return Err(ProtocolError::UnsupportedSseEvent);
+        }
+        opaque.stage = OpaqueItemStage::Done;
+        Ok((
+            TextStreamEventKind::OpaqueItemDone {
+                item_id,
+                output_index,
+                item_type: item_type.to_owned(),
+            },
+            TextStreamState::OutputItemDone,
+        ))
+    }
+
+    fn validate_completed_output(&self, output: &[Value]) -> Result<(), ProtocolError> {
+        if let Some(reasoning) = &self.reasoning_item
+            && reasoning.explicitly_added
+            && reasoning.stage != ReasoningItemStage::Done
+        {
+            return Err(ProtocolError::InvalidSseOrder);
+        }
+        if self.item_id.is_some() {
+            self.require_message_stage(&[MessageItemStage::Done])?;
+        }
+        if self
+            .function_items
+            .iter()
+            .any(|item| item.stage != FunctionItemStage::Done)
+            || self
+                .opaque_items
+                .iter()
+                .any(|item| item.stage != OpaqueItemStage::Done)
+        {
+            return Err(ProtocolError::InvalidSseOrder);
+        }
+        let expected_len = self.next_output_index() as usize;
+        if expected_len == 0 || output.len() != expected_len {
+            return Err(ProtocolError::InvalidSseField("response.output"));
+        }
+
+        for (index, value) in output.iter().enumerate() {
+            let object = value
+                .as_object()
+                .ok_or(ProtocolError::InvalidSseField("response.output"))?;
+            let output_index = index as u64;
+            if let Some(expected) = self
+                .reasoning_item
+                .as_ref()
+                .filter(|reasoning| reasoning.output_index == output_index)
+            {
+                let parsed = validate_sse_reasoning_item(object, ReasoningItemShape::Done)?;
+                require_matching_reasoning(expected, &parsed)?;
+                continue;
+            }
+            if self.item_id.is_some() && self.output_index == Some(output_index) {
+                let (item_id, text) = validate_sse_message(object, MessageShape::Done)?;
+                self.require_item_id(&item_id)?;
+                self.require_matching_text(&text)?;
+                continue;
+            }
+            if let Some(expected) = self
+                .function_items
+                .iter()
+                .find(|item| item.output_index == output_index)
+            {
+                let parsed = validate_sse_function_call(object)?;
+                validate_arguments_object(&parsed.arguments)?;
+                require_matching_function(expected, &parsed)?;
+                continue;
+            }
+            if let Some(expected) = self
+                .opaque_items
+                .iter()
+                .find(|item| item.output_index == output_index)
+            {
+                if event_string(object, "type")? != expected.item_type {
+                    return Err(ProtocolError::UnsupportedSseEvent);
+                }
+                if event_nonempty_string(object, "id")? != expected.item_id {
+                    return Err(ProtocolError::ItemIdMismatch);
+                }
+                continue;
+            }
+            return Err(ProtocolError::InvalidSseField("response.output"));
+        }
+        Ok(())
+    }
+
+    fn next_output_index(&self) -> u64 {
+        u64::from(self.reasoning_item.is_some())
+            + u64::from(self.item_id.is_some())
+            + self.function_items.len() as u64
+            + self.opaque_items.len() as u64
+    }
+
+    fn item_id_taken(&self, item_id: &str) -> bool {
+        self.item_id.as_deref() == Some(item_id)
+            || self
+                .reasoning_item
+                .as_ref()
+                .is_some_and(|reasoning| reasoning.item_id == item_id)
+            || self
+                .function_items
+                .iter()
+                .any(|item| item.item_id == item_id)
+            || self.opaque_items.iter().any(|item| item.item_id == item_id)
+    }
+
     fn function_item_mut(
         &mut self,
         output_index: u64,
     ) -> Result<&mut FunctionStreamItem, ProtocolError> {
-        let prefix = u64::from(self.reasoning_item.is_some()) + u64::from(self.item_id.is_some());
-        let index = output_index
-            .checked_sub(prefix)
-            .and_then(|index| usize::try_from(index).ok())
-            .ok_or(ProtocolError::OutputIndexMismatch)?;
         self.function_items
-            .get_mut(index)
+            .iter_mut()
+            .find(|item| item.output_index == output_index)
             .ok_or(ProtocolError::OutputIndexMismatch)
     }
 
@@ -3439,6 +3563,7 @@ impl TextStreamValidator {
                 )
                 || self.item_id.is_some()
                 || !self.function_items.is_empty()
+                || !self.opaque_items.is_empty()
                 || output_index != 0
             {
                 return Err(ProtocolError::InvalidSseOrder);
@@ -3558,17 +3683,6 @@ fn validate_sse_reasoning_item(
     if event_string(item, "type")? != "reasoning" {
         return Err(ProtocolError::UnsupportedSseEvent);
     }
-    reject_sse_unknown_keys(
-        item,
-        &[
-            "type",
-            "id",
-            "summary",
-            "content",
-            "encrypted_content",
-            "status",
-        ],
-    )?;
     if let Some(status) = item.get("status") {
         let status = status
             .as_str()
@@ -3631,7 +3745,6 @@ fn validate_reasoning_text_part(
     part: &Map<String, Value>,
     expected_type: &'static str,
 ) -> Result<String, ProtocolError> {
-    reject_sse_unknown_keys(part, &["type", "text"])?;
     if event_string(part, "type")? != expected_type {
         return Err(ProtocolError::UnsupportedSseEvent);
     }
@@ -3723,13 +3836,6 @@ fn require_matching_reasoning(
     Ok(())
 }
 
-fn reject_sse_unknown_keys(
-    object: &Map<String, Value>,
-    allowed: &[&str],
-) -> Result<(), ProtocolError> {
-    reject_unknown_keys_for(object, allowed).map_err(|_| ProtocolError::UnsupportedSseEvent)
-}
-
 #[derive(Debug, Clone, Copy)]
 enum MessageShape {
     Added,
@@ -3748,14 +3854,6 @@ fn validate_sse_function_call(
     item: &Map<String, Value>,
 ) -> Result<ParsedSseFunctionCall, ProtocolError> {
     if event_string(item, "type")? != "function_call" {
-        return Err(ProtocolError::UnsupportedSseEvent);
-    }
-    if reject_unknown_keys_for(
-        item,
-        &["type", "id", "call_id", "name", "arguments", "status"],
-    )
-    .is_err()
-    {
         return Err(ProtocolError::UnsupportedSseEvent);
     }
     if let Some(status) = item.get("status")
@@ -5887,7 +5985,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_rejects_unknown_nontext_and_post_terminal_events() {
+    fn stream_forwards_unknown_events_and_rejects_post_terminal_events() {
         for event_type in [
             "response.custom_tool_call_input.delta",
             "response.reasoning_summary_text.unknown",
@@ -5900,10 +5998,14 @@ mod tests {
                 "sequence_number": 0,
                 "delta": "not inspected"
             });
+            let accepted = validator.accept_value(event.clone()).unwrap();
             assert_eq!(
-                validator.accept_value(event).unwrap_err(),
-                ProtocolError::UnsupportedSseEvent
+                accepted.kind(),
+                &TextStreamEventKind::Passthrough {
+                    event_type: event_type.to_owned()
+                }
             );
+            assert_eq!(accepted.original(), &event);
         }
 
         let mut validator = TextStreamValidator::new();
@@ -5916,5 +6018,176 @@ mod tests {
                 .unwrap_err(),
             ProtocolError::EventAfterCompletion
         );
+    }
+
+    #[test]
+    fn stream_forwards_failed_and_incomplete_as_terminal_events() {
+        let mut failed = TextStreamValidator::new();
+        failed.accept_value(text_events()[0].clone()).unwrap();
+        let failed_event = json!({
+            "type": "response.failed",
+            "sequence_number": 1,
+            "response": {
+                "id": "resp_1",
+                "status": "failed",
+                "error": {"code": "server_error", "message": "upstream stopped"}
+            }
+        });
+        let accepted = failed.accept_value(failed_event.clone()).unwrap();
+        assert_eq!(
+            accepted.kind(),
+            &TextStreamEventKind::ResponseFailed {
+                response_id: "resp_1".to_owned()
+            }
+        );
+        assert_eq!(accepted.original(), &failed_event);
+        assert!(failed.finish().is_ok());
+        assert_eq!(
+            failed.accept_value(text_events()[1].clone()).unwrap_err(),
+            ProtocolError::EventAfterCompletion
+        );
+
+        let mut incomplete = TextStreamValidator::new();
+        incomplete.accept_value(text_events()[0].clone()).unwrap();
+        let incomplete_event = json!({
+            "type": "response.incomplete",
+            "sequence_number": 1,
+            "response": {
+                "id": "resp_1",
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"}
+            }
+        });
+        assert_eq!(
+            incomplete.accept_value(incomplete_event).unwrap().kind(),
+            &TextStreamEventKind::ResponseIncomplete {
+                response_id: "resp_1".to_owned()
+            }
+        );
+        assert!(incomplete.finish().is_ok());
+    }
+
+    #[test]
+    fn stream_preserves_extra_official_metadata_and_hosted_search_items() {
+        let mut events = text_events();
+        for event in events.iter_mut().skip(1) {
+            let sequence = event["sequence_number"].as_u64().unwrap();
+            event["sequence_number"] = json!(sequence + 5);
+            if event["type"] == "response.output_item.added"
+                || event["type"] == "response.output_item.done"
+                || event["type"] == "response.content_part.added"
+                || event["type"] == "response.content_part.done"
+                || event["type"] == "response.output_text.delta"
+                || event["type"] == "response.output_text.done"
+            {
+                event["output_index"] = json!(1);
+            }
+        }
+
+        let search_added = json!({
+            "type": "web_search_call",
+            "id": "ws_1",
+            "status": "in_progress"
+        });
+        let search_done = json!({
+            "type": "web_search_call",
+            "id": "ws_1",
+            "status": "completed",
+            "action": {"type": "search", "query": "codex bridge"}
+        });
+        events.insert(
+            1,
+            json!({
+                "type": "response.in_progress",
+                "sequence_number": 1,
+                "log_id": "meta-only",
+                "response": {
+                    "id": "resp_1",
+                    "status": "in_progress",
+                    "output": []
+                }
+            }),
+        );
+        events.insert(
+            2,
+            json!({
+                "type": "response.output_item.added",
+                "sequence_number": 2,
+                "output_index": 0,
+                "item": search_added
+            }),
+        );
+        events.insert(
+            3,
+            json!({
+                "type": "response.web_search_call.searching",
+                "sequence_number": 3,
+                "item_id": "ws_1",
+                "output_index": 0
+            }),
+        );
+        events.insert(
+            4,
+            json!({
+                "type": "response.output_item.done",
+                "sequence_number": 4,
+                "output_index": 0,
+                "item": search_done.clone()
+            }),
+        );
+        events.insert(
+            5,
+            json!({
+                "type": "response.output_text.annotation.added",
+                "sequence_number": 5,
+                "item_id": "msg_1",
+                "annotation": {"type": "url_citation", "url": "https://example.invalid"}
+            }),
+        );
+        let completed = events.last_mut().unwrap();
+        completed["response"]["output"] = json!([
+            search_done,
+            {
+                "type": "message",
+                "id": "msg_1",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "Hello 世界", "annotations": []}]
+            }
+        ]);
+
+        let mut validator = TextStreamValidator::new();
+        for (index, original) in events.into_iter().enumerate() {
+            let event = validator.accept_value(original.clone()).unwrap();
+            assert_eq!(event.original(), &original);
+            match index {
+                1 => assert!(matches!(
+                    event.kind(),
+                    TextStreamEventKind::ResponseInProgress { .. }
+                )),
+                2 => assert_eq!(
+                    event.kind(),
+                    &TextStreamEventKind::OpaqueItemAdded {
+                        item_id: "ws_1".to_owned(),
+                        output_index: 0,
+                        item_type: "web_search_call".to_owned()
+                    }
+                ),
+                3 | 5 => assert!(matches!(
+                    event.kind(),
+                    TextStreamEventKind::Passthrough { .. }
+                )),
+                4 => assert_eq!(
+                    event.kind(),
+                    &TextStreamEventKind::OpaqueItemDone {
+                        item_id: "ws_1".to_owned(),
+                        output_index: 0,
+                        item_type: "web_search_call".to_owned()
+                    }
+                ),
+                _ => {}
+            }
+        }
+        assert!(validator.finish().is_ok());
     }
 }
