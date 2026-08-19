@@ -277,6 +277,15 @@ async fn route_responses(
     if !state.capability.matches(&capability) {
         return StatusCode::NOT_FOUND.into_response();
     }
+    if state.responses_disabled && state.native.is_none() {
+        return route_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "bridge_disabled",
+            "server_error",
+            "bridge_disabled",
+            "Grok Responses routing is disabled",
+        );
+    }
 
     route_authorized_responses(state, request, path).await
 }
@@ -597,7 +606,12 @@ fn native_request_body(
         return Ok(original);
     }
     let mut request: Value = serde_json::from_slice(decoded).map_err(|_| ())?;
-    if !remove_unreplayable_reasoning_for_native(&mut request) {
+    let removed_prompt_cache_retention = request
+        .as_object_mut()
+        .and_then(|request| request.remove("prompt_cache_retention"))
+        .is_some();
+    let removed_unreplayable_reasoning = remove_unreplayable_reasoning_for_native(&mut request);
+    if !removed_prompt_cache_retention && !removed_unreplayable_reasoning {
         return Ok(original);
     }
     let serialized = serde_json::to_vec(&request).map_err(|_| ())?;
@@ -1285,6 +1299,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_route_removes_unsupported_prompt_cache_retention() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (client, mock, task) = start_native_mock().await;
+        let route = NativeRouteState::new(
+            crate::native::NativeUpstream::ChatgptCodex,
+            ["gpt-native".to_owned()],
+        )
+        .unwrap();
+        let app = build_router_with_services(
+            runtime_config(temporary.path()),
+            ModelCatalog::bootstrap().unwrap(),
+            None,
+            Some(Arc::new(NativeService { route, client })),
+            true,
+        );
+        let mut request = request_body("gpt-native");
+        request["prompt_cache_retention"] = json!("24h");
+        let compressed = zstd::stream::encode_all(Cursor::new(request.to_string()), 3).unwrap();
+
+        let response = send_with_headers(
+            app,
+            TOKEN,
+            &[
+                ("content-encoding", "zstd"),
+                ("content-type", "application/json"),
+                ("authorization", "Bearer native-caller-secret"),
+            ],
+            compressed,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let observed = mock.observed.lock().unwrap();
+        let (headers, upstream_body) = &observed[0];
+        assert_eq!(headers[CONTENT_ENCODING], "zstd");
+        assert_eq!(headers["authorization"], "Bearer native-caller-secret");
+        let decoded = zstd::stream::decode_all(Cursor::new(upstream_body)).unwrap();
+        let upstream: Value = serde_json::from_slice(&decoded).unwrap();
+        assert_eq!(upstream.get("prompt_cache_retention"), None);
+        assert_eq!(
+            upstream["prompt_cache_key"],
+            "11111111-1111-4111-8111-111111111111"
+        );
+        drop(observed);
+        task.abort();
+    }
+
+    #[tokio::test]
     async fn health_models_and_wrong_capability_do_not_read_credentials_or_hit_upstream() {
         let temporary = tempfile::tempdir().unwrap();
         let (client, mock, task) = start_mock(MockReply::Valid).await;
@@ -1440,10 +1501,9 @@ mod tests {
             "33333333-3333-4333-8333-333333333333"
         );
         let mut expected_upstream = request_body("grok-4.6");
-        expected_upstream
-            .as_object_mut()
-            .unwrap()
-            .remove("client_metadata");
+        let expected_object = expected_upstream.as_object_mut().unwrap();
+        expected_object.remove("client_metadata");
+        expected_object.remove("tool_choice");
         assert_eq!(upstream_body, &expected_upstream);
         drop(observed);
         task.abort();
@@ -1778,13 +1838,13 @@ mod tests {
                 .all(|(_, body)| body.get("client_metadata").is_none())
         );
         let replay = observed[1].1["input"].as_array().unwrap();
-        assert_eq!(replay[1]["id"], "reasoning_1");
-        assert_eq!(replay[1]["encrypted_content"], "opaque-state");
+        assert_eq!(replay.len(), 4);
+        assert_eq!(replay[1]["type"], "message");
+        assert!(replay[1].get("id").is_none());
         assert!(replay[2].get("id").is_none());
+        assert_eq!(replay[2]["call_id"], "call_1");
         assert!(replay[3].get("id").is_none());
         assert_eq!(replay[3]["call_id"], "call_1");
-        assert!(replay[4].get("id").is_none());
-        assert_eq!(replay[4]["call_id"], "call_1");
         drop(observed);
         task.abort();
     }
