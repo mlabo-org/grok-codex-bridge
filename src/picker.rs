@@ -133,6 +133,10 @@ fn grok_picker_entry(id: &str, priority: i32) -> Value {
             {
                 "effort": "high",
                 "description": "Heavy reasoning"
+            },
+            {
+                "effort": "xhigh",
+                "description": "Maximum reasoning depth"
             }
         ],
         "shell_type": "default",
@@ -717,7 +721,8 @@ mod tests {
             json!([
                 {"effort": "low", "description": "Faster, lighter reasoning"},
                 {"effort": "medium", "description": "Balanced reasoning"},
-                {"effort": "high", "description": "Heavy reasoning"}
+                {"effort": "high", "description": "Heavy reasoning"},
+                {"effort": "xhigh", "description": "Maximum reasoning depth"}
             ])
         );
         assert_eq!(
