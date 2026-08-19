@@ -53,6 +53,8 @@ rollback commandを報告してください。
 
 この経路はrepoが所有するV1.1導入処理をすべて自動化します。有効化したcatalogとprovider stateをCodexへ読み込ませるため、完了後の新規Codex CLIプロセス起動またはDesktop完全再起動だけは必要です。
 
+初回installはCodexから実行できます。すでに稼働中のブリッジを、Grokを使っているCodexセッションから停止・差し替えしないでください。詳細は [既存インストールの更新](#既存インストールの更新) を参照してください。
+
 ## 謝辞
 
 本プロジェクトは、[duolahypercho/codex-router](https://github.com/duolahypercho/codex-router/tree/9995c77278608640759982c98ec5bdaeb371c174) から多くの重要な知見を得ています。その実装とドキュメントは実現可能性を確認するうえで大切な先行事例であり、公式Grok認証情報の鮮度、プロバイダー境界に閉じるメタデータ、xAI Responses/SSEイベント体系、ネイティブモデルピッカー統合、可逆な有効化方式の設計判断に大きく役立ちました。MIT Licenseでこの成果を公開された作者とコントリビューターの皆様に、心より敬意と感謝を表します。
@@ -177,6 +179,12 @@ codex resume <SESSION_ID> -m <NATIVE_GPT_MODEL>
 ```
 
 ## ライフサイクルとrollback
+
+### 既存インストールの更新
+
+このブリッジを使っているCodexセッションは、ローカルのループバックサービスに依存します。対象は分離型 `grok-bridge` プロファイルと、V1.1ピッカーでGrokモデルを選んでいる場合です。そのセッションの中からサービスを停止したり、導入済みバイナリを差し替えたりすると、モデル通信が切れます。再ロードまで完了しないと service は `not_loaded` のまま残り、サービスを起動し直すまでCodexからGrokへ届きません。
+
+`./scripts/materialize-macos.sh`、導入済みバイナリの更新、`service install` は、このブリッジを使っていないセッションから実行してください。この手順の想定オペレーターはGrok Buildです。Native GPTモデルのCodexセッションでも同様に生存します。`service status` が `service loaded` を返したら、新しいCodex CLIプロセスを起動するか、Desktopを完全再起動してクライアントをつなぎ直してください。
 
 以下のコマンドはすべて生成済み実行ファイルを直接使います。
 
