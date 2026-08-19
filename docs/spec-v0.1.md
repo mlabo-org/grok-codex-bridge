@@ -95,8 +95,8 @@ V1.0安定後の別slice。GPTとGrokをCodex CLIのmodel pickerとCodex Desktop
                    │
 ┌──────────────────▼──────────────────────────┐
 │ grok-codex-bridge                           │
-│ Responses parser / normalized conversation │
-│ Tool schema translator / stream state      │
+│ Responses provider projection              │
+│ Tool namespace projection / SSE extraction  │
 │ OAuth credential reader / xAI client       │
 └──────────────────┬──────────────────────────┘
                    │ Responses API
@@ -178,27 +178,29 @@ refreshはResponses backend、non-empty model ID、xAI allowlisted inference ori
 
 ## 17. Codex Responses API
 
-Principal endpointは`POST /v1/responses`。処理は`Codex Responses request → strict typed validation / internal normalized representation → xAI Responses request`とする。current両端がResponses contractを使用するため、legacy Chat Completionsへの変換は行わない。
+Principal endpointは`POST /v1/responses`。処理は`Codex Responses request → bridge-owned provider projection → xAI Responses request`とする。current両端がResponses contractを使用するため、legacy Chat Completionsへの変換は行わない。ここでの境界はcodex-routerで観測できるCodex実装の許容的なtransport挙動と、実装時点の公式Grok client contractに合わせる。codex-routerは参考実装であり、protocol authorityではない。
 
-## 18. Internal Normalized Representation
+Grok leafは`store: false`で全履歴をrequestに含め、providerが必要とするフィールドだけを変換する。bridgeはCodexのsession/replay stateを完全に再構成しない。`previous_response_id`、prompt-cache state、reasoning provenance semantics、Codexの全transport lifecycleはCodexが所有する。混在providerの既存session continuityもCodexの責務であり、bridgeはlegacy cross-provider transport stateの再生を保証しない。
 
-Codex schemaとxAI schemaを無検証で透過させず、instructions、messages、tools、tool choice、model、content parts、tool calls、tool resultsを表す内部型を置く。TextとImageを区別し、assistantの複数tool callとtool resultの`call_id`を保持する。内部型はlossless validation/canonicalizationを所有し、別protocolを合成しない。
+## 18. Provider Projection
+
+内部表現はprovider projectionに必要な範囲だけを扱う。validなuser/assistant text、validなfunction call/output history、images、必要なtool namespace projectionを保持する。Codexのprovider-unreplayableなlocal/foreign transport artifactは狭く除外し、malformedまたはfailedなlocal tool historyが後続turn全体を汚染しないようにする。bridgeはCodex session/replayの完全なvalidatorやrepairerではなく、別protocolを合成しない。
 
 ## 19. Instructions
 
-Responsesの`instructions`は同じResponses fieldとして損失なく維持する。Codexから来たinstructionsを要約、再生成、書換えしない。
+Responsesの`instructions`は同じResponses fieldとして維持する。Codexから来たinstructionsを要約、再生成、書換えしない。
 
 ## 20. Text Message
 
-Responses input messageのrole、content order、`input_text`を対応するResponses itemとして損失なく維持する。Codex assistant履歴の`phase`は`commentary`または`final_answer`として検証し、phaseを持たないxAI easy message境界で終端する。未対応content typeをsilent dropしない。
+Responses input messageのrole、content order、`input_text`を対応するResponses itemとして維持する。validなuser/assistant textは保持し、provider-unreplayableなforeign/local transport artifactだけを狭く除外する。未対応または壊れた履歴がある場合も、後続のvalidなturnを一律に拒否するのではなく、そのartifactを除外して進められる形にする。
 
 ## 21. Images
 
-`input_image`、image URL、`data:image/...;base64,...`、tool result imageを扱う。可能な限りdecode/re-encodeせず転送する。V1で対応不能なimage形式は黙って削除せず明示unsupported errorを返す。
+`input_image`、image URL、`data:image/...;base64,...`、tool result imageを扱う。可能な限りdecode/re-encodeせず転送する。providerが再生できないlocal/foreign artifactだけを狭く除外し、validな画像を失わない。
 
 ## 22. Tool Definition
 
-Codexから渡されたfunction toolのname、description、parameters schemaを内部型では損失なく維持する。Grok providerへの投影だけは、xAIがrequest全体を拒否するroot unionまたはnullable object schemaをplain object rootへ限定的に展開し、宣言型と矛盾する`enum`/`const` literalを除去する。これはCodex app toolの実行時argument validationを置換せず、Native GPT経路のschemaは書換えない。name変更、description要約を行わない。
+Codexから渡されたfunction toolのname、description、parameters schemaを必要な範囲で保持する。Grok providerへの投影だけは、xAIがrequest全体を拒否するroot unionまたはnullable object schemaをplain object rootへ限定的に展開し、宣言型と矛盾する`enum`/`const` literalを除去する。これはCodex app toolの実行時argument validationを置換せず、Native GPT経路のschemaは書換えない。必要なtool namespace projection以外の意味を変更しない。
 
 ## 23. Tool Choice
 
@@ -206,15 +208,15 @@ Codexから渡されたfunction toolのname、description、parameters schemaを
 
 ## 24. Tool Calls
 
-Grokが返すResponses function call itemのtool name、tool call ID、arguments JSONを検証してそのまま維持する。`call_id`は次turnのtool result対応に必要なため失わない。
+Grokが返すResponses function call itemのtool name、tool call ID、arguments JSONをCodexが消費する形へ正規化する。`call_id`は次turnのtool result対応に必要なため保持する。
 
-Native GPTで完了済みの`custom_tool_call`と`custom_tool_call_output`はCodex harnessが所有するforeign実行履歴としてschemaを検証し、Grok requestから除外する。これらをGrok function call stateへ混入させず、同じturnのassistant message textは会話履歴として維持する。
+Native GPTで完了済みの`custom_tool_call`と`custom_tool_call_output`はCodex harnessが所有するforeign実行履歴として扱い、Grok requestから狭く除外する。これらをGrok function call stateへ混入させず、同じturnのvalidなassistant message textは会話履歴として維持する。
 
-Codex CLIの`agent_message`はauthor、recipient、contentをschema検証する。contentがすべて`input_text`なら順序を維持したassistant easy messageとしてGrokへ投影する。1つでもprovider-boundな`encrypted_content`を含む場合はitem全体を不可分なforeign履歴としてGrok requestから除外し、復号、要約、部分的なprefix転送を行わない。
+Codex CLIの`agent_message`は、validなtextを順序を維持したassistant easy messageとしてGrokへ投影する。provider-boundな`encrypted_content`などprovider-unreplayableなforeign履歴はitem単位でGrok requestから除外し、復号、要約、部分的なprefix転送を行わない。
 
 ## 25. Tool Result
 
-Responsesの`function_call_output`を、同一`call_id`を持つxAI Responses input itemとして維持する。textとimage resultを保持する。
+Responsesのvalidな`function_call_output`を、同一`call_id`を持つxAI Responses input itemとして維持する。textとimage resultを保持する。malformedまたはfailedなlocal tool artifactは、そのitemを除外して後続turnを継続可能にする。
 
 ## 26. Parallel Tool Calls
 
@@ -222,7 +224,7 @@ Responsesの`function_call_output`を、同一`call_id`を持つxAI Responses in
 
 ## 27. Streaming
 
-Codex側へResponses-compatible SSEを返す。upstream eventをstrictにparseし、最低限、次のlifecycle/event familyを正しい順序とschemaで維持する。
+Codex側へResponses-compatible SSEを返す。upstream SSEは、Codexが消費するtext、reasoning-summary、function-call、terminal/usage eventだけを抽出・正規化する。unknownな補助eventはstreamを終了させず、full event lifecycleのlossless validationや再構成は行わない。次のevent familyはCodex向けに投影できる対象であり、upstream lifecycle全体の保証ではない。
 
 - `response.created`
 - `response.output_item.added`
@@ -235,17 +237,17 @@ Codex側へResponses-compatible SSEを返す。upstream eventをstrictにparse�
 - `response.output_item.done`
 - `response.completed`
 
-## 28. Stream State Machine
+## 28. Stream Boundary
 
-SSE translationを場当たり的な条件分岐にしない。Created、OutputItemStarted、ContentStarted、Streaming、ContentDone、OutputItemDone、Completedを明示状態として持つ。tool callは独立output itemとして管理する。
+SSE translationはCodexが消費する意味単位を壊さないようにする。text、reasoning-summary、function call、terminal/usageの各projectionを管理し、unknownな補助eventをCodexのstream失敗へ変換しない。tool callは独立output itemとして投影するが、upstreamの全lifecycle/index/sequenceをbridgeが保証するとは限らない。
 
 ## 29. Stable IDs
 
-Bridge生成IDは`resp_<uuid>`、`msg_<uuid>`、`fc_<uuid>`等とし、同じresponse/stream内で安定させる。`sequence_number`は単調増加させる。
+Codexが必要とする場合、Bridge生成IDは`resp_<uuid>`、`msg_<uuid>`、`fc_<uuid>`等としてresponse/stream内で安定させる。upstreamの全event indexやsequenceをlosslessに再現する契約ではない。
 
 ## 30. Reasoning
 
-V1はhidden chain-of-thoughtを生成、推測、偽造しない。Grokが返したopaqueな暗号状態はbridge provenance envelopeで包み、Grokへ戻すときだけ復元する。Native GPTへはreasoning itemごと渡さない。公開可能なreasoning summaryだけをCodex表示へ維持する。
+V1はhidden chain-of-thoughtを生成、推測、偽造しない。Grokが返した公開可能なreasoning summaryだけをCodex表示へ投影する。reasoning provenance semanticsやprompt-cache stateをbridgeが完全に再構成することは保証しない。`store: false`で再利用不能なGrok由来reasoning itemをNative GPT requestへ持ち込まない判断は、Codex-owned mixed-provider continuityの一部として扱う。
 
 ## 31. Hosted Search
 
@@ -337,7 +339,7 @@ Defaultはnetwork quotaを消費せず、binary、bind、caller capability、cre
 
 ## 53. Error Mapping
 
-401/403、429、5xx、translation failureを区別する。認証failureは公式login経路、rate limitはsubscription limit、5xxはtemporary unavailableとして返す。未対応Responses item typeはtypeを示す明示errorとし、silent dropしない。
+401/403、429、5xx、translation failureを区別する。認証failureは公式login経路、rate limitはsubscription limit、5xxはtemporary unavailableとして返す。provider必須項目を投影できない場合はtypeを示す明示errorにする。一方、provider-unreplayableなlocal/foreign transport artifactやmalformed/failed local tool historyは狭く除外し、後続turn全体を拒否しない。
 
 ## 54. Timeout
 
@@ -387,7 +389,7 @@ GUI、menu bar app、automatic updater、provider plugins、cloud sync、remote/
 
 1. OpenAI Codex official repository/documentation: Responses contract、custom provider、model catalog、config semantics、tool loop。
 2. xAI Grok Build official source: auth handling、Responses schema、model catalog、tool calls、images、stream parser、CLI proxy contract。
-3. `codex-router`: Grok OAuth route、Responses compatibility、config backup、caller auth、coexistence、rollbackのreference。architectureを移植しない。
+3. `codex-router`: Grok OAuth route、Responses compatibility、config backup、caller auth、coexistence、rollbackにおける観測可能なreference behavior。tolerant transport boundaryの参考にはするが、protocol authorityやarchitectureの移植元にはしない。
 
 ## 66. Licensing
 
@@ -399,7 +401,7 @@ Reference implementationのcodeをcopy/modifyする前にlicenseとnoticeを確�
 
 - Phase A: Rust project skeleton、HTTP server、healthz、config、logging。
 - Phase B: credential parser、xAI client、official model catalog refresh、simple request、xAI SSE parser。
-- Phase C: Responses input parser、lossless text normalization、Responses SSE validation。
+- Phase C: Responses input projection、valid text/history normalization、Codex-consumed SSE extraction。
 - Phase D: function tools、tool calls、tool results、parallel calls。
 - Phase E: image input/result、Computer Use-compatible image preservation。
 - Phase F: Safe Provider installer、doctor、uninstall、launchd。
