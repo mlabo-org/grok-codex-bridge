@@ -887,6 +887,7 @@ mod tests {
     use tokio::task::JoinHandle;
     use tower::ServiceExt;
     use url::Url;
+    use uuid::Uuid;
 
     use super::*;
 
@@ -1459,6 +1460,9 @@ mod tests {
             CredentialStore::new(write_auth(temporary.path())).unwrap(),
             client,
         );
+        let mut request = request_body("grok-4.6");
+        request["prompt_cache_retention"] = json!("24h");
+        request["previous_response_id"] = json!("resp_previous");
 
         let response = send_with_headers(
             app,
@@ -1467,7 +1471,7 @@ mod tests {
                 ("authorization", "Bearer native-caller-secret"),
                 ("chatgpt-account-id", "native-account"),
             ],
-            request_body("grok-4.6").to_string(),
+            request.to_string(),
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -1500,11 +1504,42 @@ mod tests {
             headers["x-grok-agent-id"],
             "33333333-3333-4333-8333-333333333333"
         );
-        let mut expected_upstream = request_body("grok-4.6");
+        let mut expected_upstream = request;
         let expected_object = expected_upstream.as_object_mut().unwrap();
         expected_object.remove("client_metadata");
         expected_object.remove("tool_choice");
+        expected_object.remove("prompt_cache_retention");
+        expected_object.remove("previous_response_id");
         assert_eq!(upstream_body, &expected_upstream);
+        drop(observed);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn missing_codex_routing_metadata_uses_a_stable_history_anchor() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (client, mock, task) = start_mock(MockReply::Valid).await;
+        let app = test_app(
+            runtime_config(temporary.path()),
+            ModelCatalog::bootstrap().unwrap(),
+            CredentialStore::new(write_auth(temporary.path())).unwrap(),
+            client,
+        );
+
+        let mut request = request_body("grok-4.6");
+        request.as_object_mut().unwrap().remove("prompt_cache_key");
+        request.as_object_mut().unwrap().remove("client_metadata");
+        let response = send(app, TOKEN, request.to_string()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+
+        let observed = mock.observed.lock().unwrap();
+        assert_eq!(observed.len(), 1);
+        let headers = &observed[0].0;
+        assert_eq!(headers["x-grok-conv-id"], headers["x-grok-session-id"]);
+        assert_eq!(headers["x-grok-turn-idx"], "1");
+        assert!(Uuid::parse_str(headers["x-grok-conv-id"].to_str().unwrap()).is_ok());
+        assert!(observed[0].1.get("client_metadata").is_none());
         drop(observed);
         task.abort();
     }
@@ -1850,7 +1885,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_or_malformed_codex_routing_ids_stop_before_credentials_or_upstream() {
+    async fn malformed_codex_routing_ids_stop_before_credentials_or_upstream() {
         let temporary = tempfile::tempdir().unwrap();
         let (client, mock, task) = start_mock(MockReply::Valid).await;
         let app = test_app(
@@ -1860,9 +1895,9 @@ mod tests {
             client,
         );
 
-        let mut missing = request_body("grok-4.6");
-        missing.as_object_mut().unwrap().remove("prompt_cache_key");
-        let response = send(app.clone(), TOKEN, missing.to_string()).await;
+        let mut malformed_prompt = request_body("grok-4.6");
+        malformed_prompt["prompt_cache_key"] = json!("not-a-uuid");
+        let response = send(app.clone(), TOKEN, malformed_prompt.to_string()).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         let mut mismatched = request_body("grok-4.6");
