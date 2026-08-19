@@ -6,7 +6,7 @@ Status: `ACTIVE_PRODUCT_SPEC`
 
 外部製品のendpoint、schema、設定field、credential形式、ライセンスなど時間変化し得る事実は、この文書だけを根拠に実装しない。第70節の確認順序に従い、実装時点のauthoritative sourceで確認する。
 
-現在のCAO taskが宣言する開発sliceは、V1.0 Safe Provider Mode（Phase A〜G）だけである。V1.1 Native Picker Mode（Phase H〜J）はこのsliceに含めない。
+V1.0 Safe Provider Mode（Phase A〜G）は実装済みの保守的な公開経路である。V1.1 Native Picker Mode（Phase H〜J）は実験的経路として実装済みだが、Desktop pickerと最終rollback受け入れは未完了である。
 
 ## 0. 目的
 
