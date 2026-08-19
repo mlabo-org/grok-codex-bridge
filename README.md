@@ -165,7 +165,7 @@ CODEX_DIR="${CODEX_HOME:-"$HOME/.codex"}"
 
 Start a fresh Codex CLI process after activation. Fully quit and relaunch Codex Desktop before testing the Desktop picker.
 
-The merged Grok 4.5 and 4.6 entries expose a 272,000-token context window. Codex therefore applies the same native 2% skill-description budget calculation instead of falling back to the small unknown-window budget.
+Admitted Grok catalog entries, including the bootstrap `grok-4.5` and `grok-4.6` models, expose a 272,000-token context window. Codex therefore applies the same native 2% skill-description budget calculation instead of falling back to the small unknown-window budget.
 
 ### Current resume limitation
 
@@ -187,7 +187,16 @@ codex resume <SESSION_ID> -m <NATIVE_GPT_MODEL>
 
 A Codex session that uses this bridge depends on the local loopback service. That includes the isolated `grok-bridge` profile and the V1.1 picker when a Grok model is selected. Stopping the service or replacing the installed binary from inside that session cuts the model connection. If the reload does not finish, the service stays `not_loaded` and Codex cannot reach Grok until the service is started again.
 
-Perform materialization, installed-binary update, and `service install` from a session that does not use this bridge. Use Grok Build for that step, or a Codex session on a Native GPT model. After `service status` reports `service loaded`, start a fresh Codex CLI process or fully relaunch Desktop so the client reconnects.
+Perform materialization and installed-binary replacement from a session that does not use this bridge. Use Grok Build for that step, or a Codex session on a Native GPT model.
+
+After materializing a new executable, replace the loaded install with the repository-owned replacement script. It stops the service, swaps the installed binary, restarts the service, and runs `doctor`:
+
+```sh
+./scripts/materialize-macos.sh
+./scripts/replace-installed-bridge.sh ./dist/aarch64-apple-darwin/grok-codex-bridge
+```
+
+After `service status` reports `service loaded`, start a fresh Codex CLI process or fully relaunch Desktop so the client reconnects.
 
 All repository commands below use the materialized executable directly:
 
@@ -261,18 +270,21 @@ The product scope and acceptance contracts are defined in [docs/spec-v0.1.md](do
 ## Source layout
 
 ```text
-src/cli.rs                    CLI boundary
-src/config.rs                 versioned runtime configuration
-src/credential.rs             read-only Grok credential boundary
-src/catalog.rs                atomic metadata-only model catalog
-src/grok.rs                   origin-locked xAI transport
-src/protocol.rs               Responses provider projection and SSE extraction
-src/server.rs                 capability-scoped loopback service
-src/lifecycle.rs              reversible install and rollback ownership
-src/picker.rs                 merged Native GPT/Grok catalog generation
-src/picker_activation.rs      atomic picker publication and activation
-src/launchd.rs                typed user LaunchAgent boundary
-scripts/materialize-macos.sh  deterministic macOS arm64 materialization
+src/cli.rs                           CLI boundary
+src/config.rs                        versioned runtime configuration
+src/credential.rs                    read-only Grok credential boundary
+src/catalog.rs                       atomic metadata-only model catalog
+src/native.rs                        captured first-party Native GPT upstream route
+src/grok.rs                          origin-locked xAI transport
+src/protocol.rs                      Responses provider projection and SSE extraction
+src/server.rs                        capability-scoped loopback service
+src/lifecycle.rs                     reversible install and rollback ownership
+src/picker.rs                        merged Native GPT/Grok catalog generation
+src/picker_activation.rs             atomic picker publication and activation
+src/launchd.rs                       typed user LaunchAgent boundary
+scripts/materialize-macos.sh         deterministic macOS arm64 materialization
+scripts/grok-codex.sh                V1.0 isolated profile launcher
+scripts/replace-installed-bridge.sh  loaded-install binary replacement
 ```
 
 ## License

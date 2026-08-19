@@ -162,7 +162,7 @@ CODEX_DIR="${CODEX_HOME:-"$HOME/.codex"}"
 
 有効化後は新しいCodex CLIプロセスを起動します。Codex Desktopで試す場合は、完全終了してから再起動してください。
 
-統合されたGrok 4.5/4.6エントリは272,000トークンのコンテキストウィンドウを公開します。これによりCodexは、不明なwindow向けの小さなfallbackではなく、Nativeモデルと同じ標準2%のSkills説明予算計算を適用します。
+許可済みGrokカタログエントリ（bootstrapの `grok-4.5` / `grok-4.6` を含む）は272,000トークンのコンテキストウィンドウを公開します。これによりCodexは、不明なwindow向けの小さなfallbackではなく、Nativeモデルと同じ標準2%のSkills説明予算計算を適用します。
 
 ### 現在確認されているresume制限
 
@@ -184,7 +184,16 @@ codex resume <SESSION_ID> -m <NATIVE_GPT_MODEL>
 
 このブリッジを使っているCodexセッションは、ローカルのループバックサービスに依存します。対象は分離型 `grok-bridge` プロファイルと、V1.1ピッカーでGrokモデルを選んでいる場合です。そのセッションの中からサービスを停止したり、導入済みバイナリを差し替えたりすると、モデル通信が切れます。再ロードまで完了しないと service は `not_loaded` のまま残り、サービスを起動し直すまでCodexからGrokへ届きません。
 
-`./scripts/materialize-macos.sh`、導入済みバイナリの更新、`service install` は、このブリッジを使っていないセッションから実行してください。この手順の想定オペレーターはGrok Buildです。Native GPTモデルのCodexセッションでも同様に生存します。`service status` が `service loaded` を返したら、新しいCodex CLIプロセスを起動するか、Desktopを完全再起動してクライアントをつなぎ直してください。
+生成と導入済みバイナリの差し替えは、このブリッジを使っていないセッションから実行してください。この手順の想定オペレーターはGrok Buildです。Native GPTモデルのCodexセッションからでも実行できます。
+
+新しい実行ファイルを生成したあとは、repo所有の差し替えスクリプトで導入済みbinaryを置換してください。このスクリプトはサービスを停止し、導入済みbinaryを入れ替え、サービスを再起動して `doctor` を実行します。
+
+```sh
+./scripts/materialize-macos.sh
+./scripts/replace-installed-bridge.sh ./dist/aarch64-apple-darwin/grok-codex-bridge
+```
+
+`service status` が `service loaded` を返したら、新しいCodex CLIプロセスを起動するか、Desktopを完全再起動してクライアントをつなぎ直してください。
 
 以下のコマンドはすべて生成済み実行ファイルを直接使います。
 
@@ -258,18 +267,21 @@ cargo run -- --version
 ## ソース構成
 
 ```text
-src/cli.rs                    CLI境界
-src/config.rs                 version付きruntime設定
-src/credential.rs             読み取り専用Grok認証境界
-src/catalog.rs                atomicなmetadata-onlyモデルカタログ
-src/grok.rs                   xAI接続先を固定したtransport
-src/protocol.rs               Responses provider projectionとSSE抽出
-src/server.rs                 capability保護されたloopback service
-src/lifecycle.rs              可逆なinstallとrollbackの所有者
-src/picker.rs                 Native GPT/Grok統合catalog生成
-src/picker_activation.rs      pickerのatomicな公開と有効化
-src/launchd.rs                型付きuser LaunchAgent境界
-scripts/materialize-macos.sh  決定的macOS arm64 materialization
+src/cli.rs                           CLI境界
+src/config.rs                        version付きruntime設定
+src/credential.rs                    読み取り専用Grok認証境界
+src/catalog.rs                       atomicなmetadata-onlyモデルカタログ
+src/native.rs                        取得済みfirst-party Native GPT上流route
+src/grok.rs                          xAI接続先を固定したtransport
+src/protocol.rs                      Responses provider projectionとSSE抽出
+src/server.rs                        capability保護されたloopback service
+src/lifecycle.rs                     可逆なinstallとrollbackの所有者
+src/picker.rs                        Native GPT/Grok統合catalog生成
+src/picker_activation.rs             pickerのatomicな公開と有効化
+src/launchd.rs                       型付きuser LaunchAgent境界
+scripts/materialize-macos.sh         決定的macOS arm64 materialization
+scripts/grok-codex.sh                V1.0分離プロファイルランチャー
+scripts/replace-installed-bridge.sh  導入済みbinaryの差し替え
 ```
 
 ## ライセンス
