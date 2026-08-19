@@ -675,7 +675,19 @@ impl InputItem {
                 Ok(Self::FunctionCallOutput(FunctionCallOutput::parse(object)?))
             }
             "tool_search_call" => {
-                reject_unknown_keys(object, &["type", "call_id", "execution", "arguments"])?;
+                reject_unknown_keys(
+                    object,
+                    &[
+                        "type",
+                        "id",
+                        "call_id",
+                        "execution",
+                        "arguments",
+                        INTERNAL_MESSAGE_METADATA_FIELD,
+                    ],
+                )?;
+                optional_nonempty_string(object, "id")?;
+                validate_internal_message_metadata(object)?;
                 if required_string(object, "execution")? != "client" {
                     return Err(ProtocolError::InvalidRequestField("execution"));
                 }
@@ -4169,7 +4181,11 @@ mod tests {
             "parameters": {"type": "object", "properties": {}}
         }]);
         request["input"] = json!([
-            {"type": "tool_search_call", "call_id": "search-1", "execution": "client", "arguments": {"query": "calendar"}},
+            {
+                "type": "tool_search_call", "id": "ts_1", "call_id": "search-1",
+                "execution": "client", "arguments": {"query": "calendar"},
+                "internal_chat_message_metadata_passthrough": {"turn_id": "turn-1"}
+            },
             {"type": "tool_search_output", "call_id": "search-1", "status": "completed", "execution": "client", "tools": [{
                 "type": "namespace", "name": "mcp__calendar", "description": "Calendar tools.", "tools": [{
                     "type": "function", "name": "create", "description": "Create event.",
@@ -4186,6 +4202,12 @@ mod tests {
         assert_eq!(upstream["tools"][1]["name"], "mcp__calendar__create");
         assert_eq!(upstream["input"][2]["name"], "mcp__calendar__create");
         assert_eq!(upstream["input"][0]["name"], "tool_search");
+        assert!(upstream["input"][0].get("id").is_none());
+        assert!(
+            upstream["input"][0]
+                .get(INTERNAL_MESSAGE_METADATA_FIELD)
+                .is_none()
+        );
     }
 
     #[test]

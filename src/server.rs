@@ -610,8 +610,15 @@ fn native_request_body(
         .as_object_mut()
         .and_then(|request| request.remove("prompt_cache_retention"))
         .is_some();
+    let removed_previous_response_id = request
+        .as_object_mut()
+        .and_then(|request| request.remove("previous_response_id"))
+        .is_some();
     let removed_unreplayable_reasoning = remove_unreplayable_reasoning_for_native(&mut request);
-    if !removed_prompt_cache_retention && !removed_unreplayable_reasoning {
+    if !removed_prompt_cache_retention
+        && !removed_previous_response_id
+        && !removed_unreplayable_reasoning
+    {
         return Ok(original);
     }
     let serialized = serde_json::to_vec(&request).map_err(|_| ())?;
@@ -1300,7 +1307,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_route_removes_unsupported_prompt_cache_retention() {
+    async fn native_route_removes_stateless_transport_fields() {
         let temporary = tempfile::tempdir().unwrap();
         let (client, mock, task) = start_native_mock().await;
         let route = NativeRouteState::new(
@@ -1317,6 +1324,7 @@ mod tests {
         );
         let mut request = request_body("gpt-native");
         request["prompt_cache_retention"] = json!("24h");
+        request["previous_response_id"] = json!("resp_grok_store_false");
         let compressed = zstd::stream::encode_all(Cursor::new(request.to_string()), 3).unwrap();
 
         let response = send_with_headers(
@@ -1338,6 +1346,7 @@ mod tests {
         let decoded = zstd::stream::decode_all(Cursor::new(upstream_body)).unwrap();
         let upstream: Value = serde_json::from_slice(&decoded).unwrap();
         assert_eq!(upstream.get("prompt_cache_retention"), None);
+        assert_eq!(upstream.get("previous_response_id"), None);
         assert_eq!(
             upstream["prompt_cache_key"],
             "11111111-1111-4111-8111-111111111111"
