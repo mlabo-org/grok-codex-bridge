@@ -19,7 +19,7 @@ use grok_codex_bridge::lifecycle::{
 use grok_codex_bridge::picker_activation::{PickerActivationRequest, activate_picker};
 use grok_codex_bridge::{
     CatalogCache, CatalogCommand, CatalogSnapshot, Cli, Command, CredentialStore, GrokClient,
-    GrokConfig, ModelCatalog, NativeUpstream, RuntimeConfig, serve,
+    GrokConfig, ModelCatalog, NativeUpstream, RuntimeConfig, bind,
 };
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::filter::Targets;
@@ -420,7 +420,28 @@ async fn run(path: &std::path::Path) -> Result<(), RunError> {
     let config = RuntimeConfig::load(path).map_err(RunError::Config)?;
     let grok = config.grok().clone();
     let catalog = prepare_catalog(&grok).await?;
-    serve(config, catalog).await.map_err(RunError::Server)
+    // Bind the loopback listener before contacting the remote catalog endpoint.
+    // The refresh is optional startup enrichment; it must not delay provider
+    // readiness or hide an actual server failure.
+    let server = bind(config, catalog.clone())
+        .await
+        .map_err(RunError::Server)?;
+    let server_future = server.serve();
+    tokio::pin!(server_future);
+
+    if grok.refresh_on_start() {
+        let refresh_future = refresh_catalog(&grok, &catalog);
+        tokio::pin!(refresh_future);
+        tokio::select! {
+            result = &mut server_future => return result.map_err(RunError::Server),
+            result = &mut refresh_future => match result {
+                Ok(count) => tracing::info!(models = count, "model catalog refreshed"),
+                Err(error) => tracing::warn!(error_class = error.class(), "model catalog refresh skipped"),
+            },
+        }
+    }
+
+    server_future.await.map_err(RunError::Server)
 }
 
 async fn prepare_catalog(config: &GrokConfig) -> Result<ModelCatalog, RunError> {
@@ -446,14 +467,6 @@ async fn prepare_catalog(config: &GrokConfig) -> Result<ModelCatalog, RunError> 
         }
     }
 
-    if config.refresh_on_start() {
-        match refresh_catalog(config, &catalog).await {
-            Ok(count) => tracing::info!(models = count, "model catalog refreshed"),
-            Err(error) => {
-                tracing::warn!(error_class = error.class(), "model catalog refresh skipped")
-            }
-        }
-    }
     Ok(catalog)
 }
 
