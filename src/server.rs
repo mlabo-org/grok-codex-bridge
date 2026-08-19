@@ -1034,6 +1034,7 @@ mod tests {
         RateLimited,
         Unavailable,
         InvalidStream,
+        FailedStream,
     }
 
     struct MockState {
@@ -1068,8 +1069,26 @@ mod tests {
                     "response": {"id": "resp_1", "output": []}
                 }),
                 json!({
-                    "type": "response.unsupported",
-                    "sequence_number": 1
+                    "type": "response.created",
+                    "sequence_number": 0,
+                    "response": {"id": "resp_other", "output": []}
+                })
+            )),
+            MockReply::FailedStream => sse_response(format!(
+                "data: {}\n\ndata: {}\n\n",
+                json!({
+                    "type": "response.created",
+                    "sequence_number": 0,
+                    "response": {"id": "resp_1", "output": []}
+                }),
+                json!({
+                    "type": "response.failed",
+                    "sequence_number": 1,
+                    "response": {
+                        "id": "resp_1",
+                        "status": "failed",
+                        "error": {"code": "server_error", "message": "stopped"}
+                    }
                 })
             )),
         }
@@ -1930,8 +1949,37 @@ mod tests {
         let valid = body.next().await.unwrap().unwrap();
         let valid = std::str::from_utf8(&valid).unwrap();
         assert!(valid.contains("event: response.created"));
-        assert!(!valid.contains("response.unsupported"));
+        assert!(!valid.contains("resp_other"));
         assert!(body.next().await.unwrap().is_err());
+        assert!(body.next().await.is_none());
+        assert_eq!(mock.hits.load(Ordering::SeqCst), 1);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_upstream_event_is_forwarded_as_a_terminal_sse_event() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (client, mock, task) = start_mock(MockReply::FailedStream).await;
+        let app = test_app(
+            runtime_config(temporary.path()),
+            ModelCatalog::bootstrap().unwrap(),
+            CredentialStore::new(write_auth(temporary.path())).unwrap(),
+            client,
+        );
+
+        let response = send(app, TOKEN, request_body("grok-4.6").to_string()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        let created = body.next().await.unwrap().unwrap();
+        assert!(
+            std::str::from_utf8(&created)
+                .unwrap()
+                .contains("event: response.created")
+        );
+        let failed = body.next().await.unwrap().unwrap();
+        let failed = std::str::from_utf8(&failed).unwrap();
+        assert!(failed.contains("event: response.failed"));
+        assert!(failed.contains("\"status\":\"failed\""));
         assert!(body.next().await.is_none());
         assert_eq!(mock.hits.load(Ordering::SeqCst), 1);
         task.abort();
