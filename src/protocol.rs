@@ -1,4 +1,5 @@
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 use uuid::Uuid;
@@ -17,6 +18,8 @@ const REQUEST_FIELDS: &[&str] = &[
     "include",
     "service_tier",
     "prompt_cache_key",
+    "prompt_cache_retention",
+    "previous_response_id",
     "text",
     "client_metadata",
 ];
@@ -136,6 +139,11 @@ pub struct NormalizedResponsesRequest {
     include: Vec<String>,
     service_tier: OptionalJson,
     prompt_cache_key: OptionalJson,
+    // These are Codex-side state/transport fields. They are validated as
+    // scalar strings so a current request can be replayed, then terminate at
+    // the bridge boundary because this route sends the full input history.
+    _prompt_cache_retention: OptionalJson,
+    _previous_response_id: OptionalJson,
     text: OptionalJson,
     _client_metadata: ClientMetadata,
     namespace_projection: NamespaceToolProjection,
@@ -370,6 +378,8 @@ impl NormalizedResponsesRequest {
         let include = required_string_array(object, "include")?;
         let service_tier = optional_scalar_string(object, "service_tier")?;
         let prompt_cache_key = optional_scalar_string(object, "prompt_cache_key")?;
+        let prompt_cache_retention = optional_scalar_string(object, "prompt_cache_retention")?;
+        let previous_response_id = optional_scalar_string(object, "previous_response_id")?;
         let text = optional_object(object, "text")?;
         let client_metadata = parse_client_metadata(object)?;
 
@@ -387,6 +397,8 @@ impl NormalizedResponsesRequest {
             include,
             service_tier,
             prompt_cache_key,
+            _prompt_cache_retention: prompt_cache_retention,
+            _previous_response_id: previous_response_id,
             text,
             _client_metadata: client_metadata,
             namespace_projection,
@@ -402,31 +414,46 @@ impl NormalizedResponsesRequest {
     }
 
     pub fn grok_routing_metadata(&self) -> Result<GrokRoutingMetadata, ProtocolError> {
-        let conversation_id = match &self.prompt_cache_key {
-            OptionalJson::Present(Value::String(value)) => Uuid::parse_str(value)
-                .map_err(|_| ProtocolError::InvalidRequestField("prompt_cache_key"))?,
-            _ => return Err(ProtocolError::InvalidRequestField("prompt_cache_key")),
+        let prompt_cache_id = match &self.prompt_cache_key {
+            OptionalJson::Absent | OptionalJson::Present(Value::Null) => None,
+            OptionalJson::Present(Value::String(value)) => Some(
+                Uuid::parse_str(value)
+                    .map_err(|_| ProtocolError::InvalidRequestField("prompt_cache_key"))?,
+            ),
+            OptionalJson::Present(_) => unreachable!("prompt_cache_key is scalar-validated"),
         };
-        let ClientMetadata::Values(metadata) = &self._client_metadata else {
-            return Err(ProtocolError::InvalidRequestField("client_metadata"));
+        let metadata = match &self._client_metadata {
+            ClientMetadata::Absent => &[][..],
+            ClientMetadata::Values(metadata) => metadata.as_slice(),
         };
         let value = |key: &str| {
             metadata
                 .iter()
                 .find_map(|(candidate, value)| (candidate == key).then_some(value.as_str()))
         };
-        let session_id = value("session_id")
-            .and_then(|value| Uuid::parse_str(value).ok())
-            .ok_or(ProtocolError::InvalidRequestField("client_metadata"))?;
-        if session_id != conversation_id {
+        let parse_metadata_uuid = |key: &str| -> Result<Option<Uuid>, ProtocolError> {
+            value(key)
+                .map(|value| {
+                    Uuid::parse_str(value)
+                        .map_err(|_| ProtocolError::InvalidRequestField("client_metadata"))
+                })
+                .transpose()
+        };
+        let session_id = parse_metadata_uuid("session_id")?;
+        if let (Some(prompt_cache_id), Some(session_id)) = (prompt_cache_id, session_id)
+            && prompt_cache_id != session_id
+        {
             return Err(ProtocolError::InvalidRequestField("client_metadata"));
         }
-        let request_id = value("turn_id")
-            .and_then(|value| Uuid::parse_str(value).ok())
-            .ok_or(ProtocolError::InvalidRequestField("client_metadata"))?;
-        let agent_id = value("x-codex-installation-id")
-            .and_then(|value| Uuid::parse_str(value).ok())
-            .ok_or(ProtocolError::InvalidRequestField("client_metadata"))?;
+        // Codex's cache/session fields are optional, and the bridge sends the
+        // complete history on every turn.  Mirror codex-router's stable
+        // history-derived conversation routing instead of rejecting a valid
+        // request merely because optional transport metadata is absent.
+        let conversation_id = prompt_cache_id
+            .or(session_id)
+            .unwrap_or_else(|| self.derived_conversation_id());
+        let request_id = parse_metadata_uuid("turn_id")?.unwrap_or_else(Uuid::new_v4);
+        let agent_id = parse_metadata_uuid("x-codex-installation-id")?.unwrap_or_else(Uuid::new_v4);
         // Grok's prompt index advances once per prompt, not once per wire-level
         // user item. Codex can emit consecutive synthetic environment-context
         // and actual-prompt user items for one prompt, while model output marks
@@ -473,6 +500,31 @@ impl NormalizedResponsesRequest {
         })
     }
 
+    fn derived_conversation_id(&self) -> Uuid {
+        let anchor = self
+            .input
+            .iter()
+            .filter_map(InputItem::to_grok_value)
+            .take(2)
+            .collect::<Vec<_>>();
+        if anchor.is_empty() {
+            return Uuid::new_v4();
+        }
+
+        // xAI routes its cache by conversation UUID. Hash only the opening
+        // replay items, not the growing tail, so every full-history turn of
+        // one Codex conversation lands on the same upstream conversation.
+        let digest = Sha256::digest(Value::Array(anchor).to_string().as_bytes());
+        let mut bytes = [0_u8; 16];
+        let byte_count = bytes.len();
+        bytes.copy_from_slice(&digest[..byte_count]);
+        // Use UUID v5/ RFC 9562-compatible variant bits for a deterministic
+        // identifier while keeping the value in the UUID header contract.
+        bytes[6] = (bytes[6] & 0x0f) | 0x50;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        Uuid::from_bytes(bytes)
+    }
+
     pub fn to_xai_value(&self) -> Value {
         let mut object = Map::new();
         object.insert("model".into(), Value::String(self.model.clone()));
@@ -509,6 +561,10 @@ impl NormalizedResponsesRequest {
         insert_optional(&mut object, "service_tier", &self.service_tier);
         insert_optional(&mut object, "prompt_cache_key", &self.prompt_cache_key);
         insert_optional(&mut object, "text", &self.text);
+        // `prompt_cache_retention` and `previous_response_id` belong to the
+        // Codex-side stateful transport. This bridge intentionally sends a
+        // stateless full-history request to Grok, so neither field is valid
+        // upstream and both terminate here.
         // `client_metadata` is a Codex transport/session field. The current xAI
         // Responses request has no corresponding field, so validated metadata
         // intentionally terminates at the bridge boundary.
@@ -4065,6 +4121,24 @@ mod tests {
     }
 
     #[test]
+    fn codex_state_fields_are_validated_and_not_forwarded_to_grok() {
+        let mut original = request_fixture();
+        original["prompt_cache_retention"] = json!("24h");
+        original["previous_response_id"] = json!("resp_previous");
+        let normalized = NormalizedResponsesRequest::parse(original).unwrap();
+        let upstream = normalized.to_xai_value();
+        assert!(upstream.get("prompt_cache_retention").is_none());
+        assert!(upstream.get("previous_response_id").is_none());
+
+        let mut malformed = request_fixture();
+        malformed["previous_response_id"] = json!(42);
+        assert_eq!(
+            NormalizedResponsesRequest::parse(malformed).unwrap_err(),
+            ProtocolError::InvalidRequestField("previous_response_id")
+        );
+    }
+
+    #[test]
     fn tool_search_is_projected_as_one_provider_function() {
         let mut request = request_fixture();
         request["tools"] = json!([{
@@ -4541,6 +4615,26 @@ mod tests {
                 .get("client_metadata")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn routing_metadata_uses_a_stable_history_anchor_when_codex_ids_are_absent() {
+        let mut original = request_fixture();
+        original.as_object_mut().unwrap().remove("prompt_cache_key");
+        original.as_object_mut().unwrap().remove("client_metadata");
+
+        let first = NormalizedResponsesRequest::parse(original.clone())
+            .unwrap()
+            .grok_routing_metadata()
+            .unwrap();
+        let second = NormalizedResponsesRequest::parse(original)
+            .unwrap()
+            .grok_routing_metadata()
+            .unwrap();
+
+        assert_eq!(first.conversation_id(), second.conversation_id());
+        assert_eq!(first.turn_index(), 1);
+        assert_ne!(first.conversation_id(), Uuid::nil());
     }
 
     #[test]
