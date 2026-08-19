@@ -28,4 +28,4 @@ pub use protocol::{
     NormalizedResponsesRequest, ProtocolError, TextStreamEventKind, TextStreamState,
     TextStreamValidator, ValidatedTextStreamEvent,
 };
-pub use server::{ServerError, build_router, serve};
+pub use server::{BoundServer, ServerError, bind, build_router, serve};

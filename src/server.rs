@@ -1,4 +1,5 @@
 use std::io::{self, Cursor, Read};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::body::{Body, Bytes, to_bytes};
@@ -108,7 +109,33 @@ fn build_router_with_services(
         .with_state(state)
 }
 
-pub async fn serve(config: RuntimeConfig, catalog: ModelCatalog) -> Result<(), ServerError> {
+pub struct BoundServer {
+    bind: SocketAddr,
+    listener: TcpListener,
+    router: Router,
+}
+
+impl BoundServer {
+    pub async fn serve(self) -> Result<(), ServerError> {
+        tracing::info!(address = %self.bind, "loopback service started");
+        axum::serve(self.listener, self.router)
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+            .map_err(ServerError::Serve)
+    }
+
+    #[cfg(test)]
+    fn local_addr(&self) -> SocketAddr {
+        self.listener
+            .local_addr()
+            .expect("bound listener has address")
+    }
+}
+
+pub async fn bind(
+    config: RuntimeConfig,
+    catalog: ModelCatalog,
+) -> Result<BoundServer, ServerError> {
     let bind = config.bind();
     let native = native_service(&config).map_err(ServerError::NativeRoute)?;
     let responses_disabled = responses_disabled_from_environment();
@@ -119,12 +146,15 @@ pub async fn serve(config: RuntimeConfig, catalog: ModelCatalog) -> Result<(), S
     };
     let router = build_router_with_services(config, catalog, responses, native, responses_disabled);
     let listener = TcpListener::bind(bind).await.map_err(ServerError::Bind)?;
+    Ok(BoundServer {
+        bind,
+        listener,
+        router,
+    })
+}
 
-    tracing::info!(address = %bind, "loopback service started");
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .map_err(ServerError::Serve)
+pub async fn serve(config: RuntimeConfig, catalog: ModelCatalog) -> Result<(), ServerError> {
+    bind(config, catalog).await?.serve().await
 }
 
 fn native_service(config: &RuntimeConfig) -> Result<Option<Arc<NativeService>>, NativeError> {
@@ -839,6 +869,7 @@ mod tests {
     use axum::routing::post as upstream_post;
     use futures_util::StreamExt;
     use serde_json::{Value, json};
+    use tokio::net::TcpStream;
     use tokio::task::JoinHandle;
     use tower::ServiceExt;
     use url::Url;
@@ -862,6 +893,41 @@ mod tests {
         )
         .unwrap();
         RuntimeConfig::load(&config_path).unwrap()
+    }
+
+    #[tokio::test]
+    async fn listener_binds_before_a_delayed_startup_refresh_can_complete() {
+        let directory = tempfile::tempdir().unwrap();
+        let token_path = directory.path().join("caller-token");
+        fs::write(&token_path, TOKEN).unwrap();
+        fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let config_path = directory.path().join("bridge.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "version = 1\n\n[server]\nbind = \"127.0.0.1:{port}\"\ncapability_token_file = {:?}\n\n[grok]\ncatalog_cache_file = {:?}\nrefresh_on_start = true\n",
+                token_path.display().to_string(),
+                directory.path().join("models.json").display().to_string()
+            ),
+        )
+        .unwrap();
+        let config = RuntimeConfig::load(&config_path).unwrap();
+        let server = bind(config, ModelCatalog::bootstrap().unwrap())
+            .await
+            .unwrap();
+        let address = server.local_addr();
+
+        // A startup refresh may remain pending here; the concrete loopback
+        // listener is already accepting TCP connections independently of it.
+        let refresh = tokio::sync::oneshot::channel::<()>();
+        let (_release, pending) = refresh;
+        let _connection = TcpStream::connect(address).await.unwrap();
+        assert!(!_connection.peer_addr().unwrap().ip().is_unspecified());
+        drop(pending);
+        drop(server);
     }
 
     fn write_auth(directory: &FsPath) -> PathBuf {
