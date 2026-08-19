@@ -56,6 +56,8 @@ command.
 
 This route automates every repository-owned V1.1 installation step. A fresh Codex CLI process or full Desktop relaunch remains necessary after activation so Codex loads the published catalog and provider state.
 
+A first-time install can run from Codex. Do not stop or replace an already running bridge from a Grok-backed Codex session; see [Updating an existing install](#updating-an-existing-install).
+
 ## Acknowledgements
 
 This project owes a substantial design debt to [duolahypercho/codex-router](https://github.com/duolahypercho/codex-router/tree/9995c77278608640759982c98ec5bdaeb371c174). Its implementation and documentation were an important feasibility reference and materially informed our decisions around official Grok credential freshness, provider-bound metadata, xAI Responses/SSE taxonomy, native picker integration, and reversible activation. We sincerely thank the author and contributors for publishing that work under the MIT License.
@@ -180,6 +182,12 @@ codex resume <SESSION_ID> -m <NATIVE_GPT_MODEL>
 ```
 
 ## Lifecycle and rollback
+
+### Updating an existing install
+
+A Codex session that uses this bridge depends on the local loopback service. That includes the isolated `grok-bridge` profile and the V1.1 picker when a Grok model is selected. Stopping the service or replacing the installed binary from inside that session cuts the model connection. If the reload does not finish, the service stays `not_loaded` and Codex cannot reach Grok until the service is started again.
+
+Perform materialization, installed-binary update, and `service install` from a session that does not use this bridge. Use Grok Build for that step, or a Codex session on a Native GPT model. After `service status` reports `service loaded`, start a fresh Codex CLI process or fully relaunch Desktop so the client reconnects.
 
 All repository commands below use the materialized executable directly:
 
