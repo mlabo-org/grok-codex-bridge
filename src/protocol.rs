@@ -2495,7 +2495,7 @@ pub struct TextStreamValidator {
     content_index: Option<u64>,
     text: String,
     message_stage: Option<MessageItemStage>,
-    reasoning_item: Option<ReasoningStreamItem>,
+    reasoning_items: Vec<ReasoningStreamItem>,
     function_items: Vec<FunctionStreamItem>,
     opaque_items: Vec<OpaqueStreamItem>,
 }
@@ -2592,7 +2592,7 @@ impl TextStreamValidator {
             content_index: None,
             text: String::new(),
             message_stage: None,
-            reasoning_item: None,
+            reasoning_items: Vec::new(),
             function_items: Vec::new(),
             opaque_items: Vec::new(),
         }
@@ -2751,7 +2751,7 @@ impl TextStreamValidator {
                 ])?;
                 self.require_reasoning_ready_for_next_item()?;
                 let expected_index =
-                    u64::from(self.reasoning_item.is_some()) + self.opaque_items.len() as u64;
+                    self.reasoning_items.len() as u64 + self.opaque_items.len() as u64;
                 if !self.function_items.is_empty() || output_index != expected_index {
                     return Err(ProtocolError::InvalidOutputIndexOrder);
                 }
@@ -2784,17 +2784,21 @@ impl TextStreamValidator {
         item: &Map<String, Value>,
         output_index: u64,
     ) -> Result<(TextStreamEventKind, TextStreamState), ProtocolError> {
-        self.require_state(&[TextStreamState::Created, TextStreamState::InProgress])?;
-        if self.reasoning_item.is_some()
-            || self.item_id.is_some()
-            || !self.function_items.is_empty()
-            || !self.opaque_items.is_empty()
-            || output_index != 0
-        {
+        self.require_state(&[
+            TextStreamState::Created,
+            TextStreamState::InProgress,
+            TextStreamState::OutputItemDone,
+            TextStreamState::ReasoningDone,
+        ])?;
+        self.require_reasoning_ready_for_next_item()?;
+        if output_index != self.next_output_index() {
             return Err(ProtocolError::InvalidOutputIndexOrder);
         }
         let parsed = validate_sse_reasoning_item(item, ReasoningItemShape::Added)?;
-        self.reasoning_item = Some(ReasoningStreamItem {
+        if self.item_id_taken(&parsed.item_id) {
+            return Err(ProtocolError::DuplicateItemId);
+        }
+        self.reasoning_items.push(ReasoningStreamItem {
             item_id: parsed.item_id.clone(),
             output_index,
             summaries: parsed
@@ -3446,10 +3450,9 @@ impl TextStreamValidator {
     }
 
     fn validate_completed_output(&self, output: &[Value]) -> Result<(), ProtocolError> {
-        if let Some(reasoning) = &self.reasoning_item
-            && reasoning.explicitly_added
-            && reasoning.stage != ReasoningItemStage::Done
-        {
+        if self.reasoning_items.iter().any(|reasoning| {
+            reasoning.explicitly_added && reasoning.stage != ReasoningItemStage::Done
+        }) {
             return Err(ProtocolError::InvalidSseOrder);
         }
         if self.item_id.is_some() {
@@ -3477,9 +3480,9 @@ impl TextStreamValidator {
                 .ok_or(ProtocolError::InvalidSseField("response.output"))?;
             let output_index = index as u64;
             if let Some(expected) = self
-                .reasoning_item
-                .as_ref()
-                .filter(|reasoning| reasoning.output_index == output_index)
+                .reasoning_items
+                .iter()
+                .find(|reasoning| reasoning.output_index == output_index)
             {
                 let parsed = validate_sse_reasoning_item(object, ReasoningItemShape::Done)?;
                 require_matching_reasoning(expected, &parsed)?;
@@ -3520,7 +3523,7 @@ impl TextStreamValidator {
     }
 
     fn next_output_index(&self) -> u64 {
-        u64::from(self.reasoning_item.is_some())
+        self.reasoning_items.len() as u64
             + u64::from(self.item_id.is_some())
             + self.function_items.len() as u64
             + self.opaque_items.len() as u64
@@ -3529,9 +3532,9 @@ impl TextStreamValidator {
     fn item_id_taken(&self, item_id: &str) -> bool {
         self.item_id.as_deref() == Some(item_id)
             || self
-                .reasoning_item
-                .as_ref()
-                .is_some_and(|reasoning| reasoning.item_id == item_id)
+                .reasoning_items
+                .iter()
+                .any(|reasoning| reasoning.item_id == item_id)
             || self
                 .function_items
                 .iter()
@@ -3555,47 +3558,61 @@ impl TextStreamValidator {
         output_index: u64,
         allow_implicit: bool,
     ) -> Result<&mut ReasoningStreamItem, ProtocolError> {
-        if self.reasoning_item.is_none() {
-            if !allow_implicit
-                || !matches!(
-                    self.state,
-                    TextStreamState::Created | TextStreamState::InProgress
-                )
-                || self.item_id.is_some()
-                || !self.function_items.is_empty()
-                || !self.opaque_items.is_empty()
-                || output_index != 0
-            {
+        if let Some(index) = self
+            .reasoning_items
+            .iter()
+            .position(|item| item.item_id == item_id)
+        {
+            let item = &mut self.reasoning_items[index];
+            if item.output_index != output_index {
+                return Err(ProtocolError::OutputIndexMismatch);
+            }
+            if item.stage == ReasoningItemStage::Done {
                 return Err(ProtocolError::InvalidSseOrder);
             }
-            self.reasoning_item = Some(ReasoningStreamItem {
-                item_id: item_id.to_owned(),
-                output_index,
-                summaries: Vec::new(),
-                content: Vec::new(),
-                encrypted_content: None,
-                explicitly_added: false,
-                stage: ReasoningItemStage::Streaming,
-            });
+            return Ok(item);
         }
-        let item = self.reasoning_item.as_mut().expect("reasoning item exists");
-        if item.item_id != item_id {
+        if !allow_implicit
+            || self
+                .reasoning_items
+                .iter()
+                .any(|item| item.stage != ReasoningItemStage::Done)
+        {
             return Err(ProtocolError::ItemIdMismatch);
         }
-        if item.output_index != output_index {
-            return Err(ProtocolError::OutputIndexMismatch);
-        }
-        if item.stage == ReasoningItemStage::Done {
+        if !matches!(
+            self.state,
+            TextStreamState::Created
+                | TextStreamState::InProgress
+                | TextStreamState::OutputItemDone
+                | TextStreamState::ReasoningDone
+        ) || output_index != self.next_output_index()
+        {
             return Err(ProtocolError::InvalidSseOrder);
         }
-        Ok(item)
+        self.require_reasoning_ready_for_next_item()?;
+        if self.item_id_taken(item_id) {
+            return Err(ProtocolError::DuplicateItemId);
+        }
+        self.reasoning_items.push(ReasoningStreamItem {
+            item_id: item_id.to_owned(),
+            output_index,
+            summaries: Vec::new(),
+            content: Vec::new(),
+            encrypted_content: None,
+            explicitly_added: false,
+            stage: ReasoningItemStage::Streaming,
+        });
+        Ok(self
+            .reasoning_items
+            .last_mut()
+            .expect("just pushed reasoning item"))
     }
 
     fn require_reasoning_ready_for_next_item(&self) -> Result<(), ProtocolError> {
-        if let Some(reasoning) = &self.reasoning_item
-            && reasoning.explicitly_added
-            && reasoning.stage != ReasoningItemStage::Done
-        {
+        if self.reasoning_items.iter().any(|reasoning| {
+            reasoning.explicitly_added && reasoning.stage != ReasoningItemStage::Done
+        }) {
             return Err(ProtocolError::InvalidSseOrder);
         }
         Ok(())
@@ -6186,6 +6203,101 @@ mod tests {
                     }
                 ),
                 _ => {}
+            }
+        }
+        assert!(validator.finish().is_ok());
+    }
+
+    #[test]
+    fn later_reasoning_item_after_hosted_search_is_admitted() {
+        let first_done = json!({
+            "type": "reasoning",
+            "id": "reasoning_1",
+            "summary": [],
+            "status": "completed"
+        });
+        let search_done = json!({
+            "type": "web_search_call",
+            "id": "ws_1",
+            "status": "completed",
+            "action": {"type": "search", "query": "xhigh"}
+        });
+        let second_done = json!({
+            "type": "reasoning",
+            "id": "reasoning_2",
+            "summary": [{"type": "summary_text", "text": "Use the result."}],
+            "encrypted_content": "second-cipher",
+            "status": "completed"
+        });
+        let events = vec![
+            json!({
+                "type": "response.created", "sequence_number": 0,
+                "response": {"id": "resp_later", "status": "in_progress", "output": []}
+            }),
+            json!({
+                "type": "response.output_item.added", "sequence_number": 1,
+                "output_index": 0,
+                "item": {
+                    "type": "reasoning", "id": "reasoning_1", "summary": [],
+                    "status": "in_progress"
+                }
+            }),
+            json!({
+                "type": "response.output_item.done", "sequence_number": 2,
+                "output_index": 0, "item": first_done.clone()
+            }),
+            json!({
+                "type": "response.output_item.added", "sequence_number": 4,
+                "output_index": 1,
+                "item": {"type": "web_search_call", "id": "ws_1", "status": "in_progress"}
+            }),
+            json!({
+                "type": "response.output_item.done", "sequence_number": 5,
+                "output_index": 1, "item": search_done.clone()
+            }),
+            json!({
+                "type": "response.output_item.added", "sequence_number": 6,
+                "output_index": 2,
+                "item": {
+                    "type": "reasoning", "id": "reasoning_2", "summary": [],
+                    "status": "in_progress"
+                }
+            }),
+            json!({
+                "type": "response.reasoning_summary_text.delta", "sequence_number": 7,
+                "item_id": "reasoning_2", "output_index": 2, "summary_index": 0,
+                "delta": "Use the result."
+            }),
+            json!({
+                "type": "response.reasoning_summary_text.done", "sequence_number": 8,
+                "item_id": "reasoning_2", "output_index": 2, "summary_index": 0,
+                "text": "Use the result."
+            }),
+            json!({
+                "type": "response.output_item.done", "sequence_number": 9,
+                "output_index": 2, "item": second_done.clone()
+            }),
+            json!({
+                "type": "response.completed", "sequence_number": 10,
+                "response": {
+                    "id": "resp_later", "status": "completed",
+                    "output": [first_done, search_done, second_done]
+                }
+            }),
+        ];
+
+        let mut validator = TextStreamValidator::new();
+        for (index, original) in events.into_iter().enumerate() {
+            let event = validator.accept_value(original.clone()).unwrap();
+            assert_eq!(event.original(), &original);
+            if index == 5 {
+                assert_eq!(
+                    event.kind(),
+                    &TextStreamEventKind::ReasoningItemAdded {
+                        item_id: "reasoning_2".to_owned(),
+                        output_index: 2
+                    }
+                );
             }
         }
         assert!(validator.finish().is_ok());
