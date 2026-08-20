@@ -136,7 +136,7 @@ capability token、完全なcapability URLをlogへ出さない。
 
 ## 11. Credential Cache
 
-Access tokenのmemory cacheは許容する。disk再保存、debug print、panic dumpは禁止する。secret保持型を使い、process exit時は可能な範囲でzeroizeする。credential fileのmtime変化を検出して再読込する。
+Access tokenのmemory cacheは許容する。disk再保存、debug print、panic dumpは禁止する。secret保持型を使い、process exit時は可能な範囲でzeroizeする。credential fileのmtime変化を検出して再読込する。長時間sleepからの復帰時にmemory cacheのcredentialが期限切れで、公式Grok flowによるauthoritative file更新が遅れている場合、Responses requestは最大60秒だけread-only再読込を待ってから判定する。この待機はexpired credentialだけを対象とし、bridge自身によるrefresh、credential変更、upstream request再送は行わない。
 
 ## 12. OAuth Refresh
 
