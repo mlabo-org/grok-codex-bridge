@@ -209,6 +209,7 @@ Codexから渡されたfunction toolのname、description、parameters schemaを
 ## 24. Tool Calls
 
 Grokが返すResponses function call itemのtool name、tool call ID、arguments JSONをCodexが消費する形へ正規化する。`call_id`は次turnのtool result対応に必要なため保持する。
+Grokは整数をJSON float（`8.0`）として返すことがある。Codex hostのinteger parserはこれを拒否するため、bridgeはfunction call / `tool_search` argument object内のinteger-valued numberだけをJSON integerへ直す。実際の小数は変更しない。
 
 Native GPTで完了済みの`custom_tool_call`と`custom_tool_call_output`はCodex harnessが所有するforeign実行履歴として扱い、Grok requestから狭く除外する。これらをGrok function call stateへ混入させず、同じturnのvalidなassistant message textは会話履歴として維持する。
 

@@ -576,10 +576,11 @@ impl InputItem {
                 if required_string(object, "execution")? != "client" {
                     return Err(ProtocolError::InvalidRequestField("execution"));
                 }
-                let arguments = required_value(object, "arguments")?.clone();
+                let mut arguments = required_value(object, "arguments")?.clone();
                 if !arguments.is_object() {
                     return Err(ProtocolError::InvalidFunctionArguments);
                 }
+                canonicalize_integer_valued_numbers(&mut arguments);
                 Ok(Self::ToolSearchCall(ToolSearchCall {
                     call_id: required_nonempty_string(object, "call_id")?.to_owned(),
                     arguments,
@@ -930,6 +931,115 @@ fn parse_prior_reasoning_parts(
         .collect()
 }
 
+
+fn canonicalize_integer_valued_numbers(value: &mut Value) {
+    match value {
+        Value::Number(number) => {
+            if let Some(canonical) = integer_valued_json_number(number) {
+                *number = canonical;
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                canonicalize_integer_valued_numbers(value);
+            }
+        }
+        Value::Object(object) => {
+            for value in object.values_mut() {
+                canonicalize_integer_valued_numbers(value);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::String(_) => {}
+    }
+}
+
+fn integer_valued_json_number(number: &serde_json::Number) -> Option<serde_json::Number> {
+    if number.is_i64() || number.is_u64() {
+        return None;
+    }
+    let float = number.as_f64()?;
+    if !float.is_finite() {
+        return None;
+    }
+    if float < i64::MIN as f64 || float > i64::MAX as f64 {
+        return None;
+    }
+    let integer = float as i64;
+    if integer as f64 != float {
+        return None;
+    }
+    Some(serde_json::Number::from(integer))
+}
+
+fn canonicalize_json_object_argument_string(arguments: &str) -> Option<String> {
+    let mut value: Value = serde_json::from_str(arguments).ok()?;
+    if !value.is_object() {
+        return None;
+    }
+    let original = value.clone();
+    canonicalize_integer_valued_numbers(&mut value);
+    if value == original {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn canonicalize_arguments_field(object: &mut Map<String, Value>) {
+    match object.get("arguments") {
+        Some(Value::String(arguments)) => {
+            if let Some(canonical) = canonicalize_json_object_argument_string(arguments) {
+                object.insert("arguments".into(), Value::String(canonical));
+            }
+        }
+        Some(Value::Object(_) | Value::Array(_)) => {
+            if let Some(arguments) = object.get_mut("arguments") {
+                canonicalize_integer_valued_numbers(arguments);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn canonicalize_function_call_item_arguments(item: &mut Value) {
+    let Some(object) = item.as_object_mut() else {
+        return;
+    };
+    if object.get("type").and_then(Value::as_str) != Some("function_call") {
+        return;
+    }
+    canonicalize_arguments_field(object);
+}
+
+fn canonicalize_response_event_arguments(event: &mut Value) {
+    let Some(object) = event.as_object_mut() else {
+        return;
+    };
+    match object.get("type").and_then(Value::as_str) {
+        Some("response.output_item.added" | "response.output_item.done") => {
+            if let Some(item) = object.get_mut("item") {
+                canonicalize_function_call_item_arguments(item);
+            }
+        }
+        Some("response.completed") => {
+            if let Some(output) = object
+                .get_mut("response")
+                .and_then(Value::as_object_mut)
+                .and_then(|response| response.get_mut("output"))
+                .and_then(Value::as_array_mut)
+            {
+                for item in output {
+                    canonicalize_function_call_item_arguments(item);
+                }
+            }
+        }
+        Some("response.function_call_arguments.done") => {
+            canonicalize_arguments_field(object);
+        }
+        _ => {}
+    }
+}
+
 impl FunctionCall {
     fn parse(
         object: &Map<String, Value>,
@@ -939,11 +1049,18 @@ impl FunctionCall {
         // tool call. Validate Codex's output-only id, but do not forward it.
         optional_nonempty_string(object, "id")?;
         let arguments = required_string(object, "arguments")?.to_owned();
-        let parsed: Value = serde_json::from_str(&arguments)
+        let mut parsed: Value = serde_json::from_str(&arguments)
             .map_err(|_| ProtocolError::InvalidFunctionArguments)?;
         if !parsed.is_object() {
             return Err(ProtocolError::InvalidFunctionArguments);
         }
+        let original_arguments = parsed.clone();
+        canonicalize_integer_valued_numbers(&mut parsed);
+        let arguments = if parsed == original_arguments {
+            arguments
+        } else {
+            parsed.to_string()
+        };
         let native_name = required_nonempty_string(object, "name")?;
         let name = match optional_nonempty_string(object, "namespace")? {
             Some(namespace) => namespace_projection
@@ -1390,6 +1507,7 @@ impl NamespaceToolProjection {
     }
 
     fn restore_response_event(&self, value: &mut Value) {
+        canonicalize_response_event_arguments(value);
         if self.provider_to_native.is_empty() && self.tool_search_provider_name.is_none() {
             return;
         }
@@ -1443,12 +1561,13 @@ impl NamespaceToolProjection {
         let Some(arguments) = object.get("arguments").and_then(Value::as_str) else {
             return false;
         };
-        let Ok(arguments) = serde_json::from_str::<Value>(arguments) else {
+        let Ok(mut arguments) = serde_json::from_str::<Value>(arguments) else {
             return false;
         };
         if !arguments.is_object() {
             return false;
         }
+        canonicalize_integer_valued_numbers(&mut arguments);
         object.insert("type".into(), Value::String("tool_search_call".into()));
         object.insert("execution".into(), Value::String("client".into()));
         object.insert("arguments".into(), arguments);
@@ -2807,6 +2926,114 @@ mod tests {
         assert_eq!(event["item"]["execution"], "client");
         assert_eq!(event["item"]["arguments"]["query"], "calendar");
         assert!(event["item"].get("name").is_none());
+    }
+
+    #[test]
+    fn integer_valued_json_floats_become_integers() {
+        let mut value = json!({
+            "limit": 8.0,
+            "nested": {"waitMs": 120000.0, "ratio": 0.25},
+            "flags": [1.0, 1.5, -2.0]
+        });
+        canonicalize_integer_valued_numbers(&mut value);
+        assert_eq!(value["limit"].as_i64(), Some(8));
+        assert_eq!(value["nested"]["waitMs"].as_i64(), Some(120000));
+        assert_eq!(value["nested"]["ratio"].as_f64(), Some(0.25));
+        assert!(value["nested"]["ratio"].as_i64().is_none());
+        assert_eq!(value["flags"][0].as_i64(), Some(1));
+        assert_eq!(value["flags"][1].as_f64(), Some(1.5));
+        assert!(value["flags"][1].as_i64().is_none());
+        assert_eq!(value["flags"][2].as_i64(), Some(-2));
+    }
+
+    #[test]
+    fn tool_search_float_limit_is_restored_as_json_integer() {
+        let mut request = request_fixture();
+        request["tools"] = json!([{
+            "type": "tool_search", "execution": "client",
+            "description": "Search deferred tools.",
+            "parameters": {"type": "object", "properties": {}}
+        }]);
+        let projection = NormalizedResponsesRequest::parse(request)
+            .unwrap()
+            .namespace_projection();
+        let mut event = json!({
+            "type": "response.output_item.done", "sequence_number": 1,
+            "output_index": 0, "item": {
+                "type": "function_call", "id": "fc-1", "call_id": "search-1",
+                "name": "tool_search",
+                "arguments": "{\"limit\":8.0,\"query\":\"generate_image_grid\"}",
+                "status": "completed"
+            }
+        });
+        projection.restore_response_event(&mut event);
+        assert_eq!(event["item"]["type"], "tool_search_call");
+        assert_eq!(event["item"]["arguments"]["limit"].as_i64(), Some(8));
+        assert_eq!(event["item"]["arguments"]["query"], "generate_image_grid");
+    }
+
+    #[test]
+    fn host_tool_float_arguments_are_restored_as_json_integers() {
+        let mut event = json!({
+            "type": "response.output_item.done", "sequence_number": 1,
+            "output_index": 0, "item": {
+                "type": "function_call", "id": "fc-1", "call_id": "call-1",
+                "name": "write_stdin",
+                "arguments": "{\"session_id\":42337.0,\"chars\":\"x\",\"yield_time_ms\":250.0}"
+            }
+        });
+        NamespaceToolProjection::default().restore_response_event(&mut event);
+        let parsed: Value = serde_json::from_str(
+            event["item"]["arguments"].as_str().expect("function arguments"),
+        )
+        .unwrap();
+        assert_eq!(parsed["session_id"].as_i64(), Some(42337));
+        assert_eq!(parsed["yield_time_ms"].as_i64(), Some(250));
+        assert_eq!(parsed["chars"], "x");
+    }
+
+    #[test]
+    fn function_call_arguments_done_float_is_canonicalized() {
+        let mut event = json!({
+            "type": "response.function_call_arguments.done",
+            "item_id": "fc-1",
+            "output_index": 0,
+            "arguments": "{\"limit\":12.0,\"query\":\"grid\",\"temperature\":0.7}"
+        });
+        NamespaceToolProjection::default().restore_response_event(&mut event);
+        let parsed: Value =
+            serde_json::from_str(event["arguments"].as_str().expect("done arguments")).unwrap();
+        assert_eq!(parsed["limit"].as_i64(), Some(12));
+        assert_eq!(parsed["query"], "grid");
+        assert_eq!(parsed["temperature"].as_f64(), Some(0.7));
+        assert!(parsed["temperature"].as_i64().is_none());
+    }
+
+    #[test]
+    fn tool_search_replay_float_limit_is_projected_as_json_integer() {
+        let mut request = request_fixture();
+        request["tools"] = json!([{
+            "type": "tool_search", "execution": "client",
+            "description": "Search deferred tools.",
+            "parameters": {"type": "object", "properties": {}}
+        }]);
+        request["input"] = json!([
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]},
+            {"type":"tool_search_call","call_id":"search_1","execution":"client","arguments":{"limit":15.0,"query":"rust"}}
+        ]);
+        let projected = NormalizedResponsesRequest::parse(request)
+            .unwrap()
+            .to_xai_value();
+        let call = projected["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"] == "tool_search")
+            .expect("projected tool_search call");
+        let parsed: Value =
+            serde_json::from_str(call["arguments"].as_str().expect("projected arguments")).unwrap();
+        assert_eq!(parsed["limit"].as_i64(), Some(15));
+        assert_eq!(parsed["query"], "rust");
     }
 
     #[test]
