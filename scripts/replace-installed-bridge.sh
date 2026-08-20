@@ -11,6 +11,28 @@ fail() {
     exit 1
 }
 
+wait_for_service_state() {
+    bridge_binary=$1
+    expected_state=$2
+    attempts=0
+    while [ "$attempts" -lt 100 ]; do
+        if observed_state=$("$bridge_binary" service status 2>/dev/null); then
+            if [ "$observed_state" = "$expected_state" ]; then
+                return 0
+            fi
+            case "$observed_state" in
+                "service loaded"|"service not_loaded") ;;
+                *) return 1 ;;
+            esac
+        else
+            return 1
+        fi
+        attempts=$((attempts + 1))
+        [ "$attempts" -ge 100 ] || /bin/sleep 0.1
+    done
+    return 1
+}
+
 if [ "$#" -ne 1 ]; then
     usage
 fi
@@ -56,10 +78,12 @@ cleanup() {
 
     if [ "$exit_code" -ne 0 ]; then
         if [ "$replaced" -eq 1 ] && [ -f "$rollback_binary" ]; then
-            "$installed_binary" service uninstall >/dev/null 2>&1 || true
-            if /bin/mv -f "$rollback_binary" "$installed_binary"; then
+            if "$installed_binary" service uninstall >/dev/null 2>&1 \
+                && wait_for_service_state "$installed_binary" "service not_loaded" \
+                && /bin/mv -f "$rollback_binary" "$installed_binary"; then
                 /bin/chmod 755 "$installed_binary"
-                if "$installed_binary" service install >/dev/null 2>&1; then
+                if "$installed_binary" service install >/dev/null 2>&1 \
+                    && wait_for_service_state "$installed_binary" "service loaded"; then
                     printf '%s\n' "rollback: restored the previous bridge and restarted its service" >&2
                 else
                     printf '%s\n' "rollback error: previous bridge was restored but its service did not restart" >&2
@@ -68,7 +92,8 @@ cleanup() {
                 printf '%s\n' "rollback error: unable to restore the previous bridge" >&2
             fi
         elif [ "$stopped" -eq 1 ]; then
-            if "$installed_binary" service install >/dev/null 2>&1; then
+            if "$installed_binary" service install >/dev/null 2>&1 \
+                && wait_for_service_state "$installed_binary" "service loaded"; then
                 printf '%s\n' "rollback: restarted the previous bridge service" >&2
             else
                 printf '%s\n' "rollback error: previous bridge service did not restart" >&2
@@ -94,9 +119,8 @@ trap 'exit 143' 15
 
 "$installed_binary" service uninstall
 stopped=1
-service_state=$("$installed_binary" service status)
-if [ "$service_state" != "service not_loaded" ]; then
-    fail "bridge service did not stop cleanly: $service_state"
+if ! wait_for_service_state "$installed_binary" "service not_loaded"; then
+    fail "bridge service did not reach not_loaded state before the bounded deadline"
 fi
 
 /bin/mv -f "$staged_binary" "$installed_binary"
@@ -109,10 +133,10 @@ if [ "$installed_version" != "$new_version" ]; then
 fi
 
 "$installed_binary" service install
-service_state=$("$installed_binary" service status)
-if [ "$service_state" != "service loaded" ]; then
-    fail "new bridge service did not reach loaded state: $service_state"
+if ! wait_for_service_state "$installed_binary" "service loaded"; then
+    fail "new bridge service did not reach loaded state before the bounded deadline"
 fi
+service_state="service loaded"
 "$installed_binary" doctor
 
 printf '%s\n' "bridge replaced: $installed_binary"

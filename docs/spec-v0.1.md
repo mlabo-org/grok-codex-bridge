@@ -391,7 +391,7 @@ Service stop、managed config removal、original config restoration、generated 
 
 ## 63. launchd
 
-macOS first。LaunchAgentはuser domainに置き、loopbackだけへbindし、crash restartを許容できる。stdout/stderrへsecretを出さない。source buildとinstalled runtimeは別境界とする。
+macOS first。LaunchAgentはuser domainに置き、loopbackだけへbindし、crash restartを許容できる。service install/uninstallは`launchctl` commandの受付完了だけで成功にせず、bounded pollで`loaded`/`not_loaded`へ収束したことを確認してから返す。stdout/stderrへsecretを出さない。source buildとinstalled runtimeは別境界とする。
 
 ## 64. V1 Non-goals
 
