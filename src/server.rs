@@ -24,7 +24,7 @@ use crate::lifecycle::PICKER_CALLER_HEADER;
 use crate::native::{
     NativeClient, NativeError, NativeResponsesPath, NativeRouteState, is_hop_by_hop_response_header,
 };
-use crate::protocol::{NormalizedResponsesRequest, remove_unreplayable_reasoning_for_native};
+use crate::protocol::{NormalizedResponsesRequest, sanitize_unreplayable_history_for_native};
 
 const MAX_RESPONSES_BODY_BYTES: usize = 16 * 1024 * 1024;
 const DISABLE_ENVIRONMENT_VARIABLE: &str = "GROK_CODEX_BRIDGE_DISABLE";
@@ -621,10 +621,10 @@ fn native_request_body(
         .as_object_mut()
         .and_then(|request| request.remove("previous_response_id"))
         .is_some();
-    let removed_unreplayable_reasoning = remove_unreplayable_reasoning_for_native(&mut request);
+    let sanitized_unreplayable_history = sanitize_unreplayable_history_for_native(&mut request);
     if !removed_prompt_cache_retention
         && !removed_previous_response_id
-        && !removed_unreplayable_reasoning
+        && !sanitized_unreplayable_history
     {
         return Ok(original);
     }
@@ -1377,6 +1377,105 @@ mod tests {
             upstream["prompt_cache_key"],
             "11111111-1111-4111-8111-111111111111"
         );
+        drop(observed);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn model_switch_native_route_sanitizes_replay_and_keeps_call_pairs() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (client, mock, task) = start_native_mock().await;
+        let route = NativeRouteState::new(
+            crate::native::NativeUpstream::ChatgptCodex,
+            ["gpt-native".to_owned()],
+        )
+        .unwrap();
+        let app = build_router_with_services(
+            runtime_config(temporary.path()),
+            ModelCatalog::bootstrap().unwrap(),
+            None,
+            Some(Arc::new(NativeService { route, client })),
+            true,
+        );
+        let mut request = request_body("gpt-native");
+        request["input"] = json!([
+            {
+                "type": "message", "id": "msg_user", "role": "user",
+                "content": [{"type": "input_text", "text": "use the plugin"}]
+            },
+            {
+                "type": "reasoning", "id": "rs_grok",
+                "summary": [], "encrypted_content": "grok-codex-bridge:v1:opaque"
+            },
+            {
+                "type": "message", "id": "msg_grok", "role": "assistant",
+                "content": [{"type": "output_text", "text": "running"}]
+            },
+            {
+                "type": "function_call", "id": "fc_grok", "name": "mcp__demo__ping",
+                "arguments": "{}", "call_id": "call-1"
+            },
+            {
+                "type": "function_call_output", "id": "fco_grok",
+                "call_id": "call-1", "output": "pong"
+            },
+            {
+                "type": "tool_search_call",
+                "id": "msg_e2a2848a-4ab3-9328-a1b4-c2318babb894",
+                "call_id": "search-1", "execution": "client",
+                "arguments": {"limit": 8, "query": "generate_image_grid"}
+            },
+            {
+                "type": "tool_search_call", "id": "tsc_native",
+                "call_id": "search-2", "execution": "client",
+                "arguments": {"limit": 8, "query": "codex_image_grid"}
+            }
+        ]);
+        let compressed = zstd::stream::encode_all(Cursor::new(request.to_string()), 3).unwrap();
+
+        let response = send_with_headers(
+            app,
+            TOKEN,
+            &[
+                ("content-encoding", "zstd"),
+                ("content-type", "application/json"),
+                ("authorization", "Bearer native-caller-secret"),
+            ],
+            compressed,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let observed = mock.observed.lock().unwrap();
+        let decoded = zstd::stream::decode_all(Cursor::new(&observed[0].1)).unwrap();
+        let upstream: Value = serde_json::from_slice(&decoded).unwrap();
+        let input = upstream["input"].as_array().unwrap();
+        assert!(input.iter().all(|item| item["type"] != "reasoning"));
+        assert!(
+            input
+                .iter()
+                .filter(|item| matches!(
+                    item["type"].as_str(),
+                    Some("message" | "function_call" | "function_call_output")
+                ))
+                .all(|item| item.get("id").is_none())
+        );
+        let call = input
+            .iter()
+            .find(|item| item["type"] == "function_call")
+            .unwrap();
+        let output = input
+            .iter()
+            .find(|item| item["type"] == "function_call_output")
+            .unwrap();
+        assert_eq!(call["call_id"], "call-1");
+        assert_eq!(output["call_id"], "call-1");
+        let searches = input
+            .iter()
+            .filter(|item| item["type"] == "tool_search_call")
+            .collect::<Vec<_>>();
+        assert_eq!(searches[0].get("id"), None);
+        assert_eq!(searches[0]["call_id"], "search-1");
+        assert_eq!(searches[1]["id"], "tsc_native");
         drop(observed);
         task.abort();
     }
