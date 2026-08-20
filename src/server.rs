@@ -22,7 +22,7 @@ use crate::credential::{CredentialError, CredentialStore};
 use crate::grok::{GrokClient, GrokError, ResponsesTransportRequest};
 use crate::lifecycle::PICKER_CALLER_HEADER;
 use crate::native::{
-    NativeClient, NativeError, NativeResponsesPath, NativeRouteState, is_hop_by_hop_response_header,
+    NativeApiPath, NativeClient, NativeError, NativeRouteState, is_hop_by_hop_response_header,
 };
 use crate::protocol::{NormalizedResponsesRequest, sanitize_unreplayable_history_for_native};
 
@@ -97,6 +97,12 @@ fn build_router_with_services(
             get(picker_responses_websocket_not_supported).post(picker_responses),
         )
         .route("/v1/responses/compact", post(picker_responses_compact))
+        .route(
+            "/v1/images/generations",
+            post(picker_images_generations),
+        )
+        .route("/v1/images/edits", post(picker_images_edits))
+        .route("/v1/alpha/search", post(picker_alpha_search))
         .route("/_grok/{capability}/healthz", get(healthz))
         .route("/_grok/{capability}/v1/models", get(models))
         .route(
@@ -228,11 +234,11 @@ async fn responses(
     Path(capability): Path<String>,
     request: Request<Body>,
 ) -> Response {
-    route_responses(state, capability, request, NativeResponsesPath::Responses).await
+    route_responses(state, capability, request, NativeApiPath::Responses).await
 }
 
 async fn picker_responses(State(state): State<ServiceState>, request: Request<Body>) -> Response {
-    route_picker_responses(state, request, NativeResponsesPath::Responses).await
+    route_picker_responses(state, request, NativeApiPath::Responses).await
 }
 
 async fn responses_compact(
@@ -240,14 +246,35 @@ async fn responses_compact(
     Path(capability): Path<String>,
     request: Request<Body>,
 ) -> Response {
-    route_responses(state, capability, request, NativeResponsesPath::Compact).await
+    route_responses(state, capability, request, NativeApiPath::Compact).await
 }
 
 async fn picker_responses_compact(
     State(state): State<ServiceState>,
     request: Request<Body>,
 ) -> Response {
-    route_picker_responses(state, request, NativeResponsesPath::Compact).await
+    route_picker_responses(state, request, NativeApiPath::Compact).await
+}
+
+async fn picker_images_generations(
+    State(state): State<ServiceState>,
+    request: Request<Body>,
+) -> Response {
+    route_picker_native_api(state, request, NativeApiPath::ImagesGenerations).await
+}
+
+async fn picker_images_edits(
+    State(state): State<ServiceState>,
+    request: Request<Body>,
+) -> Response {
+    route_picker_native_api(state, request, NativeApiPath::ImagesEdits).await
+}
+
+async fn picker_alpha_search(
+    State(state): State<ServiceState>,
+    request: Request<Body>,
+) -> Response {
+    route_picker_native_api(state, request, NativeApiPath::AlphaSearch).await
 }
 
 async fn responses_websocket_not_supported(
@@ -274,7 +301,7 @@ async fn route_responses(
     state: ServiceState,
     capability: String,
     request: Request<Body>,
-    path: NativeResponsesPath,
+    path: NativeApiPath,
 ) -> Response {
     if !state.capability.matches(&capability) {
         return StatusCode::NOT_FOUND.into_response();
@@ -295,7 +322,7 @@ async fn route_responses(
 async fn route_picker_responses(
     state: ServiceState,
     request: Request<Body>,
-    path: NativeResponsesPath,
+    path: NativeApiPath,
 ) -> Response {
     if !picker_authorized(&state, request.headers()) {
         return StatusCode::UNAUTHORIZED.into_response();
@@ -312,10 +339,32 @@ fn picker_authorized(state: &ServiceState, headers: &HeaderMap) -> bool {
     state.capability.matches(candidate)
 }
 
+async fn route_picker_native_api(
+    state: ServiceState,
+    request: Request<Body>,
+    path: NativeApiPath,
+) -> Response {
+    if !picker_authorized(&state, request.headers()) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Some(native) = state.native else {
+        return route_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "native_route",
+            "server_error",
+            "native_upstream_unavailable",
+            "Native Codex upstream is unavailable",
+        );
+    };
+    let (parts, body) = request.into_parts();
+    let body = reqwest::Body::wrap_stream(body.into_data_stream());
+    native_response(native, path, &parts.headers, body).await
+}
+
 async fn route_authorized_responses(
     state: ServiceState,
     request: Request<Body>,
-    path: NativeResponsesPath,
+    path: NativeApiPath,
 ) -> Response {
     let (parts, body) = request.into_parts();
     let body = match to_bytes(body, MAX_RESPONSES_BODY_BYTES).await {
@@ -376,7 +425,7 @@ async fn route_authorized_responses(
                     );
                 }
             };
-            return native_response(native, path, &parts.headers, body).await;
+            return native_response(native, path, &parts.headers, body.into()).await;
         }
         (true, true) => {
             return route_error(
@@ -399,7 +448,7 @@ async fn route_authorized_responses(
         (false, true) => {}
     }
 
-    if path == NativeResponsesPath::Compact {
+    if path == NativeApiPath::Compact {
         return route_error(
             StatusCode::BAD_REQUEST,
             "grok_compaction",
@@ -550,9 +599,9 @@ async fn route_authorized_responses(
 
 async fn native_response(
     service: Arc<NativeService>,
-    path: NativeResponsesPath,
+    path: NativeApiPath,
     headers: &HeaderMap,
-    body: Bytes,
+    body: reqwest::Body,
 ) -> Response {
     let upstream = match service.client.post(path, headers, body).await {
         Ok(response) => response,
@@ -562,7 +611,7 @@ async fn native_response(
                 "native_transport",
                 "server_error",
                 "native_upstream_unavailable",
-                "Native Codex Responses upstream is unavailable",
+                "Native Codex upstream is unavailable",
             );
         }
     };
@@ -604,12 +653,12 @@ fn decode_request_copy(headers: &HeaderMap, raw: &[u8]) -> Result<Vec<u8>, ()> {
 }
 
 fn native_request_body(
-    path: NativeResponsesPath,
+    path: NativeApiPath,
     headers: &HeaderMap,
     original: Bytes,
     decoded: &[u8],
 ) -> Result<Bytes, ()> {
-    if path != NativeResponsesPath::Responses {
+    if path != NativeApiPath::Responses {
         return Ok(original);
     }
     let mut request: Value = serde_json::from_slice(decoded).map_err(|_| ())?;
@@ -1269,6 +1318,151 @@ mod tests {
         )
         .unwrap();
         (client, state, task)
+    }
+
+    struct NativeApiMockState {
+        observed: Mutex<Vec<(String, HeaderMap, Vec<u8>)>>,
+        response: Vec<u8>,
+    }
+
+    async fn mock_native_api(
+        AxumState(state): AxumState<Arc<NativeApiMockState>>,
+        uri: axum::http::Uri,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Response {
+        state
+            .observed
+            .lock()
+            .unwrap()
+            .push((uri.path().to_owned(), headers, body.to_vec()));
+        let mut response = Body::from(state.response.clone()).into_response();
+        *response.status_mut() = StatusCode::CREATED;
+        response
+            .headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        response
+            .headers_mut()
+            .insert("x-native-proof", HeaderValue::from_static("raw"));
+        response
+    }
+
+    async fn start_native_api_mock() -> (NativeClient, Arc<NativeApiMockState>, JoinHandle<()>) {
+        let state = Arc::new(NativeApiMockState {
+            observed: Mutex::new(Vec::new()),
+            response: br#"{"data":[{"b64_json":"native-image"}]}"#.to_vec(),
+        });
+        let router = Router::new()
+            .route(
+                "/backend-api/codex/images/generations",
+                upstream_post(mock_native_api),
+            )
+            .route(
+                "/backend-api/codex/images/edits",
+                upstream_post(mock_native_api),
+            )
+            .route(
+                "/backend-api/codex/alpha/search",
+                upstream_post(mock_native_api),
+            )
+            .with_state(Arc::clone(&state));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let client = NativeClient::for_test(
+            Url::parse(&format!("http://{address}/backend-api/codex/")).unwrap(),
+        )
+        .unwrap();
+        (client, state, task)
+    }
+
+    #[tokio::test]
+    async fn native_auxiliary_routes_require_picker_auth_and_preserve_transport() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (client, mock, task) = start_native_api_mock().await;
+        let route = NativeRouteState::new(
+            crate::native::NativeUpstream::ChatgptCodex,
+            ["gpt-native".to_owned()],
+        )
+        .unwrap();
+        let app = build_router_with_services(
+            runtime_config(temporary.path()),
+            ModelCatalog::bootstrap().unwrap(),
+            None,
+            Some(Arc::new(NativeService { route, client })),
+            true,
+        );
+
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/images/generations")
+                    .body(Body::from("unauthorized"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        assert!(mock.observed.lock().unwrap().is_empty());
+
+        let cases = [
+            (
+                "/v1/images/generations",
+                "/backend-api/codex/images/generations",
+                br#"{"model":"gpt-image-1","prompt":"draw"}"#.as_slice(),
+            ),
+            (
+                "/v1/images/edits",
+                "/backend-api/codex/images/edits",
+                br#"{"model":"gpt-image-1","images":[],"prompt":"edit"}"#.as_slice(),
+            ),
+            (
+                "/v1/alpha/search",
+                "/backend-api/codex/alpha/search",
+                br#"{"query":"current provider surface"}"#.as_slice(),
+            ),
+        ];
+        for (route, _, body) in cases {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(route)
+                        .header(PICKER_CALLER_HEADER, TOKEN)
+                        .header(CONTENT_TYPE, "application/json")
+                        .header("authorization", "Bearer native-caller-secret")
+                        .header("x-codex-image-turn-id", "turn-native")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+            assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
+            assert_eq!(response.headers()["x-native-proof"], "raw");
+            let response_body = to_bytes(response.into_body(), 4096).await.unwrap();
+            assert_eq!(response_body.as_ref(), mock.response.as_slice());
+        }
+
+        let observed = mock.observed.lock().unwrap();
+        assert_eq!(observed.len(), cases.len());
+        for ((_, expected_path, expected_body), (path, headers, body)) in
+            cases.into_iter().zip(observed.iter())
+        {
+            assert_eq!(path, expected_path);
+            assert_eq!(body, expected_body);
+            assert_eq!(headers[CONTENT_TYPE], "application/json");
+            assert_eq!(headers["authorization"], "Bearer native-caller-secret");
+            assert_eq!(headers["x-codex-image-turn-id"], "turn-native");
+            assert!(headers.get(PICKER_CALLER_HEADER).is_none());
+        }
+        drop(observed);
+        task.abort();
     }
 
     #[tokio::test]

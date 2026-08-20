@@ -148,7 +148,7 @@ V1はcurrent xAI公式Grok Buildが公開するResponses endpointと公式source
 
 ## 14. Codex-facing API
 
-最低限の論理endpointは次の3つ。
+V1.0の最低限の論理endpointは次の3つ。
 
 ```text
 GET  /healthz
@@ -157,6 +157,17 @@ POST /v1/responses
 ```
 
 実runtimeではすべてcapability pathの下へ配置する。
+
+V1.1 merged pickerは、同じprovider base URLを使用する現行CodexのNative補助APIもcaller headerで認証し、Native upstreamへ透過する。
+
+```text
+POST /v1/responses/compact
+POST /v1/images/generations
+POST /v1/images/edits
+POST /v1/alpha/search
+```
+
+`responses`と`responses/compact`はmodel ownershipでNative/Grokを分類する。Images APIとWeb Search APIはendpoint自体をNative所有とし、画像model slugやsearch request bodyをGrok catalogで分類しない。
 
 ## 15. `/healthz`
 
@@ -272,11 +283,11 @@ V1.0完了後の別task。必要に応じて`openai_base_url`、merged model cat
 
 ## 36. V1.1 Routing
 
-将来はrequestのmodel fieldだけでGrok routeとNative GPT passthroughを分ける。これはV1.1 scopeであり、V1.0では実装しない。
+`responses` requestはmodel fieldでGrok routeとNative GPT passthroughを分ける。`images/generations`、`images/edits`、`alpha/search`はNative専用endpointとしてNative upstreamへrouteし、Grok protocol変換へ入れない。これはV1.1 scopeであり、V1.0のcapability pathを変更しない。
 
 ## 37. Native GPT Passthrough
 
-V1.1で必要になった場合、GPT requestのsystem prompt、model、tools、JSON bytes、tool resultsを変更せず、xAI headerを付けず、prompt/bodyをlogしない。Response streamも透過させる。
+V1.1のGPT requestでは、providerをまたいで再生不能なtransport stateだけを狭く除外し、system prompt、model、tools、tool resultsとresponse streamをNative upstreamへ転送する。Images APIとWeb Search APIはrequest headers/bodyおよびresponse status/headers/bodyを変換せず透過する。いずれのNative routeにもxAI headerを付けず、prompt/bodyをlogしない。loopback caller認証にだけ使う`x-grok-caller-capability`はNative upstreamへ転送しない。
 
 ## 38. Native Upstream Discovery
 
@@ -439,6 +450,7 @@ V1.0とは別taskで扱う。
 - [ ] Native GPTとGrokをCodex Desktop GUI model pickerでそれぞれ独立選択できる。
 - [ ] GPT trafficがxAIへ行かず、Grok trafficがOpenAI inferenceへ行かない。
 - [ ] GPT request/response streamを変更しない。
+- [ ] Native画像生成・画像編集・Web Searchがmerged picker経由で動く。
 - [ ] GrokがCodex toolsとComputer Useを利用し続ける。
 - [ ] Complete rollbackが動く。
 

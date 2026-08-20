@@ -3,13 +3,14 @@ use std::fs;
 use std::io::Read;
 use std::path::Path;
 
-use axum::body::Bytes;
 use axum::http::header::{CONNECTION, CONTENT_LENGTH, HOST, TRANSFER_ENCODING};
 use axum::http::{HeaderMap, HeaderName};
 use reqwest::redirect::Policy;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
+
+use crate::lifecycle::PICKER_CALLER_HEADER;
 
 const ROUTE_STATE_VERSION: u32 = 1;
 const MAX_ROUTE_STATE_BYTES: u64 = 1024 * 1024;
@@ -169,9 +170,9 @@ impl NativeClient {
 
     pub(crate) async fn post(
         &self,
-        suffix: NativeResponsesPath,
+        suffix: NativeApiPath,
         incoming_headers: &HeaderMap,
-        body: Bytes,
+        body: reqwest::Body,
     ) -> Result<reqwest::Response, NativeError> {
         let url = self
             .base_url
@@ -179,7 +180,7 @@ impl NativeClient {
             .map_err(|_| NativeError::UnsupportedUpstream)?;
         let mut headers = HeaderMap::new();
         for (name, value) in incoming_headers {
-            if !is_hop_by_hop_request_header(name) {
+            if !is_hop_by_hop_request_header(name) && name.as_str() != PICKER_CALLER_HEADER {
                 headers.append(name.clone(), value.clone());
             }
         }
@@ -194,16 +195,22 @@ impl NativeClient {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum NativeResponsesPath {
+pub(crate) enum NativeApiPath {
     Responses,
     Compact,
+    ImagesGenerations,
+    ImagesEdits,
+    AlphaSearch,
 }
 
-impl NativeResponsesPath {
+impl NativeApiPath {
     fn relative_path(self) -> &'static str {
         match self {
             Self::Responses => "responses",
             Self::Compact => "responses/compact",
+            Self::ImagesGenerations => "images/generations",
+            Self::ImagesEdits => "images/edits",
+            Self::AlphaSearch => "alpha/search",
         }
     }
 }
