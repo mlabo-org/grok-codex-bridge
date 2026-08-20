@@ -83,7 +83,7 @@ grok-codex-bridge（Rust製ネイティブ実行ファイル）
 Grok / xAI
 ```
 
-ブリッジ自身はツールを実行しません。validな関数定義、順序付きツール呼び出しと結果、テキスト、画像URLとdata URI、reasoning summary、必要なResponses制御値を保持し、実行責任はCodexに残します。providerで再生できないlocal/foreign transport artifactだけを狭く除外し、Codexのsession/replay状態や、既存の混在provider履歴をブリッジが再構成することは保証しません。
+ブリッジ自身はツールを実行しません。validな関数定義、順序付きツール呼び出しと結果、テキスト、画像URLとdata URI、reasoning summary、必要なResponses制御値を保持し、実行責任はCodexに残します。GPT/Grok切替時はproviderで再生できないitem IDとreasoning stateだけを除外し、tool call/outputを結ぶ`call_id`を保持します。
 
 ## 現在の状態
 
@@ -91,7 +91,7 @@ Grok / xAI
 | --- | --- |
 | V1.0 分離型 `grok-bridge` プロファイル | 実装済み・Codex CLIで検証済み |
 | Rustネイティブビルドと可逆なユーザーサービス | 実装済み・検証済み |
-| V1.1 Native GPT/Grok統合モデルピッカー | 実装済み・CLIでの切替を検証済み。混在providerの継続性はCodexが所有 |
+| V1.1 Native GPT/Grok統合モデルピッカー | 実装済み・CLIでの切替を検証済み。supportedなmessage/function/tool-search履歴の双方向切替をbridge境界で保持 |
 | V1.1 Skillsメタデータ予算 | Grokカタログに272,000トークンを設定し、Codex標準の2%計算を使用 |
 | Desktopピッカーと最終rollback受け入れ | 最終検証待ち |
 | 公開リリースバイナリ | 提供しません。ソースからbuild・materializeしてください |

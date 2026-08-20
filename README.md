@@ -86,7 +86,7 @@ grok-codex-bridge (native Rust executable)
 Grok / xAI
 ```
 
-The bridge does not execute tool calls. It preserves valid function definitions, ordered tool calls and results, text, image URLs and data URIs, reasoning summaries, and required Responses controls while Codex remains responsible for execution. Provider-unreplayable local or foreign transport artifacts are excluded narrowly; the bridge does not reconstruct the complete Codex session/replay state or legacy mixed-provider continuity.
+The bridge does not execute tool calls. It preserves valid function definitions, ordered tool calls and results, text, image URLs and data URIs, reasoning summaries, and required Responses controls while Codex remains responsible for execution. On GPT/Grok switches it excludes only provider-unreplayable item IDs and reasoning state while preserving the `call_id` links between tool calls and outputs.
 
 ## Project status
 
@@ -94,7 +94,7 @@ The bridge does not execute tool calls. It preserves valid function definitions,
 | --- | --- |
 | V1.0 isolated `grok-bridge` profile | Implemented and validated in the Codex CLI |
 | Native Rust build and reversible user service | Implemented and validated |
-| V1.1 merged Native GPT/Grok model picker | Implemented; CLI switching validated; mixed-provider continuity remains Codex-owned |
+| V1.1 merged Native GPT/Grok model picker | Implemented; CLI switching validated; bidirectional switching preserves supported message/function/tool-search history at the bridge boundary |
 | V1.1 skill metadata budget | Grok catalog entries publish a 272,000-token context window, using Codex's native 2% calculation |
 | Desktop picker and final rollback acceptance | Pending final verification |
 | Public release binaries | Not published; build and materialize from source |

@@ -180,7 +180,7 @@ refreshはResponses backend、non-empty model ID、xAI allowlisted inference ori
 
 Principal endpointは`POST /v1/responses`。処理は`Codex Responses request → bridge-owned provider projection → xAI Responses request`とする。current両端がResponses contractを使用するため、legacy Chat Completionsへの変換は行わない。ここでの境界はcodex-routerで観測できるCodex実装の許容的なtransport挙動と、実装時点の公式Grok client contractに合わせる。codex-routerは参考実装であり、protocol authorityではない。
 
-Grok leafは`store: false`で全履歴をrequestに含め、providerが必要とするフィールドだけを変換する。bridgeはCodexのsession/replay stateを完全に再構成しない。`previous_response_id`、prompt-cache state、reasoning provenance semantics、Codexの全transport lifecycleはCodexが所有する。混在providerの既存session continuityもCodexの責務であり、bridgeはlegacy cross-provider transport stateの再生を保証しない。
+Grok leafは`store: false`で全履歴をrequestに含め、providerが必要とするフィールドだけを変換する。Codexはsession assemblyとtool executionを所有し、bridgeはpicker配下のGPT/Grok切替境界を所有する。supportedなmessage、function call/output、tool search履歴では、provider保存用item `id`とreasoning ciphertextを別providerへ持ち込まず、tool実行を結ぶ`call_id`を保持して、同一session内の双方向切替を成立させる。`previous_response_id`、prompt-cache state、Codexの全transport lifecycleはCodexが所有する。
 
 ## 18. Provider Projection
 
@@ -248,7 +248,7 @@ Codexが必要とする場合、Bridge生成IDは`resp_<uuid>`、`msg_<uuid>`、
 
 ## 30. Reasoning
 
-V1はhidden chain-of-thoughtを生成、推測、偽造しない。Grokが返した公開可能なreasoning summaryだけをCodex表示へ投影する。reasoning provenance semanticsやprompt-cache stateをbridgeが完全に再構成することは保証しない。`store: false`で再利用不能なGrok由来reasoning itemをNative GPT requestへ持ち込まない判断は、Codex-owned mixed-provider continuityの一部として扱う。
+V1はhidden chain-of-thoughtを生成、推測、偽造しない。Grokが返した公開可能なreasoning summaryだけをCodex表示へ投影する。reasoning provenance semanticsやprompt-cache stateをbridgeが完全に再構成することは保証しない。`store: false`のmixed-provider replayでは、再利用不能なreasoning itemとprovider保存用のmessage/function item `id`をNative GPT requestから除外し、function/tool outputの`call_id`を保持する。Native `tool_search_call`では正規の`tsc_` item IDだけを再送する。
 
 ## 31. Hosted Search
 

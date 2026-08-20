@@ -859,13 +859,17 @@ impl PriorReasoning {
     }
 }
 
-/// Removes the complete reasoning history when a `store: false` Native GPT
-/// request contains evidence of a Grok turn. Bridge-enveloped items came from
-/// current Grok output; explicit null items identify repaired legacy Grok
-/// history. Removing the whole reasoning family also covers older untagged
-/// Grok items from the same mixed-provider session instead of failing once per
-/// historical item. Native-only GPT sessions remain byte-for-byte intact.
-pub fn remove_unreplayable_reasoning_for_native(request: &mut Value) -> bool {
+/// Removes provider-bound replay state before a `store: false` mixed-provider
+/// request is forwarded to Native GPT.
+///
+/// Bridge-enveloped or explicitly null reasoning identifies Grok history. In
+/// that case the complete reasoning family and provider-owned item IDs are not
+/// portable to the Native Responses store, while function `call_id` values are
+/// retained so Codex can preserve tool call/output pairs. Native tool-search
+/// IDs are only replayable with Codex's `tsc_` prefix, so malformed or foreign
+/// IDs are removed even when older history lacks reasoning provenance.
+/// Native-only GPT sessions otherwise remain byte-for-byte intact.
+pub fn sanitize_unreplayable_history_for_native(request: &mut Value) -> bool {
     let Some(object) = request.as_object_mut() else {
         return false;
     };
@@ -888,16 +892,40 @@ pub fn remove_unreplayable_reasoning_for_native(request: &mut Value) -> bool {
             _ => false,
         }
     });
-    if !contains_grok_reasoning {
-        return false;
+    let mut changed = false;
+    if contains_grok_reasoning {
+        let original_len = input.len();
+        input.retain(|item| {
+            item.as_object()
+                .and_then(|item| item.get("type"))
+                .and_then(Value::as_str)
+                != Some("reasoning")
+        });
+        changed = input.len() != original_len;
     }
-    input.retain(|item| {
-        item.as_object()
-            .and_then(|item| item.get("type"))
-            .and_then(Value::as_str)
-            != Some("reasoning")
-    });
-    true
+
+    for item in input {
+        let Some(item) = item.as_object_mut() else {
+            continue;
+        };
+        let Some(item_type) = item.get("type").and_then(Value::as_str) else {
+            continue;
+        };
+        let remove_provider_id = contains_grok_reasoning
+            && matches!(
+                item_type,
+                "message" | "function_call" | "function_call_output"
+            );
+        let remove_invalid_tool_search_id = item_type == "tool_search_call"
+            && item
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| !id.starts_with("tsc_"));
+        if (remove_provider_id || remove_invalid_tool_search_id) && item.remove("id").is_some() {
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn parse_prior_reasoning_parts(
@@ -3210,7 +3238,7 @@ mod tests {
     }
 
     #[test]
-    fn model_switch_native_cleanup_requires_grok_history_evidence() {
+    fn model_switch_native_only_history_stays_byte_exact_without_foreign_replay_state() {
         let mut native_only = json!({
             "store": false,
             "input": [
@@ -3219,14 +3247,81 @@ mod tests {
                     "summary": [], "encrypted_content": "native-gpt-ciphertext"
                 },
                 {
-                    "type": "message", "role": "user",
+                    "type": "message", "id": "msg_native", "role": "user",
                     "content": [{"type": "input_text", "text": "continue"}]
+                },
+                {
+                    "type": "tool_search_call", "id": "tsc_native",
+                    "call_id": "search-native", "execution": "client",
+                    "arguments": {"query": "status"}
                 }
             ]
         });
         let original = native_only.clone();
-        assert!(!remove_unreplayable_reasoning_for_native(&mut native_only));
+        assert!(!sanitize_unreplayable_history_for_native(&mut native_only));
         assert_eq!(native_only, original);
+    }
+
+    #[test]
+    fn model_switch_mixed_provider_native_replay_drops_ids_and_keeps_tool_pairs() {
+        let mut mixed = two_turn_reasoning_request();
+        mixed["input"].as_array_mut().unwrap().push(json!({
+            "type": "tool_search_call", "id": "msg_foreign_tool_search",
+            "call_id": "search-1", "execution": "client",
+            "arguments": {"limit": 8, "query": "generate_image_grid"}
+        }));
+        mixed["input"].as_array_mut().unwrap().push(json!({
+            "type": "tool_search_call", "id": "tsc_native_tool_search",
+            "call_id": "search-2", "execution": "client",
+            "arguments": {"limit": 8, "query": "codex_image_grid"}
+        }));
+
+        assert!(sanitize_unreplayable_history_for_native(&mut mixed));
+        let input = mixed["input"].as_array().unwrap();
+        assert!(input.iter().all(|item| item["type"] != "reasoning"));
+        assert!(
+            input
+                .iter()
+                .filter(|item| matches!(
+                    item["type"].as_str(),
+                    Some("message" | "function_call" | "function_call_output")
+                ))
+                .all(|item| item.get("id").is_none())
+        );
+        let function_call = input
+            .iter()
+            .find(|item| item["type"] == "function_call")
+            .unwrap();
+        let function_output = input
+            .iter()
+            .find(|item| item["type"] == "function_call_output")
+            .unwrap();
+        assert_eq!(function_call["call_id"], "call_turn_1");
+        assert_eq!(function_output["call_id"], "call_turn_1");
+        let searches = input
+            .iter()
+            .filter(|item| item["type"] == "tool_search_call")
+            .collect::<Vec<_>>();
+        assert_eq!(searches[0].get("id"), None);
+        assert_eq!(searches[0]["call_id"], "search-1");
+        assert_eq!(searches[1]["id"], "tsc_native_tool_search");
+    }
+
+    #[test]
+    fn model_switch_legacy_foreign_tool_search_id_is_removed_without_reasoning_provenance() {
+        let mut request = json!({
+            "store": false,
+            "input": [{
+                "type": "tool_search_call",
+                "id": "msg_e2a2848a-4ab3-9328-a1b4-c2318babb894",
+                "call_id": "search-1",
+                "execution": "client",
+                "arguments": {"limit": 8, "query": "generate_image_grid"}
+            }]
+        });
+        assert!(sanitize_unreplayable_history_for_native(&mut request));
+        assert!(request["input"][0].get("id").is_none());
+        assert_eq!(request["input"][0]["call_id"], "search-1");
     }
 
     #[test]
