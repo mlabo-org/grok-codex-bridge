@@ -5,7 +5,8 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::thread;
+use std::time::{Duration as StdDuration, Instant, SystemTime};
 
 use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
@@ -16,6 +17,7 @@ const XAI_SCOPE_PREFIX: &str = "https://auth.x.ai::";
 const XAI_ISSUER: &str = "https://auth.x.ai";
 const TOKEN_TTL: Duration = Duration::days(30);
 const MAX_AUTH_FILE_BYTES: u64 = 1024 * 1024;
+const RENEWAL_POLL_INTERVAL: StdDuration = StdDuration::from_millis(250);
 
 pub struct CredentialStore {
     path: PathBuf,
@@ -71,6 +73,33 @@ impl CredentialStore {
             credential: Arc::clone(&credential),
         });
         Ok(credential)
+    }
+
+    /// Waits briefly for the official Grok flow to replace a credential that
+    /// expired while this long-lived bridge process was asleep.
+    ///
+    /// This method never refreshes, rewrites, or sends the expired credential.
+    /// It only repeats the same read-only load until the authoritative file is
+    /// replaced or the bounded grace period ends.
+    pub fn load_with_renewal_grace(
+        &self,
+        grace_period: StdDuration,
+    ) -> Result<Arc<SessionCredential>, CredentialError> {
+        let deadline = Instant::now() + grace_period;
+        loop {
+            match self.load() {
+                Ok(credential) => return Ok(credential),
+                Err(error) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if !matches!(error, CredentialError::ExpiredSessionCredential)
+                        || remaining.is_zero()
+                    {
+                        return Err(error);
+                    }
+                    thread::sleep(RENEWAL_POLL_INTERVAL.min(remaining));
+                }
+            }
+        }
     }
 }
 
@@ -385,5 +414,30 @@ mod tests {
             parse_auth_map(ambiguous),
             Err(CredentialError::AmbiguousSessionCredential)
         ));
+    }
+
+    #[test]
+    fn expired_credential_waits_for_official_file_replacement() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("auth.json");
+        write_auth(&path, &record("expired", "2020-01-01T00:00:00Z"), 0o600);
+        let store = CredentialStore::new(path.clone()).unwrap();
+
+        let replacement_path = temporary.path().join("auth.json.renewed");
+        let renew = thread::spawn(move || {
+            thread::sleep(StdDuration::from_millis(25));
+            write_auth(
+                &replacement_path,
+                &record("renewed", "2099-01-01T00:00:00Z"),
+                0o600,
+            );
+            fs::rename(replacement_path, path).unwrap();
+        });
+
+        let credential = store
+            .load_with_renewal_grace(StdDuration::from_secs(1))
+            .unwrap();
+        renew.join().unwrap();
+        assert_eq!(credential.token(), "renewed");
     }
 }

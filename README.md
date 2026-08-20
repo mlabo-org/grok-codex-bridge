@@ -223,7 +223,7 @@ The lifecycle manifest owns only files created or replaced by the bridge. Full u
 
 ## Model catalog and credentials
 
-The bridge discovers the official Grok session credential from the configured `GROK_AUTH_PATH`, an absolute `GROK_HOME`, or the official default Grok home. The selected credential file is opened read-only without following symlinks. Login, token refresh, and credential repair remain the responsibility of the official Grok flow.
+The bridge discovers the official Grok session credential from the configured `GROK_AUTH_PATH`, an absolute `GROK_HOME`, or the official default Grok home. The selected credential file is opened read-only without following symlinks. After a long system sleep, a Responses request waits up to 60 seconds for the official Grok flow to replace an expired credential file before returning a login error. The bridge never performs OAuth refresh or rewrites the credential; login, token refresh, and credential repair remain the responsibility of the official Grok flow.
 
 Request one bounded official catalog refresh without starting the server:
 

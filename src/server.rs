@@ -1,6 +1,7 @@
 use std::io::{self, Cursor, Read};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::{Path, State};
@@ -28,6 +29,7 @@ use crate::protocol::{NormalizedResponsesRequest, remove_unreplayable_reasoning_
 const MAX_RESPONSES_BODY_BYTES: usize = 16 * 1024 * 1024;
 const DISABLE_ENVIRONMENT_VARIABLE: &str = "GROK_CODEX_BRIDGE_DISABLE";
 const X_GROK_UPSTREAM_STATUS: &str = "x-grok-upstream-status";
+const CREDENTIAL_RENEWAL_GRACE: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 struct ServiceState {
@@ -476,7 +478,12 @@ async fn route_authorized_responses(
         );
     };
     let credential_store = Arc::clone(&service.credentials);
-    let credential = match tokio::task::spawn_blocking(move || credential_store.load()).await {
+    let credential_renewal_grace = service.credential_renewal_grace;
+    let credential = match tokio::task::spawn_blocking(move || {
+        credential_store.load_with_renewal_grace(credential_renewal_grace)
+    })
+    .await
+    {
         Ok(Ok(credential)) => credential,
         Ok(Err(_)) => {
             return route_error(
@@ -677,6 +684,7 @@ fn responses_disabled_from_environment() -> bool {
 struct ResponsesService {
     credentials: Arc<CredentialStore>,
     client: GrokClient,
+    credential_renewal_grace: Duration,
 }
 
 #[derive(Clone)]
@@ -692,6 +700,7 @@ impl ResponsesService {
                 CredentialStore::from_environment().map_err(ServerError::CredentialSource)?,
             ),
             client: GrokClient::production().map_err(ServerError::UpstreamClient)?,
+            credential_renewal_grace: CREDENTIAL_RENEWAL_GRACE,
         })
     }
 }
@@ -1037,12 +1046,29 @@ mod tests {
         credentials: CredentialStore,
         client: GrokClient,
     ) -> Router {
+        test_app_with_renewal_grace(
+            config,
+            catalog,
+            credentials,
+            client,
+            Duration::ZERO,
+        )
+    }
+
+    fn test_app_with_renewal_grace(
+        config: RuntimeConfig,
+        catalog: ModelCatalog,
+        credentials: CredentialStore,
+        client: GrokClient,
+        credential_renewal_grace: Duration,
+    ) -> Router {
         build_router_with_responses(
             config,
             catalog,
             Some(Arc::new(ResponsesService {
                 credentials: Arc::new(credentials),
                 client,
+                credential_renewal_grace,
             })),
             false,
         )
@@ -1418,6 +1444,7 @@ mod tests {
                     CredentialStore::new(temporary.path().join("missing-auth.json")).unwrap(),
                 ),
                 client,
+                credential_renewal_grace: Duration::ZERO,
             })),
             true,
         );
@@ -1969,6 +1996,50 @@ mod tests {
             "grok_login_required"
         );
         assert_eq!(mock.hits.load(Ordering::SeqCst), 0);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn expired_local_credential_waits_for_official_renewal_before_upstream() {
+        let temporary = tempfile::tempdir().unwrap();
+        let auth_path = temporary.path().join("auth.json");
+        fs::write(
+            &auth_path,
+            br#"{"https://auth.x.ai::current-client":{"key":"expired","auth_mode":"oidc","create_time":"2019-01-01T00:00:00Z","user_id":"user-1","expires_at":"2020-01-01T00:00:00Z","oidc_issuer":"https://auth.x.ai"}}"#,
+        )
+        .unwrap();
+        fs::set_permissions(&auth_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let (client, mock, task) = start_mock(MockReply::Valid).await;
+        let app = test_app_with_renewal_grace(
+            runtime_config(temporary.path()),
+            ModelCatalog::bootstrap().unwrap(),
+            CredentialStore::new(auth_path.clone()).unwrap(),
+            client,
+            Duration::from_secs(1),
+        );
+
+        let renewed_path = temporary.path().join("auth.json.renewed");
+        let renew = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            fs::write(
+                &renewed_path,
+                br#"{"https://auth.x.ai::current-client":{"key":"renewed-session-secret","auth_mode":"oidc","create_time":"2026-08-21T00:00:00Z","user_id":"user-1","expires_at":"2099-01-01T00:00:00Z","oidc_issuer":"https://auth.x.ai"}}"#,
+            )
+            .unwrap();
+            fs::set_permissions(&renewed_path, fs::Permissions::from_mode(0o600)).unwrap();
+            fs::rename(renewed_path, auth_path).unwrap();
+        });
+
+        let response = send(app, TOKEN, request_body("grok-4.6").to_string()).await;
+        renew.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        assert_eq!(mock.hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            mock.observed.lock().unwrap()[0].0["authorization"],
+            "Bearer renewed-session-secret"
+        );
         task.abort();
     }
 
