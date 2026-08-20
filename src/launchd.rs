@@ -4,6 +4,8 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::Duration;
 
 use thiserror::Error;
 
@@ -13,6 +15,8 @@ const LAUNCHCTL_PATH: &str = "/bin/launchctl";
 const INSTALLED_BINARY_NAME: &str = "grok-codex-bridge";
 const LAUNCH_AGENT_MODE: u32 = 0o644;
 const MAX_LAUNCH_AGENT_BYTES: u64 = 1024 * 1024;
+const SERVICE_STATE_POLL_ATTEMPTS: usize = 100;
+const SERVICE_STATE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LaunchAgentSpec {
@@ -155,13 +159,24 @@ pub enum ServiceStatus {
 pub fn service_install(spec: &LaunchAgentSpec, plist_path: &Path) -> Result<(), LaunchdError> {
     let uid = effective_user_id()?;
     let mut runner = SystemLaunchctlRunner;
-    service_install_with_runner(spec, plist_path, uid, &mut runner)
+    service_install_and_wait_with_runner(
+        spec,
+        plist_path,
+        uid,
+        &mut runner,
+        SERVICE_STATE_POLL_INTERVAL,
+    )
 }
 
 pub fn service_uninstall(spec: &LaunchAgentSpec) -> Result<ServiceUninstallOutcome, LaunchdError> {
     let uid = effective_user_id()?;
     let mut runner = SystemLaunchctlRunner;
-    service_uninstall_with_runner(spec, uid, &mut runner)
+    service_uninstall_and_wait_with_runner(
+        spec,
+        uid,
+        &mut runner,
+        SERVICE_STATE_POLL_INTERVAL,
+    )
 }
 
 pub fn service_status(spec: &LaunchAgentSpec) -> Result<ServiceStatus, LaunchdError> {
@@ -230,6 +245,72 @@ pub enum LaunchdError {
         operation: LaunchctlOperation,
         exit_code: Option<i32>,
     },
+    #[error("launchd service did not reach {expected} state before the bounded deadline")]
+    ServiceStateTimeout { expected: &'static str },
+}
+
+fn service_install_and_wait_with_runner<R: LaunchctlRunner>(
+    spec: &LaunchAgentSpec,
+    plist_path: &Path,
+    uid: u32,
+    runner: &mut R,
+    poll_interval: Duration,
+) -> Result<(), LaunchdError> {
+    service_install_with_runner(spec, plist_path, uid, runner)?;
+    wait_for_service_state_with_runner(
+        spec,
+        uid,
+        runner,
+        ServiceStatus::Loaded,
+        "loaded",
+        poll_interval,
+    )
+}
+
+fn service_uninstall_and_wait_with_runner<R: LaunchctlRunner>(
+    spec: &LaunchAgentSpec,
+    uid: u32,
+    runner: &mut R,
+    poll_interval: Duration,
+) -> Result<ServiceUninstallOutcome, LaunchdError> {
+    let outcome = service_uninstall_with_runner(spec, uid, runner)?;
+    if outcome == ServiceUninstallOutcome::Stopped {
+        wait_for_service_state_with_runner(
+            spec,
+            uid,
+            runner,
+            ServiceStatus::NotLoaded,
+            "not_loaded",
+            poll_interval,
+        )?;
+    }
+    Ok(outcome)
+}
+
+fn wait_for_service_state_with_runner<R: LaunchctlRunner>(
+    spec: &LaunchAgentSpec,
+    uid: u32,
+    runner: &mut R,
+    expected: ServiceStatus,
+    expected_name: &'static str,
+    poll_interval: Duration,
+) -> Result<(), LaunchdError> {
+    for attempt in 0..SERVICE_STATE_POLL_ATTEMPTS {
+        match service_status_with_runner(spec, uid, runner)? {
+            status if status == expected => return Ok(()),
+            ServiceStatus::Failed { exit_code } => {
+                return Err(LaunchdError::LaunchctlFailed {
+                    operation: LaunchctlOperation::Print,
+                    exit_code,
+                });
+            }
+            _ if attempt + 1 < SERVICE_STATE_POLL_ATTEMPTS => thread::sleep(poll_interval),
+            _ => break,
+        }
+    }
+    Err(LaunchdError::ServiceStateTimeout {
+        expected: expected_name,
+    })
 }
 
 fn service_install_with_runner<R: LaunchctlRunner>(
@@ -760,6 +841,69 @@ mod tests {
                         &["kickstart", "-k", "gui/501/com.local.grok-codex-bridge",]
                     ),
                 },
+            ]
+        );
+    }
+
+    #[test]
+    fn service_lifecycle_waits_for_launchd_state_convergence() {
+        let spec = spec();
+        let temporary = tempfile::tempdir().unwrap();
+        let plist_path = write_admitted_plist(&spec, temporary.path());
+        let exact = format!(
+            "Could not find service \"{}\" in domain for user gui: {UID}",
+            RECOMMENDED_LAUNCH_AGENT_LABEL
+        );
+
+        let mut install_runner = FakeRunner::new([
+            success(),
+            success(),
+            failure(113, &exact),
+            success(),
+        ]);
+        service_install_and_wait_with_runner(
+            &spec,
+            &plist_path,
+            UID,
+            &mut install_runner,
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert_eq!(
+            install_runner
+                .commands
+                .iter()
+                .map(|command| command.operation)
+                .collect::<Vec<_>>(),
+            vec![
+                LaunchctlOperation::Bootstrap,
+                LaunchctlOperation::Kickstart,
+                LaunchctlOperation::Print,
+                LaunchctlOperation::Print,
+            ]
+        );
+
+        let mut uninstall_runner = FakeRunner::new([success(), success(), failure(113, &exact)]);
+        assert_eq!(
+            service_uninstall_and_wait_with_runner(
+                &spec,
+                UID,
+                &mut uninstall_runner,
+                Duration::ZERO,
+            )
+            .unwrap(),
+            ServiceUninstallOutcome::Stopped
+        );
+        assert_eq!(
+            uninstall_runner
+                .commands
+                .iter()
+                .map(|command| command.operation)
+                .collect::<Vec<_>>(),
+            vec![
+                LaunchctlOperation::Bootout,
+                LaunchctlOperation::Print,
+                LaunchctlOperation::Print,
             ]
         );
     }
