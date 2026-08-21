@@ -62,7 +62,7 @@ For an official Grok Build login, the session inference host is `cli-chat-proxy.
 - Model catalog endpoint: `GET /models`.
 - Stream transport: SSE with `stream: true` and `Accept: text/event-stream`.
 - Credential source: `$GROK_AUTH_PATH` when set, otherwise `$GROK_HOME/auth.json`, with `$GROK_HOME` falling back to `~/.grok`.
-- `auth.json` is a scope-to-record JSON map. The selected current session record contains at least `key`, `auth_mode`, `create_time`, and `user_id`, with optional expiry and profile fields. V1.0 reads it in place and never refreshes or rewrites it.
+- `auth.json` is a scope-to-record JSON map. The selected current session record contains at least `key`, `auth_mode`, `create_time`, and `user_id`, with optional expiry and profile fields. V1.0 reads it in place and never handles a refresh token or rewrites it. When the selected record is hard-expired, the bridge may invoke the sibling official `bin/grok models` command non-interactively; the official process owns any silent OIDC refresh, and the bridge only rereads the file afterward.
 - A hard-expired access token is not sent. Missing, expired, 401, or 403 state stops with guidance to use the official `grok login` path.
 
 The official source attaches `Authorization: Bearer <session token>`, `X-XAI-Token-Auth: xai-grok-cli`, `x-authenticateresponse: authenticate-response`, `x-grok-client-mode`, truthful request/conversation identifiers, and `x-grok-model-override`. The bridge will identify itself truthfully as `grok-codex-bridge`; it will not impersonate the Grok Build User-Agent or client identifier. Redirects may not carry the bearer to another origin.
@@ -107,4 +107,3 @@ No reference implementation code was copied into this repository during R0. The 
 - R0 did not read the user's real Grok credential, call the live model catalog, consume inference quota, mutate Codex configuration, or activate a service.
 - Phase B must prove strict catalog/auth parsing with fixtures before any explicitly authorized live check.
 - Phase G owns the first quota-bearing end-to-end proof and the exact live entitlement result.
-
