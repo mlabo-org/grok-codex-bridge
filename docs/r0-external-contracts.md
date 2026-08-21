@@ -61,8 +61,8 @@ For an official Grok Build login, the session inference host is `cli-chat-proxy.
 - Inference endpoint: `POST /responses`.
 - Model catalog endpoint: `GET /models`.
 - Stream transport: SSE with `stream: true` and `Accept: text/event-stream`.
-- Credential source: `$GROK_AUTH_PATH` when set, otherwise `$GROK_HOME/auth.json`, with `$GROK_HOME` falling back to `~/.grok`.
-- `auth.json` is a scope-to-record JSON map. The selected current session record contains at least `key`, `auth_mode`, `create_time`, and `user_id`, with optional expiry and profile fields. V1.0 reads it in place and never handles a refresh token or rewrites it. When the selected record is hard-expired, the bridge may invoke the sibling official `bin/grok models` command non-interactively; the official process owns any silent OIDC refresh, and the bridge only rereads the file afterward.
+- Credential source: `$GROK_AUTH_PATH` when set, otherwise `$GROK_HOME/auth.json`, with `$GROK_HOME` falling back to `~/.grok`. If `$GROK_AUTH_PATH` points outside the official home, `$GROK_HOME` must also identify that home so the bridge can resolve its official CLI helper.
+- `auth.json` is a scope-to-record JSON map. The selected current session record contains at least `key`, `auth_mode`, `create_time`, and `user_id`, with optional expiry and profile fields. V1.0 inspects it in place and never handles a refresh token or rewrites it. If `expires_at` is absent, the bridge uses `create_time + 30 days` as a parser fallback. When the selected record is hard-expired during a provider request, the bridge may invoke the official `bin/grok models` command non-interactively once, with a 7-second timeout and disconnected standard streams; the official process owns any silent OIDC refresh, and the bridge only rereads the file afterward for up to the 60-second request grace.
 - A hard-expired access token is not sent. Missing, expired, 401, or 403 state stops with guidance to use the official `grok login` path.
 
 The official source attaches `Authorization: Bearer <session token>`, `X-XAI-Token-Auth: xai-grok-cli`, `x-authenticateresponse: authenticate-response`, `x-grok-client-mode`, truthful request/conversation identifiers, and `x-grok-model-override`. The bridge will identify itself truthfully as `grok-codex-bridge`; it will not impersonate the Grok Build User-Agent or client identifier. Redirects may not carry the bearer to another origin.
@@ -84,7 +84,7 @@ V1.0 must not compile one permanent Grok model slug into its routing logic.
 - Only entries with a non-empty stable identifier/model, a Responses backend, and an allowed xAI inference base are admitted. Hidden, unsupported, malformed, legacy-protocol, or alternate-origin entries are rejected.
 - Refresh replacement is atomic and origin-scoped. An empty, malformed, unauthorized, or failed response leaves the last-known-good catalog unchanged.
 - The bridge exposes the current admitted catalog through its own capability-scoped `/v1/models`; a request naming a model outside that catalog fails explicitly.
-- Startup may perform one bounded refresh, and `catalog refresh` provides an explicit refresh. V1.0 does not add an unattended polling loop.
+- Startup may perform one bounded catalog refresh, and `catalog refresh` provides an explicit refresh. Both catalog paths require a currently usable credential and use direct credential loading; neither invokes the hard-expiry renewal helper. That helper is limited to the Responses provider request path. V1.0 does not add an unattended polling loop.
 
 This lets a future officially published model such as `grok-4.7` become available after a successful official-catalog refresh without a bridge code release. It does not add the model to the native Codex picker; that remains V1.1 and is excluded.
 

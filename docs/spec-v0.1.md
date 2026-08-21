@@ -97,7 +97,7 @@ V1.0安定後の別slice。GPTとGrokをCodex CLIのmodel pickerとCodex Desktop
 │ grok-codex-bridge                           │
 │ Responses provider projection              │
 │ Tool namespace projection / SSE extraction  │
-│ OAuth credential reader / xAI client       │
+│ Read-only credential boundary / xAI client │
 └──────────────────┬──────────────────────────┘
                    │ Responses API
                    ▼
@@ -132,15 +132,15 @@ capability token、完全なcapability URLをlogへ出さない。
 
 ## 10. Grok Credential
 
-候補sourceは`$GROK_HOME/auth.json`、未設定時は`~/.grok/auth.json`。current official contractで確認してから実装する。credentialはread-onlyでin-place参照し、repo、Codex config、log、SQLite、JSON cache、environment dumpへ複製しない。
+credential sourceは、`$GROK_AUTH_PATH`、次に`$GROK_HOME/auth.json`、最後に`~/.grok/auth.json`の順で解決する。current official contractで確認してから実装する。credentialはbridgeがread-onlyでin-place検査し、repo、Codex config、log、SQLite、JSON cache、environment dumpへ複製しない。`$GROK_AUTH_PATH`を公式home外へ設定する場合は、公式CLIの更新helperを解決するため`$GROK_HOME`も設定する。
 
 ## 11. Credential Cache
 
-Access tokenのmemory cacheは許容する。disk再保存、debug print、panic dumpは禁止する。secret保持型を使い、process exit時は可能な範囲でzeroizeする。credential fileのmtime変化を検出して再読込する。長時間sleepからの復帰時にcredentialが期限切れなら、bridgeは同じGrok homeの公式`bin/grok models`をstdin/stdout/stderr切断・短時間で一度だけ起動し、公式プロセス自身のsilent OIDC refreshを促す。その後、Responses requestは最大60秒だけauthoritative fileのread-only再読込を待ってから判定する。bridgeはrefresh tokenを読まず、OAuthを実装せず、対話loginやcredential変更、upstream request再送を行わない。
+Access tokenのmemory cacheは許容する。disk再保存、debug print、panic dumpは禁止する。secret保持型を使い、process exit時は可能な範囲でzeroizeする。credential fileのmtime変化を検出して再読込する。公式session recordに`expires_at`があればそれを使い、無ければ`create_time + 30日`をparser fallbackとして使う。長時間sleepからの復帰後、Responses requestでcredentialがhard-expiredなら、bridgeは公式`bin/grok models`をstdin/stdout/stderr切断・7秒timeoutで一度だけ起動し、公式プロセス自身のsilent OIDC refreshを促す。その後、Responses requestは最大60秒だけauthoritative fileのread-only再読込を待ってから判定する。bridgeはrefresh tokenを読まず、OAuthを実装せず、対話loginやcredential fileの直接変更、upstream request再送を行わない。
 
 ## 12. OAuth Refresh
 
-V1は独自OAuth refresh、browser OAuth、client identity再実装を行わない。期限切れ時は公式`grok models`の非対話起動で公式OIDC refreshを一度だけ促し、それでも更新されなければ、公式Grok login経路が必要であることを明示errorとして返す。bridgeはrefresh tokenを取得・解釈・保存しない。
+V1は独自OAuth refresh、browser OAuth、client identity再実装を行わない。期限切れ時は公式`grok models`の非対話起動で公式OIDC refreshを一度だけ促し、それでも更新されなければ、公式Grok login経路（通常は`grok login --device-auth`）が必要であることを明示errorとして返す。bridgeはrefresh tokenを取得・解釈・保存しない。`catalog refresh`はこの更新経路を使わず、現在利用できるcredentialを要求する。
 
 ## 13. xAI Upstream
 
@@ -179,7 +179,7 @@ Credentialを読まず、upstream通信もしない。responseはservice/version
 
 ## 16. `/v1/models`
 
-V1はadmitted model catalogを返す。source snapshot由来のbootstrap catalogを持ち、Phase B以降は公式session endpointから一回のbounded startup refreshまたは明示`catalog refresh`で更新できる。
+V1はadmitted model catalogを返す。source snapshot由来のbootstrap catalogを持ち、Phase B以降は公式session endpointから一回のbounded startup refreshまたは明示`catalog refresh`で更新できる。両方のcatalog経路は現在利用できるcredentialを要求し、hard-expiry renewal helperは起動しない。renewal helperはResponses provider request経路だけで使う。
 
 ```json
 {"object":"list","data":[{"id":"grok-4.6","object":"model","owned_by":"xai"},{"id":"grok-4.5","object":"model","owned_by":"xai"}]}
@@ -339,7 +339,7 @@ Fingerprint spoofing、device spoofing、rate-limit evasion、account rotation�
 
 ## 50. CLI Commands
 
-V1完成時の最低限候補：`run`、`install`、`uninstall`、`status`、`doctor`、`auth status`、`catalog refresh`、`service install`、`service uninstall`。`catalog refresh`は公式session `/v1/models`からatomicにlast-known-good catalogを更新し、credentialやNative GPT catalogを変更しない。Phase ownershipと実装時点の必要性に合わせて追加する。
+V1完成時の最低限候補：`run`、`install`、`uninstall`、`status`、`doctor`、`auth status`、`catalog refresh`、`service install`、`service uninstall`。`catalog refresh`は現在利用できるcredentialで公式session `/v1/models`からatomicにlast-known-good catalogを更新し、credentialやNative GPT catalogを変更しない。`catalog refresh`とstartup refreshはhard-expiry renewal helperを起動せず、credential renewalはResponses provider request経路に限る。Phase ownershipと実装時点の必要性に合わせて追加する。
 
 ## 51. `doctor`
 
@@ -429,7 +429,7 @@ Reference implementationのcodeをcopy/modifyする前にlicenseとnoticeを確�
 - [ ] Single prebuilt Rust binaryで通常動作する。
 - [ ] Loopback only。
 - [ ] Local caller authenticationがある。
-- [ ] Credential fileをread-onlyで扱い、OAuth credentialを複製しない。
+- [ ] Bridgeはcredential fileをread-onlyで扱い、OAuth credentialを複製しない。hard expiry時の更新は公式CLIに一度だけboundedに委譲し、bridge自身はcredential fileを書き換えない。
 - [ ] Current xAI official CLI proxy contractだけを使う。
 - [ ] 公式model catalogをbounded refreshでき、failure時にlast-known-goodを保持する。
 - [ ] Simple textとstreamingが動く。

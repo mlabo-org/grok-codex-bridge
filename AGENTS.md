@@ -17,7 +17,7 @@
 ## Responsibility Ownership
 
 - Codexはagent loop、permission、tool call、shell、filesystem、MCP、Skills、Browser、Computer Use、task/session stateを所有する。
-- bridgeは、loopback provider endpoint、Codex側protocolのparse、Grok側protocolへの変換、streaming変換、local caller authentication、credentialのread-only参照、Grok upstream clientだけを所有する。
+- bridgeは、loopback provider endpoint、Codex側protocolのparse、Grok側protocolへの変換、streaming変換、local caller authentication、credential fileのread-only検査とzeroizing cache、Responses provider requestでhard expiryを検出した場合に限る公式CLI更新trigger、Grok upstream clientを所有する。公式CLIが行うcredential fileの更新、login、OIDC refresh自体はbridgeの所有外である。
 - Grok upstreamはmodel inferenceとupstream authentication contractを所有する。bridgeはGrokのagent harnessまたはtool executorを再実装しない。
 - materialization scriptはrelease binaryのbuildと`dist/aarch64-apple-darwin/`への配置だけを所有する。通常callerの起動、インストール、常駐化を所有しない。
 - coordinatorまたはinstallerを追加する場合、その責務をroute選択、設定適用、起動停止へ限定し、protocol変換やtool実行を重複所有させない。
@@ -26,7 +26,7 @@
 
 - Codexからbridgeへのhandoffは、現在のCodex authoritative sourceと実runtimeで確認したprotocolだけを実装する。過去の会話、README、推測したOpenAI互換性をprotocol authorityにしない。
 - bridgeからGrokへのhandoffは、現在のxAI authoritative sourceまたは観測可能な公式client contractで確認したendpoint、headers、streaming semanticsだけを実装する。private endpoint探索、fingerprint偽装、未確認fallbackを追加しない。
-- credentialは選択されたauthoritative fileをin-placeかつread-onlyで参照する。repo、Codex config、log、SQLite、cache、environment dumpへ複製しない。
+- credentialは選択されたauthoritative fileをin-placeかつread-onlyで検査する。Responses provider requestで選択recordのhard expiryを検出した場合に限り、公式bin/grok modelsをstdin/stdout/stderr切断・7秒timeoutで一度だけ起動し、authoritative fileを最大60秒read-only再読込してよい。auth status、doctor、catalog refresh、その他のcredential検査経路ではこのtriggerを起動しない。bridgeはcredential fileを直接書き換えず、repo、Codex config、log、SQLite、cache、environment dumpへ複製しない。公式CLIが行う更新はbridgeのread-only検査の外側である。
 - normal runtimeは`./scripts/materialize-macos.sh`が配置したconcrete executableを直接実行する。`cargo run`、build-on-first-use、Cargo cache探索、interpreted fallbackをnormal runtimeに使用しない。
 
 ## Public Agent Build And Install Route
