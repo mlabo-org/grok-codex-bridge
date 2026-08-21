@@ -302,7 +302,7 @@ impl NormalizedResponsesRequest {
         // parsing later function calls so a namespace discovered in an earlier
         // tool_search turn is available to the same request's replayed call.
         merge_discovered_tool_search_specs(&mut tools, &mut namespace_projection, input_values)?;
-        let input = parse_input(input_values, &namespace_projection)?;
+        let input = parse_input(input_values, &mut namespace_projection)?;
         let tool_choice = parse_tool_choice(required_value(object, "tool_choice")?)?;
         validate_tool_choice(&tool_choice, &tools)?;
         let parallel_tool_calls = required_bool(object, "parallel_tool_calls")?;
@@ -472,7 +472,7 @@ impl TryFrom<Value> for NormalizedResponsesRequest {
 impl InputItem {
     fn parse(
         value: &Value,
-        namespace_projection: &NamespaceToolProjection,
+        namespace_projection: &mut NamespaceToolProjection,
     ) -> Result<Self, ProtocolError> {
         let object = value
             .as_object()
@@ -1071,7 +1071,7 @@ fn canonicalize_response_event_arguments(event: &mut Value) {
 impl FunctionCall {
     fn parse(
         object: &Map<String, Value>,
-        namespace_projection: &NamespaceToolProjection,
+        namespace_projection: &mut NamespaceToolProjection,
     ) -> Result<Self, ProtocolError> {
         // Grok Build deliberately omits the response item id when replaying a
         // tool call. Validate Codex's output-only id, but do not forward it.
@@ -1092,9 +1092,7 @@ impl FunctionCall {
         let native_name = required_nonempty_string(object, "name")?;
         let name = match optional_nonempty_string(object, "namespace")? {
             Some(namespace) => namespace_projection
-                .provider_name(&namespace, &native_name)
-                .ok_or(ProtocolError::InvalidRequestField("namespace"))?
-                .to_owned(),
+                .ensure_provider_name(&namespace, &native_name)?,
             None => native_name,
         };
         Ok(Self {
@@ -1415,7 +1413,7 @@ fn base64_value(byte: u8) -> Option<u8> {
 
 fn parse_input(
     values: &[Value],
-    namespace_projection: &NamespaceToolProjection,
+    namespace_projection: &mut NamespaceToolProjection,
 ) -> Result<Vec<InputItem>, ProtocolError> {
     let mut calls = HashSet::new();
     let mut outputs = HashSet::new();
@@ -1496,6 +1494,34 @@ impl NamespaceToolProjection {
         self.native_to_provider
             .get(&(namespace.to_owned(), name.to_owned()))
             .map(String::as_str)
+    }
+
+    fn ensure_provider_name(
+        &mut self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<String, ProtocolError> {
+        if let Some(provider_name) = self.provider_name(namespace, name) {
+            return Ok(provider_name.to_owned());
+        }
+
+        // Codex may replay a namespaced function call after its current
+        // request has dropped the namespace's tool declaration (for example,
+        // when a deferred tool search is no longer present). The provider
+        // projection is still deterministic from the native pair, so retain
+        // the history instead of rejecting the whole request.
+        let provider_name = format!("{namespace}{NAMESPACE_DELIMITER}{name}");
+        if let Some(existing) = self.provider_to_native.get(&provider_name)
+            && (existing.namespace != namespace || existing.name != name)
+        {
+            return Err(ProtocolError::DuplicateToolName);
+        }
+        self.insert(
+            provider_name.clone(),
+            namespace.to_owned(),
+            name.to_owned(),
+        )?;
+        Ok(provider_name)
     }
 
     fn insert(
@@ -3876,6 +3902,52 @@ mod tests {
         projection.restore_response_event(&mut completed);
         assert_eq!(completed["response"]["output"][0]["name"], "ping");
         assert_eq!(completed["response"]["output"][0]["namespace"], "mcp__demo");
+    }
+
+    #[test]
+    fn stale_namespaced_history_is_flattened_when_current_tools_omit_namespace() {
+        let mut request = request_fixture();
+        request["input"] = json!([
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "continue"}]
+            },
+            {
+                "type": "function_call",
+                "namespace": "mcp__stale",
+                "name": "read_file",
+                "call_id": "call_stale_1",
+                "arguments": "{\"path\":\"README.md\"}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_stale_1",
+                "output": "line one"
+            }
+        ]);
+        request["tools"] = json!([]);
+
+        let normalized = NormalizedResponsesRequest::parse(request).unwrap();
+        let upstream = normalized.to_xai_value();
+        assert_eq!(upstream["input"][1]["name"], "mcp__stale__read_file");
+        assert!(upstream["input"][1].get("namespace").is_none());
+
+        let projection = normalized.namespace_projection();
+        let mut event = json!({
+            "type": "response.output_item.done",
+            "sequence_number": 1,
+            "output_index": 0,
+            "item": {
+                "type": "function_call",
+                "call_id": "call_stale_2",
+                "name": "mcp__stale__read_file",
+                "arguments": "{}"
+            }
+        });
+        projection.restore_response_event(&mut event);
+        assert_eq!(event["item"]["name"], "read_file");
+        assert_eq!(event["item"]["namespace"], "mcp__stale");
     }
 
     #[test]
