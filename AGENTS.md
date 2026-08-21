@@ -9,6 +9,7 @@
 
 - このrepoは、CodexとGrokの間を接続する独立Rust provider bridgeの現役source-of-truthである。Codex plugin、Skill、汎用LLM router、agent harnessとして扱わない。
 - `src/`、`tests/`、`Cargo.toml`、`Cargo.lock`、`rust-toolchain.toml`、`scripts/`をexecutable sourceとする。`docs/spec-v0.1.md`を製品意図、scope、実装順序、acceptance contractのauthoritative sourceとする。
+- `Grok.md` は Grok モデルへ渡す overlay 本文の SSOT である。picker はカタログ生成時にこのファイルだけを Grok 行の `base_instructions` へ注入する。生成カタログは写しであり、本文を `picker.rs` に複製しない。
 - `README.md`と`README.ja.md`は公開利用者向け説明であり、protocolまたは製品scopeのauthorityではない。
 - `target/`はCargo build cache、`dist/`はmaterialized runtime artifactであり、authoritative sourceまたはGit管理対象として編集しない。
 - 明示的な導入、activation、Codex config変更、LaunchAgent作成が実施されるまで、このrepoの存在だけでactive runtimeまたはconsumerが存在するとみなさない。
