@@ -220,7 +220,7 @@ codex resume <SESSION_ID> -m <NATIVE_GPT_MODEL>
 
 ## モデルカタログと認証情報
 
-ブリッジは、設定された `GROK_AUTH_PATH`、絶対パスの `GROK_HOME`、またはGrok公式の既定homeから公式Grokセッション認証情報を検出します。選択した認証ファイルはsymlinkを追跡せず、読み取り専用で開きます。長時間のsystem sleep後は、Responses requestが期限切れcredential fileを公式Grokフローが置換するまで最大60秒待ってからlogin errorを返します。bridge自身がOAuth refreshまたはcredentialの書き換えを行うことはなく、ログイン、token refresh、認証情報の修復は引き続き公式Grokフローの責任です。
+ブリッジは、設定された `GROK_AUTH_PATH`、絶対パスの `GROK_HOME`、またはGrok公式の既定homeから公式Grokセッション認証情報を検出します。選択した認証ファイルはsymlinkを追跡せず、読み取り専用で開きます。長時間のsystem sleepでcredentialが期限切れになった場合は、同じGrok homeにある公式 `bin/grok models` を非対話・短時間で起動し、公式Grokプロセス自身のsilent OIDC refreshを促してから、権威ファイルを再読込します。bridgeはrefresh tokenを扱わず、OAuthを実装せず、対話loginを起動せず、credentialを書き換えません。
 
 サーバーを起動せず、公式カタログを一度だけ取得します。
 

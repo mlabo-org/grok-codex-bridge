@@ -4,6 +4,7 @@ use std::fmt;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration as StdDuration, Instant, SystemTime};
@@ -18,23 +19,36 @@ const XAI_ISSUER: &str = "https://auth.x.ai";
 const TOKEN_TTL: Duration = Duration::days(30);
 const MAX_AUTH_FILE_BYTES: u64 = 1024 * 1024;
 const RENEWAL_POLL_INTERVAL: StdDuration = StdDuration::from_millis(250);
+const OFFICIAL_REFRESH_TIMEOUT: StdDuration = StdDuration::from_secs(7);
 
 pub struct CredentialStore {
     path: PathBuf,
+    official_cli: PathBuf,
     cached: Mutex<Option<CachedCredential>>,
 }
 
 impl CredentialStore {
     pub fn from_environment() -> Result<Self, CredentialError> {
-        Self::new(resolve_auth_path()?)
+        let path = resolve_auth_path()?;
+        let official_cli = resolve_official_cli_path(&path)?;
+        Self::with_official_cli(path, official_cli)
     }
 
     pub fn new(path: PathBuf) -> Result<Self, CredentialError> {
+        let official_cli = path
+            .parent()
+            .ok_or(CredentialError::RelativeAuthPath)?
+            .join("bin/grok");
+        Self::with_official_cli(path, official_cli)
+    }
+
+    fn with_official_cli(path: PathBuf, official_cli: PathBuf) -> Result<Self, CredentialError> {
         if !path.is_absolute() {
             return Err(CredentialError::RelativeAuthPath);
         }
         Ok(Self {
             path,
+            official_cli,
             cached: Mutex::new(None),
         })
     }
@@ -78,26 +92,68 @@ impl CredentialStore {
     /// Waits briefly for the official Grok flow to replace a credential that
     /// expired while this long-lived bridge process was asleep.
     ///
-    /// This method never refreshes, rewrites, or sends the expired credential.
-    /// It only repeats the same read-only load until the authoritative file is
-    /// replaced or the bounded grace period ends.
+    /// This method never refreshes, rewrites, or sends the expired credential
+    /// itself. It delegates one headless refresh attempt to the official Grok
+    /// helper, then repeats the same read-only load until the authoritative
+    /// file is replaced or the bounded grace period ends.
     pub fn load_with_renewal_grace(
         &self,
         grace_period: StdDuration,
     ) -> Result<Arc<SessionCredential>, CredentialError> {
         let deadline = Instant::now() + grace_period;
+        let mut refresh_attempted = false;
         loop {
             match self.load() {
                 Ok(credential) => return Ok(credential),
                 Err(error) => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
-                    if !matches!(error, CredentialError::ExpiredSessionCredential)
-                        || remaining.is_zero()
-                    {
+                    if !matches!(error, CredentialError::ExpiredSessionCredential) {
                         return Err(error);
+                    }
+                    if remaining.is_zero() {
+                        return Err(error);
+                    }
+                    if !refresh_attempted {
+                        refresh_attempted = true;
+                        let _ = run_official_refresh(&self.official_cli);
+                        continue;
                     }
                     thread::sleep(RENEWAL_POLL_INTERVAL.min(remaining));
                 }
+            }
+        }
+    }
+}
+
+fn run_official_refresh(helper: &Path) -> bool {
+    let Ok(mut child) = Command::new(helper)
+        .arg("models")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+
+    let deadline = Instant::now() + OFFICIAL_REFRESH_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(
+                    RENEWAL_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
             }
         }
     }
@@ -112,6 +168,19 @@ fn resolve_auth_path() -> Result<PathBuf, CredentialError> {
     }
     let home = nonempty_env("HOME").ok_or(CredentialError::HomeUnavailable)?;
     Ok(absolute_path(home)?.join(".grok/auth.json"))
+}
+
+fn resolve_official_cli_path(auth_path: &Path) -> Result<PathBuf, CredentialError> {
+    if let Some(home) = nonempty_env("GROK_HOME") {
+        return Ok(absolute_path(home)?.join("bin/grok"));
+    }
+    if let Some(home) = nonempty_env("HOME") {
+        return Ok(absolute_path(home)?.join(".grok/bin/grok"));
+    }
+    auth_path
+        .parent()
+        .map(|parent| parent.join("bin/grok"))
+        .ok_or(CredentialError::RelativeAuthPath)
 }
 
 fn nonempty_env(name: &str) -> Option<String> {
@@ -360,6 +429,11 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
     }
 
+    fn write_helper(path: &Path, body: &str) {
+        fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
     fn record(token: &str, expires_at: &str) -> String {
         format!(
             r#"{{"https://auth.x.ai::current-client":{{"key":"{token}","auth_mode":"oidc","create_time":"2026-08-01T00:00:00Z","user_id":"user-1","expires_at":"{expires_at}","oidc_issuer":"https://auth.x.ai"}}}}"#
@@ -439,5 +513,81 @@ mod tests {
             .unwrap();
         renew.join().unwrap();
         assert_eq!(credential.token(), "renewed");
+    }
+
+    #[test]
+    fn expired_credential_adopts_official_helper_replacement() {
+        let temporary = tempfile::tempdir().unwrap();
+        let auth_home = temporary.path();
+        let path = auth_home.join("auth.json");
+        let helper = auth_home.join("bin/grok");
+        let invocation = auth_home.join("invocation");
+        fs::create_dir(auth_home.join("bin")).unwrap();
+        write_auth(&path, &record("expired", "2020-01-01T00:00:00Z"), 0o600);
+        write_helper(
+            &helper,
+            &format!(
+                "helper_dir=$(dirname \"$0\")\nauth_path=\"$helper_dir/../auth.json\"\nprintf '%s' \"$1\" > \"{}\"\nprintf '%s' '{}' > \"$auth_path.tmp\"\nchmod 600 \"$auth_path.tmp\"\nmv \"$auth_path.tmp\" \"$auth_path\"",
+                invocation.display(),
+                record("renewed", "2099-01-01T00:00:00Z")
+            ),
+        );
+
+        let credential = CredentialStore::new(path)
+            .unwrap()
+            .load_with_renewal_grace(StdDuration::from_secs(1))
+            .unwrap();
+        assert_eq!(credential.token(), "renewed");
+        assert_eq!(fs::read_to_string(invocation).unwrap(), "models");
+    }
+
+    #[test]
+    fn failed_official_helper_preserves_expired_error() {
+        let temporary = tempfile::tempdir().unwrap();
+        let auth_home = temporary.path();
+        let path = auth_home.join("auth.json");
+        let helper = auth_home.join("bin/grok");
+        fs::create_dir(auth_home.join("bin")).unwrap();
+        write_auth(&path, &record("expired", "2020-01-01T00:00:00Z"), 0o600);
+        write_helper(&helper, "exit 7");
+
+        assert!(matches!(
+            CredentialStore::new(path)
+                .unwrap()
+                .load_with_renewal_grace(StdDuration::from_secs(1)),
+            Err(CredentialError::ExpiredSessionCredential)
+        ));
+    }
+
+    #[test]
+    fn official_helper_is_not_attempted_for_non_expiry_errors() {
+        let current_record = record("current", "2099-01-01T00:00:00Z");
+        let cases = [
+            ("missing", None, None),
+            ("malformed", Some("not-json"), None),
+            ("current", Some(current_record.as_str()), Some("current")),
+        ];
+
+        for (name, contents, expected_token) in cases {
+            let temporary = tempfile::tempdir().unwrap();
+            let auth_home = temporary.path();
+            let path = auth_home.join("auth.json");
+            let helper = auth_home.join("bin/grok");
+            let marker = auth_home.join("attempted");
+            fs::create_dir(auth_home.join("bin")).unwrap();
+            write_helper(&helper, &format!("touch \"{}\"", marker.display()));
+            if let Some(contents) = contents {
+                write_auth(&path, contents, 0o600);
+            }
+
+            let result = CredentialStore::new(path)
+                .unwrap()
+                .load_with_renewal_grace(StdDuration::from_millis(1));
+            match expected_token {
+                Some(token) => assert_eq!(result.unwrap().token(), token, "{name}"),
+                None => assert!(result.is_err(), "{name}"),
+            }
+            assert!(!marker.exists(), "{name}");
+        }
     }
 }

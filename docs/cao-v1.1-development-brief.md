@@ -163,6 +163,5 @@ After intake, create these durable progress items:
 - codex-router's multi-hop router architecture;
 - fixed Grok model lists as the long-term picker source;
 - remote/LAN provider access;
-- credential copying, login automation, or refresh-token exchange;
+- credential copying, interactive login automation, or refresh-token exchange; a bounded invocation of the official Grok CLI's non-interactive refresh path remains allowed;
 - commit, push, publication, or live runtime/config activation without separate current authority.
-

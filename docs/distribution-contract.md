@@ -143,4 +143,4 @@ One semantic acceptance bundle for the distribution implementation must prove al
 - GitHub publication, Homebrew publication, license selection, signing identity, and notarization execution;
 - Intel macOS, Linux, and Windows artifacts;
 - automatic modification of shell profiles;
-- any credential migration, copying, refresh-token exchange, or login automation.
+- any credential migration, copying, refresh-token exchange, or interactive login automation; the bridge may only invoke the official Grok CLI's bounded non-interactive refresh path.

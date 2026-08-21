@@ -223,7 +223,7 @@ The lifecycle manifest owns only files created or replaced by the bridge. Full u
 
 ## Model catalog and credentials
 
-The bridge discovers the official Grok session credential from the configured `GROK_AUTH_PATH`, an absolute `GROK_HOME`, or the official default Grok home. The selected credential file is opened read-only without following symlinks. After a long system sleep, a Responses request waits up to 60 seconds for the official Grok flow to replace an expired credential file before returning a login error. The bridge never performs OAuth refresh or rewrites the credential; login, token refresh, and credential repair remain the responsibility of the official Grok flow.
+The bridge discovers the official Grok session credential from the configured `GROK_AUTH_PATH`, an absolute `GROK_HOME`, or the official default Grok home. The selected credential file is opened read-only without following symlinks. When a long system sleep leaves that credential expired, the bridge may invoke the sibling official `bin/grok models` command non-interactively, with a short timeout, so the official Grok process can perform its own silent OIDC refresh. The bridge never handles a refresh token, performs OAuth itself, invokes interactive login, or rewrites the credential; it only rereads the authoritative file after the official process returns.
 
 Request one bounded official catalog refresh without starting the server:
 

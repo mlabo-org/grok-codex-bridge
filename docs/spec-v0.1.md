@@ -136,11 +136,11 @@ capability token、完全なcapability URLをlogへ出さない。
 
 ## 11. Credential Cache
 
-Access tokenのmemory cacheは許容する。disk再保存、debug print、panic dumpは禁止する。secret保持型を使い、process exit時は可能な範囲でzeroizeする。credential fileのmtime変化を検出して再読込する。長時間sleepからの復帰時にmemory cacheのcredentialが期限切れで、公式Grok flowによるauthoritative file更新が遅れている場合、Responses requestは最大60秒だけread-only再読込を待ってから判定する。この待機はexpired credentialだけを対象とし、bridge自身によるrefresh、credential変更、upstream request再送は行わない。
+Access tokenのmemory cacheは許容する。disk再保存、debug print、panic dumpは禁止する。secret保持型を使い、process exit時は可能な範囲でzeroizeする。credential fileのmtime変化を検出して再読込する。長時間sleepからの復帰時にcredentialが期限切れなら、bridgeは同じGrok homeの公式`bin/grok models`をstdin/stdout/stderr切断・短時間で一度だけ起動し、公式プロセス自身のsilent OIDC refreshを促す。その後、Responses requestは最大60秒だけauthoritative fileのread-only再読込を待ってから判定する。bridgeはrefresh tokenを読まず、OAuthを実装せず、対話loginやcredential変更、upstream request再送を行わない。
 
 ## 12. OAuth Refresh
 
-V1は独自OAuth refresh、browser OAuth、client identity再実装を行わない。401/403は、公式Grok login経路を再実行してretryする必要があることを明示errorとして返す。login commandの正確な形はcurrent official CLIで確認する。
+V1は独自OAuth refresh、browser OAuth、client identity再実装を行わない。期限切れ時は公式`grok models`の非対話起動で公式OIDC refreshを一度だけ促し、それでも更新されなければ、公式Grok login経路が必要であることを明示errorとして返す。bridgeはrefresh tokenを取得・解釈・保存しない。
 
 ## 13. xAI Upstream
 
