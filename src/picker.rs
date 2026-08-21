@@ -10,7 +10,7 @@ use crate::catalog::{CatalogError, CatalogSnapshot, OFFICIAL_MODELS_ORIGIN, vali
 const PICKER_POLICY_VERSION: u32 = 2;
 const MANAGED_STATE_VERSION: u32 = 2;
 const GROK_ENTRY_DESCRIPTION: &str = "Grok model served through Grok Codex Bridge.";
-const GROK_BASE_INSTRUCTIONS: &str = "You are Codex, a coding agent using the selected Grok model through Grok Codex Bridge. Follow the developer and user instructions supplied by Codex, and use Codex tools when needed.";
+const GROK_BASE_INSTRUCTIONS: &str = include_str!("../Grok.md");
 const GROK_CONTEXT_WINDOW: i64 = 272_000;
 
 /// A generated complete-replacement Codex catalog.
@@ -735,7 +735,29 @@ mod tests {
         );
         assert_eq!(after["models"][1]["include_apps_usage_instructions"], true);
         assert_eq!(after["models"][1]["supports_parallel_tool_calls"], true);
+        assert_eq!(
+            after["models"][1]["base_instructions"],
+            GROK_BASE_INSTRUCTIONS
+        );
         assert_eq!(serde_json::from_slice::<Value>(&source).unwrap(), before);
+    }
+
+    #[test]
+    fn grok_overlay_comes_from_grok_md_ssot() {
+        assert!(GROK_BASE_INSTRUCTIONS.contains("Grok 専用実行 overlay の SSOT"));
+        assert!(GROK_BASE_INSTRUCTIONS.contains("宣言した操作はそのターンで実行する"));
+        assert!(GROK_BASE_INSTRUCTIONS.contains("やったフリをするな"));
+        let grok = CatalogSnapshot::new(["grok-4.6"], None).unwrap();
+        let generated = generate_picker_catalog(&native_catalog(), &grok).unwrap();
+        let after: Value = serde_json::from_slice(generated.bytes()).unwrap();
+        assert_eq!(
+            after["models"][1]["base_instructions"],
+            GROK_BASE_INSTRUCTIONS
+        );
+        assert_ne!(
+            after["models"][0]["base_instructions"],
+            GROK_BASE_INSTRUCTIONS
+        );
     }
 
     #[test]
