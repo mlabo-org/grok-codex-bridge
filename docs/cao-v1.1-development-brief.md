@@ -86,7 +86,7 @@ V1.0 is an accepted implementation input, not a producer to rewrite routinely:
 
 - direct Rust Responses-to-Responses bridge;
 - loopback-only capability-scoped provider;
-- read-only official Grok credential boundary;
+- read-only bridge-side official Grok credential boundary, with a bounded official-CLI renewal trigger on hard expiry;
 - current official model catalog refresh with last-known-good preservation;
 - validated text, reasoning, tool, image, and streaming handoffs;
 - isolated `grok-bridge` CLI profile;

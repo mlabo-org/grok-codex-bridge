@@ -4,7 +4,7 @@
 
 **A native Rust Responses-to-Responses bridge that lets Grok run inside the Codex harness without replacing Native GPT.**
 
-`grok-codex-bridge` is a standalone, loopback-only provider bridge for macOS on Apple Silicon. Codex continues to own the agent loop, tools, permissions, MCP servers, Skills, and session state. This project owns only the local provider boundary, tolerant provider projection for Responses transport, Codex-consumed SSE extraction, read-only Grok authentication, and the upstream connection to xAI.
+`grok-codex-bridge` is a standalone, loopback-only provider bridge for macOS on Apple Silicon. Codex continues to own the agent loop, tools, permissions, MCP servers, Skills, and session state. This project owns only the local provider boundary, tolerant provider projection for Responses transport, Codex-consumed SSE extraction, the bridge-side Grok credential boundary, and the upstream connection to xAI. The bridge inspects the official credential read-only; on hard expiry it may invoke the official Grok CLI as a bounded renewal trigger, while the official CLI owns any credential update.
 
 It is not a Codex plugin, a general-purpose LLM router, or an agent harness.
 
@@ -106,7 +106,7 @@ V1.0 is the conservative public route: it uses a separate Codex profile and leav
 - Tolerant Codex Responses-to-xAI Responses provider projection with `store: false` and full input history; no legacy Chat Completions conversion.
 - Codex-consumed SSE extraction for text, reasoning summaries, function calls, terminal/usage events, while unknown auxiliary events do not terminate the stream.
 - Ordered function calls/results and mixed text/image inputs without downloading or re-encoding image data.
-- Read-only use of the official Grok session credential, with in-memory zeroizing cache reload when the source changes.
+- Read-only bridge-side use of the official Grok session credential, with in-memory zeroizing cache reload when the source changes. On hard expiry during a provider request, one bounded non-interactive official-CLI invocation may trigger the CLI's own silent OIDC refresh; the bridge never handles refresh tokens, performs OAuth, or writes the credential file.
 - Fixed official xAI origin through rustls, redirects disabled, and typed authentication, rate-limit, status, and stream failures.
 - Catalog-driven Grok model admission with atomic metadata-only last-known-good state.
 - Loopback-only listener and capability-scoped routes; invalid capabilities return `404`.
@@ -117,7 +117,7 @@ V1.0 is the conservative public route: it uses a separate Codex profile and leav
 
 - macOS on Apple Silicon.
 - Rust 1.95.0 for building from source, pinned by [rust-toolchain.toml](rust-toolchain.toml).
-- An existing official Grok login for live Grok requests.
+- An official Grok CLI installation and an existing official Grok login for live Grok requests.
 - A current Codex CLI installation.
 
 Prebuilt Intel macOS, Linux, and Windows artifacts are not currently provided.
@@ -223,16 +223,42 @@ The lifecycle manifest owns only files created or replaced by the bridge. Full u
 
 ## Model catalog and credentials
 
-The bridge discovers the official Grok session credential from the configured `GROK_AUTH_PATH`, an absolute `GROK_HOME`, or the official default Grok home. The selected credential file is opened read-only without following symlinks. When a long system sleep leaves that credential expired, the bridge may invoke the sibling official `bin/grok models` command non-interactively, with a short timeout, so the official Grok process can perform its own silent OIDC refresh. The bridge never handles a refresh token, performs OAuth itself, invokes interactive login, or rewrites the credential; it only rereads the authoritative file after the official process returns.
+The bridge resolves the authoritative credential file in this order:
 
-Request one bounded official catalog refresh without starting the server:
+1. `GROK_AUTH_PATH`, when set;
+2. `GROK_HOME/auth.json`, when `GROK_HOME` is set; or
+3. `~/.grok/auth.json`.
+
+The selected file is opened read-only without following symlinks. `GROK_AUTH_PATH` selects the file; `GROK_HOME` selects the official CLI home used for renewal. If `GROK_AUTH_PATH` points outside the official Grok home, set `GROK_HOME` as well so the bridge can resolve the matching `GROK_HOME/bin/grok` helper. With no `GROK_HOME`, the helper resolves to `~/.grok/bin/grok` when `HOME` is available.
+
+The bridge uses `expires_at` when the official session record provides it. If that field is absent, it uses `create_time + 30 days` as its parser fallback; this is not a promise about the official Grok session lifetime. `auth status` reports credential availability without revealing the credential or its expiry timestamp.
+
+The following recovery path runs only when a Responses provider request encounters a hard-expired credential. The bridge invokes the official `bin/grok models` command once with stdin, stdout, and stderr disconnected and a 7-second timeout. It then rereads the authoritative file for up to 60 seconds. The bridge does not proactively refresh a credential, read a refresh token, perform OAuth, invoke interactive login, or rewrite `auth.json`. If the official process does not replace the file, the request fails with an authentication error.
+
+To restore an expired or missing official login, run the official device flow outside the bridge session:
 
 ```sh
-./dist/aarch64-apple-darwin/grok-codex-bridge catalog refresh \
-  --config ./docs/bridge-config.example.toml
+GROK_HOME_DIR="${GROK_HOME:-"$HOME/.grok"}"
+"$GROK_HOME_DIR/bin/grok" login --device-auth
 ```
 
-The checked-in example intentionally disables refresh-on-start. For a live refresh, copy it to an untracked local file, replace its placeholder paths with valid absolute runtime paths, and enable the option there. Never commit credentials or runtime-specific paths.
+Complete any device or browser confirmation only on the official page shown by the CLI. Never paste a device code into chat, logs, or the repository. Then verify the bridge without revealing credentials:
+
+```sh
+./dist/aarch64-apple-darwin/grok-codex-bridge auth status
+./dist/aarch64-apple-darwin/grok-codex-bridge service status
+```
+
+`catalog refresh` is separate from the expired-credential recovery path. It requires a currently usable credential, does not invoke the renewal helper, and updates only the last-known-good model catalog. The checked-in configuration is a template with placeholder absolute paths and must not be run unchanged. Copy it to an untracked local configuration, replace the placeholders with valid absolute paths, and then run:
+
+```sh
+cp ./docs/bridge-config.example.toml ./bridge-config.local.toml
+# Edit ./bridge-config.local.toml with machine-local absolute paths.
+./dist/aarch64-apple-darwin/grok-codex-bridge catalog refresh \
+  --config ./bridge-config.local.toml
+```
+
+The `refresh_on_start` field controls service startup only; the explicit `catalog refresh` command always performs its one bounded catalog request. Keep the local configuration untracked and never commit credentials or runtime-specific paths.
 
 ## Security boundary
 
