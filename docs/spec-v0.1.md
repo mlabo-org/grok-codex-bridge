@@ -251,7 +251,7 @@ Codex側へResponses-compatible SSEを返す。upstream SSEは、Codexが消費�
 
 ## 28. Stream Boundary
 
-SSE translationはCodexが消費する意味単位を壊さないようにする。text、reasoning-summary、function call、terminal/usageの各projectionを管理し、unknownな補助eventをCodexのstream失敗へ変換しない。tool callは独立output itemとして投影するが、upstreamの全lifecycle/index/sequenceをbridgeが保証するとは限らない。
+SSE translationはCodexが消費する意味単位を壊さないようにする。text、reasoning-summary、function call、terminal/usageの各projectionを管理し、unknownな補助eventをCodexのstream失敗へ変換しない。tool callは独立output itemとして投影するが、upstreamの全lifecycle/index/sequenceをbridgeが保証するとは限らない。Grokが有用なCodex向けeventのあとterminal markerなしで接続を閉じた場合、bridgeは出力itemを捏造せず、Codexが要求する`response.completed`だけを合成してstreamを閉じる。`response.failed`または`response.incomplete`を既に受け取っている場合は合成しない。
 
 ## 29. Stable IDs
 

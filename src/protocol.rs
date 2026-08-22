@@ -2745,6 +2745,7 @@ fn mark_reasoning_ciphertext(item: &mut Map<String, Value>) {
 pub struct TextStreamValidator {
     state: TextStreamState,
     last_sequence: Option<u64>,
+    response_id: Option<String>,
 }
 impl Default for TextStreamValidator {
     fn default() -> Self {
@@ -2757,6 +2758,7 @@ impl TextStreamValidator {
         Self {
             state: TextStreamState::AwaitingCreated,
             last_sequence: None,
+            response_id: None,
         }
     }
 
@@ -2768,11 +2770,52 @@ impl TextStreamValidator {
         self.state == TextStreamState::Completed
     }
 
+    fn is_terminal(&self) -> bool {
+        matches!(
+            self.state,
+            TextStreamState::Completed | TextStreamState::Failed | TextStreamState::Incomplete
+        )
+    }
+
     pub fn finish(&self) -> Result<(), ProtocolError> {
         // The provider may close after its terminal payload without emitting
         // every Responses lifecycle marker.  The transport has already
         // forwarded all useful events, so EOF is not a schema violation.
         Ok(())
+    }
+
+    /// Codex treats a Responses SSE close without `response.completed` as a
+    /// transport failure. Grok can end after the last useful item, so the
+    /// bridge supplies only that lifecycle marker. This is not a substitute
+    /// for `response.failed` / `response.incomplete`, and it does not invent
+    /// output items that were never streamed.
+    pub fn synthetic_completed_on_eof(&mut self) -> Option<ValidatedTextStreamEvent> {
+        if self.is_terminal() || self.state == TextStreamState::AwaitingCreated {
+            return None;
+        }
+        let response_id = self
+            .response_id
+            .clone()
+            .filter(|id| !id.is_empty())
+            .unwrap_or_else(|| format!("resp_{}", Uuid::new_v4()));
+        let sequence_number = self.last_sequence.map_or(0, |n| n.saturating_add(1));
+        let original = serde_json::json!({
+            "type": "response.completed",
+            "sequence_number": sequence_number,
+            "response": {
+                "id": response_id,
+                "status": "completed",
+                "output": []
+            }
+        });
+        self.state = TextStreamState::Completed;
+        self.last_sequence = Some(sequence_number);
+        self.response_id = Some(response_id.clone());
+        Some(ValidatedTextStreamEvent {
+            sequence_number,
+            kind: TextStreamEventKind::ResponseCompleted { response_id },
+            original,
+        })
     }
 
     pub fn accept_data(&mut self, data: &str) -> Result<ValidatedTextStreamEvent, ProtocolError> {
@@ -2817,6 +2860,9 @@ impl TextStreamValidator {
         let delta = string(Some(object), "delta");
         let text = string(Some(object), "text");
         let response_id = string(response, "id");
+        if !response_id.is_empty() {
+            self.response_id.get_or_insert_with(|| response_id.clone());
+        }
         let kind = match event_type {
             "response.created" => TextStreamEventKind::ResponseCreated { response_id },
             "response.in_progress" => TextStreamEventKind::ResponseInProgress { response_id },
@@ -4725,6 +4771,62 @@ mod tests {
         assert_eq!(deltas, "Hello 世界");
         assert_eq!(validator.state(), TextStreamState::Completed);
         assert!(validator.finish().is_ok());
+    }
+
+    #[test]
+    fn eof_without_terminal_event_synthesizes_response_completed() {
+        let mut validator = TextStreamValidator::new();
+        validator
+            .accept_value(json!({
+                "type": "response.created",
+                "sequence_number": 0,
+                "response": {"id": "resp_1", "output": []}
+            }))
+            .unwrap();
+        validator
+            .accept_value(json!({
+                "type": "response.output_item.done",
+                "sequence_number": 1,
+                "output_index": 0,
+                "item": {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "status": "completed"
+                }
+            }))
+            .unwrap();
+        assert!(!validator.is_completed());
+        let event = validator.synthetic_completed_on_eof().unwrap();
+        assert_eq!(
+            event.kind(),
+            &TextStreamEventKind::ResponseCompleted {
+                response_id: "resp_1".into()
+            }
+        );
+        assert_eq!(event.original()["type"], "response.completed");
+        assert_eq!(event.original()["response"]["id"], "resp_1");
+        assert_eq!(event.original()["response"]["status"], "completed");
+        assert_eq!(event.original()["response"]["output"], json!([]));
+        assert!(validator.is_completed());
+        assert!(validator.synthetic_completed_on_eof().is_none());
+    }
+
+    #[test]
+    fn eof_after_upstream_completed_does_not_synthesize_another_terminal() {
+        let mut validator = TextStreamValidator::new();
+        validator
+            .accept_value(json!({
+                "type": "response.completed",
+                "response": {"id": "resp"}
+            }))
+            .unwrap();
+        assert!(validator.synthetic_completed_on_eof().is_none());
+    }
+
+    #[test]
+    fn eof_before_any_sse_event_does_not_synthesize_completed() {
+        let mut validator = TextStreamValidator::new();
+        assert!(validator.synthetic_completed_on_eof().is_none());
     }
 
 }
