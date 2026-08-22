@@ -158,7 +158,8 @@ CODEX_DIR="${CODEX_HOME:-"$HOME/.codex"}"
 
 ./dist/aarch64-apple-darwin/grok-codex-bridge picker install \
   --native-catalog "$CODEX_DIR/models_cache.json" \
-  --native-upstream-base-url "https://chatgpt.com/backend-api/codex"
+  --native-upstream-base-url "https://chatgpt.com/backend-api/codex" \
+  --grok-overlay "$PWD/Grok.md"
 ```
 
 `--native-catalog` must resolve to an absolute existing file. Do not copy the example upstream URL when a different first-party upstream is effective for your Codex authentication route.
@@ -166,6 +167,14 @@ CODEX_DIR="${CODEX_HOME:-"$HOME/.codex"}"
 Start a fresh Codex CLI process after activation. Fully quit and relaunch Codex Desktop before testing the Desktop picker.
 
 Admitted Grok catalog entries, including the bootstrap `grok-4.5` and `grok-4.6` models, expose a 272,000-token context window. Codex therefore applies the same native 2% skill-description budget calculation instead of falling back to the small unknown-window budget.
+
+### Grok.md overlay
+
+[`Grok.md`](Grok.md) is the source of truth for the Grok-only execution overlay. `picker install` reads that file from disk and copies it into each admitted Grok row's `base_instructions` in the generated catalog. Codex consumes the generated catalog; Native GPT rows never receive this overlay. The binary does not bake the file in at compile time, and the live HTTP path does not re-read it on every request.
+
+Omit `--grok-overlay` only when the current working directory already contains `Grok.md`. After changing the overlay, run `picker install` again and start a fresh Codex CLI process or fully relaunch Desktop. Existing Grok sessions keep the overlay that was in the catalog when they started.
+
+The overlay is a companion contract, not a second constitution. It tells Grok to finish declared work in the same turn: call tools when needed, then return the user-visible result instead of ending on tool calls or progress notes alone. In a merged-picker session after catalog refresh and restart, that path is the one Codex actually loads for Grok.
 
 ### Current resume limitation
 

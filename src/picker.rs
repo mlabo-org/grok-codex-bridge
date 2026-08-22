@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -10,7 +11,6 @@ use crate::catalog::{CatalogError, CatalogSnapshot, OFFICIAL_MODELS_ORIGIN, vali
 const PICKER_POLICY_VERSION: u32 = 2;
 const MANAGED_STATE_VERSION: u32 = 2;
 const GROK_ENTRY_DESCRIPTION: &str = "Grok model served through Grok Codex Bridge.";
-const GROK_BASE_INSTRUCTIONS: &str = include_str!("../Grok.md");
 const GROK_CONTEXT_WINDOW: i64 = 272_000;
 
 /// A generated complete-replacement Codex catalog.
@@ -53,14 +53,27 @@ impl GeneratedPickerCatalog {
     }
 }
 
+/// Reads the Grok overlay SSOT from disk at catalog generation.
+pub fn load_grok_overlay(path: &Path) -> Result<String, PickerError> {
+    let bytes = fs::read(path).map_err(|error| PickerError::UnreadableOverlay(error.to_string()))?;
+    if bytes.is_empty() {
+        return Err(PickerError::EmptyOverlay);
+    }
+    String::from_utf8(bytes).map_err(|_| PickerError::OverlayNotUtf8)
+}
+
 /// Generates the one bridge-owned catalog consumed later by Phase J.
 ///
-/// `grok_catalog` is deliberately a [`CatalogSnapshot`], so picker admission
-/// cannot bypass the refreshable Grok catalog owner in `catalog.rs`.
+/// `overlay` is the Grok.md SSOT body read at catalog generation. It is not
+/// compiled into the binary.
 pub fn generate_picker_catalog(
     native_catalog: &[u8],
     grok_catalog: &CatalogSnapshot,
+    overlay: &str,
 ) -> Result<GeneratedPickerCatalog, PickerError> {
+    if overlay.is_empty() {
+        return Err(PickerError::EmptyOverlay);
+    }
     let mut root: Value = serde_json::from_slice(native_catalog)
         .map_err(|error| PickerError::MalformedNativeCatalog(error.to_string()))?;
     let root_object = root
@@ -100,7 +113,7 @@ pub fn generate_picker_catalog(
         let priority = 1_000_i32
             .checked_add(i32::try_from(index).map_err(|_| PickerError::TooManyModels)?)
             .ok_or(PickerError::TooManyModels)?;
-        let entry = grok_picker_entry(id, priority);
+        let entry = grok_picker_entry(id, priority, overlay);
         validate_model_entry(&entry, native_model_count + index)?;
         native_models.push(entry);
     }
@@ -115,7 +128,7 @@ pub fn generate_picker_catalog(
     })
 }
 
-fn grok_picker_entry(id: &str, priority: i32) -> Value {
+fn grok_picker_entry(id: &str, priority: i32, overlay: &str) -> Value {
     let mut entry = json!({
         "slug": id,
         "display_name": id,
@@ -148,7 +161,7 @@ fn grok_picker_entry(id: &str, priority: i32) -> Value {
         "default_service_tier": null,
         "availability_nux": null,
         "upgrade": null,
-        "base_instructions": GROK_BASE_INSTRUCTIONS,
+        "base_instructions": overlay,
         "model_messages": null,
         "include_skills_usage_instructions": true,
         "include_plugin_usage_instructions": true,
@@ -645,6 +658,12 @@ pub enum PickerError {
     TooManyModels,
     #[error("could not serialize generated picker catalog: {0}")]
     SerializeCatalog(String),
+    #[error("Grok overlay file is unreadable: {0}")]
+    UnreadableOverlay(String),
+    #[error("Grok overlay file is empty")]
+    EmptyOverlay,
+    #[error("Grok overlay file is not UTF-8")]
+    OverlayNotUtf8,
     #[error("picker managed-state JSON is malformed: {0}")]
     MalformedManagedState(String),
     #[error("picker managed state is invalid: {0}")]
@@ -658,6 +677,14 @@ pub enum PickerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn overlay() -> &'static str {
+        "Grok overlay for tests.\nやったフリをするな\n"
+    }
+
+    fn ssot_overlay() -> String {
+        load_grok_overlay(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Grok.md")).unwrap()
+    }
 
     fn native_catalog() -> Vec<u8> {
         serde_json::to_vec(&json!({
@@ -699,7 +726,7 @@ mod tests {
         let before: Value = serde_json::from_slice(&source).unwrap();
         let grok = CatalogSnapshot::new(["grok-4.6"], Some("\"grok-v1\"".to_owned())).unwrap();
 
-        let generated = generate_picker_catalog(&source, &grok).unwrap();
+        let generated = generate_picker_catalog(&source, &grok, overlay()).unwrap();
         let after: Value = serde_json::from_slice(generated.bytes()).unwrap();
 
         assert_eq!(generated.native_model_count(), 1);
@@ -737,27 +764,26 @@ mod tests {
         assert_eq!(after["models"][1]["supports_parallel_tool_calls"], true);
         assert_eq!(
             after["models"][1]["base_instructions"],
-            GROK_BASE_INSTRUCTIONS
+            overlay()
         );
         assert_eq!(serde_json::from_slice::<Value>(&source).unwrap(), before);
     }
 
     #[test]
     fn grok_overlay_comes_from_grok_md_ssot() {
-        assert!(GROK_BASE_INSTRUCTIONS.contains("Grok 専用実行 overlay の SSOT"));
-        assert!(GROK_BASE_INSTRUCTIONS.contains("宣言した操作はそのターンで実行する"));
-        assert!(GROK_BASE_INSTRUCTIONS.contains("やったフリをするな"));
+        let ssot = ssot_overlay();
+        assert!(ssot.contains("Grok 専用実行 overlay の SSOT"));
+        assert!(ssot.contains("ユーザー向け本文まで出せ"));
+        assert!(ssot.contains("やったフリをするな"));
         let grok = CatalogSnapshot::new(["grok-4.6"], None).unwrap();
-        let generated = generate_picker_catalog(&native_catalog(), &grok).unwrap();
+        let generated = generate_picker_catalog(&native_catalog(), &grok, &ssot).unwrap();
         let after: Value = serde_json::from_slice(generated.bytes()).unwrap();
-        assert_eq!(
-            after["models"][1]["base_instructions"],
-            GROK_BASE_INSTRUCTIONS
-        );
-        assert_ne!(
-            after["models"][0]["base_instructions"],
-            GROK_BASE_INSTRUCTIONS
-        );
+        assert_eq!(after["models"][1]["base_instructions"], ssot);
+        assert_ne!(after["models"][0]["base_instructions"], ssot);
+        let other = generate_picker_catalog(&native_catalog(), &grok, overlay()).unwrap();
+        let other_after: Value = serde_json::from_slice(other.bytes()).unwrap();
+        assert_eq!(other_after["models"][1]["base_instructions"], overlay());
+        assert_ne!(other_after["models"][1]["base_instructions"], ssot);
     }
 
     #[test]
@@ -769,7 +795,7 @@ mod tests {
             .expect("CODEX_NATIVE_CATALOG must name that consumer's bundled catalog");
         let native_bytes = std::fs::read(native_catalog).unwrap();
         let grok = CatalogSnapshot::new(["grok-4.6"], Some("\"grok-v1\"".to_owned())).unwrap();
-        let generated = generate_picker_catalog(&native_bytes, &grok).unwrap();
+        let generated = generate_picker_catalog(&native_bytes, &grok, overlay()).unwrap();
         let isolated_home = tempfile::tempdir().unwrap();
         let generated_path = isolated_home.path().join("picker-models.json");
         std::fs::write(&generated_path, generated.bytes()).unwrap();
@@ -806,7 +832,7 @@ mod tests {
     #[test]
     fn future_admitted_grok_model_flows_without_a_picker_registry_change() {
         let grok = CatalogSnapshot::new(["grok-4.7", "grok-4.6"], None).unwrap();
-        let generated = generate_picker_catalog(&native_catalog(), &grok).unwrap();
+        let generated = generate_picker_catalog(&native_catalog(), &grok, overlay()).unwrap();
         let value: Value = serde_json::from_slice(generated.bytes()).unwrap();
         let slugs: Vec<&str> = value["models"]
             .as_array()
@@ -827,7 +853,7 @@ mod tests {
         let grok = CatalogSnapshot::new(["grok-4.6"], None).unwrap();
 
         assert_eq!(
-            generate_picker_catalog(&native, &grok),
+            generate_picker_catalog(&native, &grok, overlay()),
             Err(PickerError::DuplicateSlug("grok-4.6".to_owned()))
         );
     }
@@ -836,11 +862,11 @@ mod tests {
     fn malformed_or_schema_invalid_native_catalog_is_rejected() {
         let grok = CatalogSnapshot::new(["grok-4.6"], None).unwrap();
         assert!(matches!(
-            generate_picker_catalog(b"{", &grok),
+            generate_picker_catalog(b"{", &grok, overlay()),
             Err(PickerError::MalformedNativeCatalog(_))
         ));
         assert_eq!(
-            generate_picker_catalog(br#"{"models":[]}"#, &grok),
+            generate_picker_catalog(br#"{"models":[]}"#, &grok, overlay()),
             Err(PickerError::InvalidNativeCatalog(
                 "native models array must not be empty"
             ))
@@ -852,7 +878,7 @@ mod tests {
             .remove("base_instructions");
         let invalid = serde_json::to_vec(&json!({"models": [missing_instructions]})).unwrap();
         assert_eq!(
-            generate_picker_catalog(&invalid, &grok),
+            generate_picker_catalog(&invalid, &grok, overlay()),
             Err(PickerError::InvalidModelSchema {
                 index: 0,
                 field: "base_instructions or model_messages.instructions_template"
@@ -866,10 +892,10 @@ mod tests {
         let second = CatalogSnapshot::new(["grok-4.6", "grok-4.7"], None).unwrap();
 
         assert_eq!(
-            generate_picker_catalog(&native_catalog(), &first)
+            generate_picker_catalog(&native_catalog(), &first, overlay())
                 .unwrap()
                 .bytes(),
-            generate_picker_catalog(&native_catalog(), &second)
+            generate_picker_catalog(&native_catalog(), &second, overlay())
                 .unwrap()
                 .bytes()
         );

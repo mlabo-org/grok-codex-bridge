@@ -137,6 +137,9 @@ pub struct PickerInstallArgs {
     /// Loopback address used by the installed bridge provider.
     #[arg(long, default_value = "127.0.0.1:8746", value_name = "ADDRESS")]
     pub bind: String,
+    /// Grok.md SSOT read at catalog generation. Defaults to ./Grok.md when that file exists.
+    #[arg(long, value_name = "FILE")]
+    pub grok_overlay: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]

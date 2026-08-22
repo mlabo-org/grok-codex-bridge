@@ -22,7 +22,7 @@ pub use grok::{
 pub use native::{NativeRouteState, NativeUpstream};
 pub use picker::{
     ArtifactIdentity, ConfigRollbackOwnership, GeneratedPickerCatalog, PickerError,
-    PickerManagedState, generate_picker_catalog,
+    PickerManagedState, generate_picker_catalog, load_grok_overlay,
 };
 pub use protocol::{
     NormalizedResponsesRequest, ProtocolError, TextStreamEventKind, TextStreamState,
