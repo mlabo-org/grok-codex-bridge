@@ -71,7 +71,7 @@ rollback commandを報告してください。
 
 ```text
 Codexハーネス
-  エージェントループ · ツール · 権限 · MCP · Skills · セッション
+  エージェントループ · ツール · 権限 · MCP · Skills · サブエージェント · セッション
         |
         | capabilityで保護されたResponsesリクエスト
         v
@@ -109,6 +109,7 @@ V1.0は保守的な公開ルートです。Codexの分離プロファイルを�
 - ループバック専用listenerとcapability保護されたroute。不正なcapabilityには `404` を返します。
 - install、LaunchAgentサービス、診断、ピッカー有効化、設定の完全復元を可逆に管理。
 - request path、capability、認証情報、response bodyを残さないメタデータ限定ログ。
+- Grok選択セッションからも公式Codexサブエージェントを使える。spawn時に `model` / `reasoning_effort` を省略すると、親のGrokではなくCodexの `[agents]` デフォルトが使われる。
 
 ## 必要環境
 
@@ -172,6 +173,17 @@ CODEX_DIR="${CODEX_HOME:-"$HOME/.codex"}"
 `--grok-overlay` を省略できるのは、カレントディレクトリに `Grok.md` があるときだけです。overlay を直したあとは `picker install` を再実行し、新しい Codex CLI プロセスを起動するか Desktop を完全再起動してください。既存の Grok セッションは、起動時のカタログのままです。
 
 この overlay は第二の憲法ではなく、仕事の伴走契約です。宣言した操作を同じターンでやり切り、必要なツールを呼んだあと、ツール呼び出しや進捗報告だけで終わらずユーザー向け本文まで出させます。統合ピッカーでカタログを書き直して再起動したセッションでは、Grok が実際に読むのがこの経路です。
+
+### 公式サブエージェント
+
+サブエージェントの起動はCodexが所有します。bridgeはprovider protocolを変換するだけで、workerを起動しません。
+
+V1.1統合ピッカーのliveセッションで確認済みです。
+
+- Grok親から公式Codexサブエージェント（`spawn_agent` / `wait_agent` / `close_agent`）を起動できる。
+- spawn時に `model` または `reasoning_effort` を省略すると、Codex設定の `[agents].default_subagent_model` と `[agents].default_subagent_reasoning_effort` が使われる。親のGrokモデルや推論深度にはならない。
+- 子をGrokで動かすには、`model` を許可済みカタログID（`grok-4.6` や `grok-4.5`）へ明示する。
+- 推論深度も `reasoning_effort` を明示する。現行のGrokカタログは `low` / `medium` / `high` / `xhigh` を公開する。`grok-4.5` の `xhigh` まで確認済み。
 
 ### 現在確認されているresume制限
 

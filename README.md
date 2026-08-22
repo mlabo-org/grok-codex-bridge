@@ -74,7 +74,7 @@ Normal use never compiles on demand. Cargo is used only for development and cons
 
 ```text
 Codex harness
-  agent loop · tools · permissions · MCP · Skills · sessions
+  agent loop · tools · permissions · MCP · Skills · subagents · sessions
         |
         | capability-scoped Responses request
         v
@@ -112,6 +112,7 @@ V1.0 is the conservative public route: it uses a separate Codex profile and leav
 - Loopback-only listener and capability-scoped routes; invalid capabilities return `404`.
 - Reversible install, LaunchAgent service lifecycle, diagnostics, picker activation, and exact configuration rollback.
 - Metadata-only logging that does not log request paths, capability material, credentials, or response bodies.
+- Official Codex subagents stay on the Codex harness from Grok-backed sessions. Omitted spawn `model` / `reasoning_effort` follow Codex `[agents]` defaults, not the parent Grok session.
 
 ## Requirements
 
@@ -175,6 +176,17 @@ Admitted Grok catalog entries, including the bootstrap `grok-4.5` and `grok-4.6`
 Omit `--grok-overlay` only when the current working directory already contains `Grok.md`. After changing the overlay, run `picker install` again and start a fresh Codex CLI process or fully relaunch Desktop. Existing Grok sessions keep the overlay that was in the catalog when they started.
 
 The overlay is a companion contract, not a second constitution. It tells Grok to finish declared work in the same turn: call tools when needed, then return the user-visible result instead of ending on tool calls or progress notes alone. In a merged-picker session after catalog refresh and restart, that path is the one Codex actually loads for Grok.
+
+### Official subagents
+
+Codex owns subagent dispatch. The bridge only translates provider protocol; it does not spawn workers.
+
+Verified on a live V1.1 picker session:
+
+- A Grok parent can spawn official Codex subagents (`spawn_agent` / `wait_agent` / `close_agent`).
+- Omitting `model` or `reasoning_effort` applies Codex `[agents].default_subagent_model` and `[agents].default_subagent_reasoning_effort`. Those values are not the parent Grok model or effort.
+- To run the child as Grok, set `model` to an admitted catalog id such as `grok-4.6` or `grok-4.5`.
+- To set reasoning depth, set `reasoning_effort` explicitly. Current Grok catalog entries advertise `low`, `medium`, `high`, and `xhigh`. `grok-4.5` at `xhigh` has been verified.
 
 ### Current resume limitation
 
