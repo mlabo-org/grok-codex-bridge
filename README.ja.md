@@ -83,7 +83,7 @@ grok-codex-bridge（Rust製ネイティブ実行ファイル）
 Grok / xAI
 ```
 
-ブリッジ自身はツールを実行しません。validな関数定義、順序付きツール呼び出しと結果、テキスト、画像URLとdata URI、reasoning summary、必要なResponses制御値を保持し、実行責任はCodexに残します。GPT/Grok切替時はproviderで再生できないitem IDとreasoning stateだけを除外し、tool call/outputを結ぶ`call_id`を保持します。
+ブリッジ自身はツールを実行しません。validな関数定義、順序付きツール呼び出しと結果、テキスト、画像URLとdata URI、reasoning summary、必要なResponses制御値を保持し、実行責任はCodexに残します。xAIがrequest全体を拒否するfunction schemaはGrokへの投影からのみ省略し、Codex側のcatalog、tool_search履歴、Native GPT経路は元のtoolを保持します。GPT/Grok切替時はproviderで再生できないitem IDとreasoning stateだけを除外し、tool call/outputを結ぶ`call_id`を保持します。
 
 ## 現在の状態
 

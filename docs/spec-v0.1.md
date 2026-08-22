@@ -211,7 +211,7 @@ Responses input messageのrole、content order、`input_text`を対応するResp
 
 ## 22. Tool Definition
 
-Codexから渡されたfunction toolのname、description、parameters schemaを必要な範囲で保持する。Grok providerへの投影だけは、xAIがrequest全体を拒否するroot unionまたはnullable object schemaをplain object rootへ限定的に展開し、宣言型と矛盾する`enum`/`const` literalを除去する。これはCodex app toolの実行時argument validationを置換せず、Native GPT経路のschemaは書換えない。必要なtool namespace projection以外の意味を変更しない。
+Codexから渡されたfunction toolのname、description、parameters schemaを必要な範囲で保持する。Grok providerへの投影だけは、xAIがrequest全体を拒否するroot unionまたはnullable object schemaをplain object rootへ限定的に展開し、宣言型と矛盾する`enum`/`const` literalを除去する。入れ子の未解決`$ref`、空の`anyOf`/`oneOf`/`enum`、boolean property schema、tuple `items`、`minContains`/`maxContains`のように、忠実な契約へ書き換えられずrequest全体を400にするschemaは、そのfunctionだけをGrok toolsから省略する。Codex側のcatalog、tool_search履歴、Native GPT経路は保持する。これはCodex app toolの実行時argument validationを置換せず、必要なtool namespace projection以外の意味を変更しない。
 
 ## 23. Tool Choice
 

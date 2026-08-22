@@ -227,12 +227,6 @@ enum ToolsField {
     List(Vec<ProjectedTool>),
 }
 
-impl ToolsField {
-    fn has_projected_tools(&self) -> bool {
-        matches!(self, Self::List(tools) if !tools.is_empty())
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 enum ProjectedTool {
     Function(FunctionTool),
@@ -425,11 +419,18 @@ impl NormalizedResponsesRequest {
                     .collect(),
             ),
         );
-        insert_tools(&mut object, &self.tools);
-        // xAI rejects `tool_choice` when no projected tool is present, even
-        // though Codex requires and validates the field on its side.
-        if self.tools.has_projected_tools() {
-            object.insert("tool_choice".into(), self.tool_choice.to_value());
+        let projected_tools = project_tools_for_xai(&self.tools);
+        if let Some(tools) = projected_tools {
+            let include_tool_choice = match &tools {
+                Value::Array(items) => !items.is_empty(),
+                _ => false,
+            };
+            object.insert("tools".into(), tools);
+            // xAI rejects `tool_choice` when no projected tool is present, even
+            // though Codex requires and validates the field on its side.
+            if include_tool_choice {
+                object.insert("tool_choice".into(), self.tool_choice.to_value());
+            }
         }
         object.insert(
             "parallel_tool_calls".into(),
@@ -2222,29 +2223,129 @@ fn validate_tool_choice(choice: &ToolChoice, tools: &ToolsField) -> Result<(), P
     }
 }
 
-fn insert_tools(object: &mut Map<String, Value>, tools: &ToolsField) {
+fn project_tools_for_xai(tools: &ToolsField) -> Option<Value> {
     match tools {
-        ToolsField::Absent => {}
-        ToolsField::Null => {
-            object.insert("tools".into(), Value::Null);
-        }
-        ToolsField::List(tools) => {
-            object.insert(
-                "tools".into(),
-                Value::Array(
-                    tools
-                        .iter()
-                        .map(|tool| match tool {
-                            ProjectedTool::Function(tool) => tool.to_value(),
-                            ProjectedTool::HostedWebSearch => {
-                                serde_json::json!({"type": "web_search"})
-                            }
-                        })
-                        .collect(),
-                ),
-            );
+        ToolsField::Absent => None,
+        ToolsField::Null => Some(Value::Null),
+        ToolsField::List(tools) => Some(Value::Array(
+            tools.iter().filter_map(project_tool_for_xai).collect(),
+        )),
+    }
+}
+
+fn project_tool_for_xai(tool: &ProjectedTool) -> Option<Value> {
+    match tool {
+        ProjectedTool::HostedWebSearch => Some(serde_json::json!({"type": "web_search"})),
+        ProjectedTool::Function(tool) => {
+            let projected = tool.to_value();
+            if tool.name == "tool_search" {
+                return Some(projected);
+            }
+            let Some(parameters) = projected.get("parameters") else {
+                return Some(projected);
+            };
+            match xai_incompatible_tool_schema(parameters) {
+                Some(reason) => {
+                    tracing::warn!(
+                        tool = %tool.name,
+                        reason,
+                        "omitting xAI-incompatible function tool from provider projection"
+                    );
+                    None
+                }
+                None => Some(projected),
+            }
         }
     }
+}
+
+/// xAI rejects the whole Responses request when even one function schema is
+/// illegal. Nested defects cannot be rewritten into a faithful contract, so
+/// the provider projection omits that function instead of poisoning spawn and
+/// other valid tools. Codex parsing and the native route keep the original
+/// catalog.
+fn xai_incompatible_tool_schema(schema: &Value) -> Option<&'static str> {
+    walk_xai_tool_schema(schema, schema, 0, false)
+}
+
+fn walk_xai_tool_schema(
+    node: &Value,
+    root: &Value,
+    depth: usize,
+    property_schema: bool,
+) -> Option<&'static str> {
+    if depth > MAX_TOOL_SCHEMA_LITERAL_DEPTH {
+        return None;
+    }
+    match node {
+        Value::Bool(_) if property_schema => Some("boolean_property_schema"),
+        Value::Object(map) => {
+            if let Some(Value::String(reference)) = map.get("$ref") {
+                if resolve_json_pointer(root, reference).is_none() {
+                    return Some("unresolvable_ref");
+                }
+            }
+            for key in ["anyOf", "oneOf", "enum"] {
+                if matches!(map.get(key), Some(Value::Array(values)) if values.is_empty()) {
+                    return Some("empty_union");
+                }
+            }
+            if map.contains_key("maxContains") || map.contains_key("minContains") {
+                return Some("contains_constraint");
+            }
+            if matches!(map.get("items"), Some(Value::Array(_))) {
+                return Some("tuple_items");
+            }
+            for (key, child) in map {
+                if *key == "properties" || *key == "patternProperties" {
+                    if let Value::Object(properties) = child {
+                        for property in properties.values() {
+                            if let Some(reason) =
+                                walk_xai_tool_schema(property, root, depth + 1, true)
+                            {
+                                return Some(reason);
+                            }
+                        }
+                        continue;
+                    }
+                }
+                if let Some(reason) = walk_xai_tool_schema(child, root, depth + 1, false) {
+                    return Some(reason);
+                }
+            }
+            None
+        }
+        Value::Array(items) => {
+            for item in items {
+                if let Some(reason) = walk_xai_tool_schema(item, root, depth + 1, false) {
+                    return Some(reason);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn resolve_json_pointer<'a>(root: &'a Value, reference: &str) -> Option<&'a Value> {
+    let pointer = reference.strip_prefix('#')?;
+    if pointer.is_empty() {
+        return Some(root);
+    }
+    let pointer = pointer.strip_prefix('/')?;
+    let mut current = root;
+    for raw_segment in pointer.split('/') {
+        let segment = raw_segment.replace("~1", "/").replace("~0", "~");
+        current = match current {
+            Value::Object(map) => map.get(&segment)?,
+            Value::Array(items) => {
+                let index = segment.parse::<usize>().ok()?;
+                items.get(index)?
+            }
+            _ => return None,
+        };
+    }
+    Some(current)
 }
 
 fn insert_optional(object: &mut Map<String, Value>, key: &str, field: &OptionalJson) {
@@ -2855,6 +2956,192 @@ mod tests {
                 .get(INTERNAL_MESSAGE_METADATA_FIELD)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn xai_projection_omits_unresolvable_ref_without_dropping_spawn_agent() {
+        let mut request = request_fixture();
+        request["tools"] = json!([{
+            "type": "tool_search",
+            "execution": "client",
+            "description": "Search deferred tools.",
+            "parameters": {"type": "object", "properties": {"query": {"type": "string"}}}
+        }]);
+        request["input"] = json!([
+            {
+                "type": "tool_search_call",
+                "call_id": "search-1",
+                "execution": "client",
+                "arguments": {"query": "spawn subagent official Codex multi-agent tools"}
+            },
+            {
+                "type": "tool_search_output",
+                "call_id": "search-1",
+                "status": "completed",
+                "execution": "client",
+                "tools": [
+                    {
+                        "type": "namespace",
+                        "name": "multi_agent_v1",
+                        "description": "Tools for spawning and managing sub-agents.",
+                        "tools": [{
+                            "type": "function",
+                            "name": "spawn_agent",
+                            "description": "Spawn a sub-agent.",
+                            "strict": false,
+                            "defer_loading": true,
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"message": {"type": "string"}},
+                                "additionalProperties": false
+                            }
+                        }]
+                    },
+                    {
+                        "type": "namespace",
+                        "name": "mcp__agent_video_studio",
+                        "description": "Tools in the mcp__agent_video_studio namespace.",
+                        "tools": [
+                            {
+                                "type": "function",
+                                "name": "inspect_auto_edit_plan",
+                                "description": "Validate an inline avs.auto-edit-plan.v1 from Codex.",
+                                "strict": false,
+                                "defer_loading": true,
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "plan": {
+                                            "type": "object",
+                                            "properties": {
+                                                "metadata": {
+                                                    "$ref": "#/properties/plan/properties/operations/items/anyOf/1/properties/clips/items/properties/properties/properties/metadata"
+                                                },
+                                                "operations": {
+                                                    "type": "array",
+                                                    "items": {}
+                                                }
+                                            },
+                                            "additionalProperties": false
+                                        }
+                                    },
+                                    "required": ["plan"],
+                                    "additionalProperties": false
+                                }
+                            },
+                            {
+                                "type": "function",
+                                "name": "plan_silence_removal",
+                                "description": "Build a silence-removal plan for Codex.",
+                                "strict": false,
+                                "defer_loading": true,
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "metadata": {
+                                            "type": "object",
+                                            "properties": {},
+                                            "additionalProperties": {
+                                                "anyOf": [
+                                                    {"type": "string"},
+                                                    {
+                                                        "type": "array",
+                                                        "items": {
+                                                            "$ref": "#/properties/metadata/additionalProperties"
+                                                        }
+                                                    },
+                                                    {
+                                                        "type": "object",
+                                                        "properties": {},
+                                                        "additionalProperties": {
+                                                            "$ref": "#/properties/metadata/additionalProperties"
+                                                        }
+                                                    }
+                                                ]
+                                            }
+                                        }
+                                    },
+                                    "additionalProperties": false
+                                }
+                            }
+                        ]
+                    }
+                ]
+            }
+        ]);
+
+        assert_eq!(
+            upstream_tool_names(&request),
+            vec![
+                "tool_search",
+                "multi_agent_v1__spawn_agent",
+                "mcp__agent_video_studio__plan_silence_removal"
+            ]
+        );
+    }
+
+    #[test]
+    fn xai_projection_omits_documented_request_killing_schemas_and_keeps_resolvable_refs() {
+        let mut request = request_fixture();
+        request["tools"] = json!([
+            {
+                "type": "function",
+                "name": "boolean_property",
+                "description": "Illegal boolean property schema.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"flag": true}
+                }
+            },
+            {
+                "type": "function",
+                "name": "empty_any_of",
+                "description": "Illegal empty anyOf.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"value": {"anyOf": []}}
+                }
+            },
+            {
+                "type": "function",
+                "name": "tuple_items",
+                "description": "Illegal tuple items.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pair": {"type": "array", "items": [{"type": "string"}, {"type": "number"}]}
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "name": "resolvable_ref",
+                "description": "Legal local $ref.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"item": {"$ref": "#/$defs/item"}},
+                    "$defs": {
+                        "item": {
+                            "type": "object",
+                            "properties": {"id": {"type": "string"}}
+                        }
+                    }
+                }
+            }
+        ]);
+
+        assert_eq!(upstream_tool_names(&request), vec!["resolvable_ref"]);
+    }
+
+    fn upstream_tool_names(request: &Value) -> Vec<String> {
+        NormalizedResponsesRequest::parse(request.clone())
+            .unwrap()
+            .to_xai_value()["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_owned))
+            .collect()
     }
 
     #[test]
