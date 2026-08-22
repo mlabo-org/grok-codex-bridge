@@ -155,7 +155,8 @@ CODEX_DIR="${CODEX_HOME:-"$HOME/.codex"}"
 
 ./dist/aarch64-apple-darwin/grok-codex-bridge picker install \
   --native-catalog "$CODEX_DIR/models_cache.json" \
-  --native-upstream-base-url "https://chatgpt.com/backend-api/codex"
+  --native-upstream-base-url "https://chatgpt.com/backend-api/codex" \
+  --grok-overlay "$PWD/Grok.md"
 ```
 
 `--native-catalog` は実行時に既存の絶対パスへ解決される必要があります。利用中のCodex認証ルートで別の公式上流が有効な場合、例のURLをそのまま流用しないでください。
@@ -163,6 +164,14 @@ CODEX_DIR="${CODEX_HOME:-"$HOME/.codex"}"
 有効化後は新しいCodex CLIプロセスを起動します。Codex Desktopで試す場合は、完全終了してから再起動してください。
 
 許可済みGrokカタログエントリ（bootstrapの `grok-4.5` / `grok-4.6` を含む）は272,000トークンのコンテキストウィンドウを公開します。これによりCodexは、不明なwindow向けの小さなfallbackではなく、Nativeモデルと同じ標準2%のSkills説明予算計算を適用します。
+
+### Grok.md overlay
+
+[`Grok.md`](Grok.md) は Grok 専用実行 overlay の正本です。`picker install` がこのファイルをディスクから読み、生成カタログの許可済み Grok 行の `base_instructions` へそのまま入れます。Codex が消費するのは生成カタログです。Native GPT 行には届きません。本文はコンパイル成果物へ焼き込まず、HTTP 毎に再読込もしません。
+
+`--grok-overlay` を省略できるのは、カレントディレクトリに `Grok.md` があるときだけです。overlay を直したあとは `picker install` を再実行し、新しい Codex CLI プロセスを起動するか Desktop を完全再起動してください。既存の Grok セッションは、起動時のカタログのままです。
+
+この overlay は第二の憲法ではなく、仕事の伴走契約です。宣言した操作を同じターンでやり切り、必要なツールを呼んだあと、ツール呼び出しや進捗報告だけで終わらずユーザー向け本文まで出させます。統合ピッカーでカタログを書き直して再起動したセッションでは、Grok が実際に読むのがこの経路です。
 
 ### 現在確認されているresume制限
 

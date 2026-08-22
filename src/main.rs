@@ -107,6 +107,19 @@ fn picker_command(command: PickerCommand) -> Result<ExitCode, OperationError> {
 fn picker_install_command(arguments: PickerInstallArgs) -> Result<ExitCode, OperationError> {
     let paths = resolve_lifecycle_paths(&arguments.paths)?;
     let native_catalog_path = require_absolute(arguments.native_catalog, "native catalog")?;
+    let grok_overlay_path = match arguments.grok_overlay {
+        Some(path) => require_absolute(path, "Grok overlay")?,
+        None => {
+            let candidate = env::current_dir()
+                .map_err(OperationError::CurrentExecutable)?
+                .join("Grok.md");
+            if candidate.is_file() {
+                require_absolute(candidate, "Grok overlay")?
+            } else {
+                return Err(OperationError::MissingGrokOverlay);
+            }
+        }
+    };
     let bind = arguments
         .bind
         .parse::<SocketAddr>()
@@ -118,6 +131,7 @@ fn picker_install_command(arguments: PickerInstallArgs) -> Result<ExitCode, Oper
             install_root: paths.install_root,
             codex_home: paths.codex_home,
             native_catalog_path,
+            grok_overlay_path,
             native_upstream,
             bind,
         },
@@ -575,6 +589,8 @@ enum OperationError {
     CurrentExecutable(#[source] std::io::Error),
     #[error("the bind address must be a valid socket address")]
     InvalidBind,
+    #[error("Grok overlay was not provided; pass --grok-overlay or run from the repo root that contains Grok.md")]
+    MissingGrokOverlay,
     #[error("the rendered LaunchAgent was not UTF-8")]
     InvalidLaunchAgentEncoding,
     #[error(transparent)]

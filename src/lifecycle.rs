@@ -77,6 +77,7 @@ pub struct PickerInstallRequest {
     pub install_root: PathBuf,
     pub codex_home: PathBuf,
     pub native_catalog_path: PathBuf,
+    pub grok_overlay_path: PathBuf,
     pub native_upstream: NativeUpstream,
     pub bind: SocketAddr,
 }
@@ -355,6 +356,7 @@ pub fn install_picker(
     validate_absolute_clean(&request.install_root)?;
     validate_absolute_clean(&request.codex_home)?;
     validate_absolute_clean(&request.native_catalog_path)?;
+    validate_absolute_clean(&request.grok_overlay_path)?;
     validate_safe_root(&request.install_root, &request.codex_home)?;
     if !request.bind.ip().is_loopback() || request.bind.port() == 0 {
         return Err(LifecycleError::NonLoopbackBind);
@@ -383,8 +385,10 @@ pub fn install_picker(
         .load()
         .map_err(LifecycleError::Catalog)?
         .ok_or(LifecycleError::PickerCatalogUnavailable)?;
-    let generated =
-        generate_picker_catalog(&native_bytes, &grok_catalog).map_err(LifecycleError::Picker)?;
+    let overlay = crate::picker::load_grok_overlay(&request.grok_overlay_path)
+        .map_err(LifecycleError::Picker)?;
+    let generated = generate_picker_catalog(&native_bytes, &grok_catalog, &overlay)
+        .map_err(LifecycleError::Picker)?;
     let native_route = NativeRouteState::new(
         request.native_upstream,
         generated.native_model_slugs().iter().cloned(),
@@ -2239,6 +2243,7 @@ mod tests {
             install_root: fixture.install_root.clone(),
             codex_home: fixture.codex_home.clone(),
             native_catalog_path: native_catalog.clone(),
+            grok_overlay_path: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Grok.md"),
             native_upstream: NativeUpstream::ChatgptCodex,
             bind: "127.0.0.1:4545".parse().unwrap(),
         })
@@ -2369,6 +2374,7 @@ mod tests {
             install_root: fixture.install_root.clone(),
             codex_home: fixture.codex_home.clone(),
             native_catalog_path: native_catalog,
+            grok_overlay_path: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Grok.md"),
             native_upstream: NativeUpstream::ChatgptCodex,
             bind: "127.0.0.1:4545".parse().unwrap(),
         })
@@ -2457,6 +2463,7 @@ mod tests {
             install_root: fixture.install_root.clone(),
             codex_home: fixture.codex_home.clone(),
             native_catalog_path: native_catalog.clone(),
+            grok_overlay_path: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Grok.md"),
             native_upstream: NativeUpstream::ChatgptCodex,
             bind: "127.0.0.1:4545".parse().unwrap(),
         })
@@ -2625,6 +2632,7 @@ mod tests {
                 install_root: fixture.install_root.clone(),
                 codex_home: fixture.codex_home.clone(),
                 native_catalog_path: native_catalog.clone(),
+                grok_overlay_path: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Grok.md"),
                 native_upstream: NativeUpstream::ChatgptCodex,
                 bind: "127.0.0.1:4545".parse().unwrap(),
             });
