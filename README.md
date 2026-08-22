@@ -86,7 +86,7 @@ grok-codex-bridge (native Rust executable)
 Grok / xAI
 ```
 
-The bridge does not execute tool calls. It preserves valid function definitions, ordered tool calls and results, text, image URLs and data URIs, reasoning summaries, and required Responses controls while Codex remains responsible for execution. Function schemas that xAI would reject for the entire request are omitted from the Grok projection only; Codex catalog, tool_search history, and the Native GPT path keep the original tools. On GPT/Grok switches it excludes only provider-unreplayable item IDs and reasoning state while preserving the `call_id` links between tool calls and outputs. If Grok closes after useful Codex-consumed events without a terminal marker, the bridge synthesizes only `response.completed`; it does not invent output items, and it does not synthesize after `response.failed` or `response.incomplete`.
+The bridge does not execute tool calls. It preserves valid function definitions, ordered tool calls and results, text, image URLs and data URIs, reasoning summaries, and required Responses controls while Codex remains responsible for execution. Function schemas that xAI would reject for the entire request are omitted from the Grok projection only; Codex catalog, tool_search history, and the Native GPT path keep the original tools. Integer-valued JSON numbers in function and tool_search arguments, such as `8.0`, are rewritten to JSON integers; real fractions are unchanged. Replayable message, function, and tool-search history is forwarded to Grok; completed Native `custom_tool_call` items and foreign reasoning are omitted. On GPT/Grok switches it excludes only provider-unreplayable item IDs and reasoning state while preserving the `call_id` links between tool calls and outputs. If Grok closes after useful Codex-consumed events without a terminal marker, the bridge synthesizes only `response.completed`; it does not invent output items, and it does not synthesize after `response.failed` or `response.incomplete`.
 
 ## Project status
 
@@ -103,8 +103,8 @@ V1.0 is the conservative public route: it uses a separate Codex profile and leav
 
 ## Features
 
-- Tolerant Codex Responses-to-xAI Responses provider projection with `store: false` and full input history; no legacy Chat Completions conversion.
-- Codex-consumed SSE extraction for text, reasoning summaries, function calls, and terminal/usage events. Unknown auxiliary events do not terminate the stream. If Grok ends a useful stream without `response.completed`, the bridge closes it with that Codex lifecycle marker only so the turn is not reported as `stream closed before response.completed`.
+- Tolerant Codex Responses-to-xAI Responses provider projection with `store: false`. Replayable message, function, and tool-search history is forwarded; completed Native `custom_tool_call` items and foreign reasoning are omitted from Grok requests. No legacy Chat Completions conversion.
+- Codex-consumed SSE extraction for text, reasoning summaries, function calls, and terminal/usage events. Unknown auxiliary events do not terminate the stream. Integer-valued JSON numbers in function and tool_search arguments are canonicalized to JSON integers. If Grok ends a useful stream without `response.completed`, the bridge closes it with that Codex lifecycle marker only so the turn is not reported as `stream closed before response.completed`.
 - Ordered function calls/results and mixed text/image inputs without downloading or re-encoding image data.
 - Read-only bridge-side use of the official Grok session credential, with in-memory zeroizing cache reload when the source changes. On hard expiry during a provider request, one bounded non-interactive official-CLI invocation may trigger the CLI's own silent OIDC refresh; the bridge never handles refresh tokens, performs OAuth, or writes the credential file.
 - Fixed official xAI origin through rustls, redirects disabled, and typed authentication, rate-limit, status, and stream failures.
@@ -143,7 +143,7 @@ The launcher is repository-scoped. Moving or symlinking the shell script by itse
 
 ## Experimental V1.1 merged picker
 
-The V1.1 route publishes a merged model catalog so Native GPT and admitted Grok models can be selected in one Codex model picker. Native model traffic remains bound to the captured first-party Codex upstream; Grok traffic is sent to xAI through the bridge.
+The V1.1 route publishes a merged model catalog so Native GPT and admitted Grok models can be selected in one Codex model picker. Native GPT `responses` and `responses/compact` stay on the captured first-party Codex upstream. `images/generations`, `images/edits`, and `alpha/search` are Native-only passthrough endpoints with no Grok protocol conversion. Grok traffic is sent to xAI through the bridge. Grok has no authoritative `responses/compact` contract, so that route fails closed for admitted Grok models.
 
 First materialize and install the native bridge:
 
@@ -317,6 +317,7 @@ The product scope and acceptance contracts are defined in [docs/spec-v0.1.md](do
 ## Source layout
 
 ```text
+src/lib.rs                           crate root
 src/cli.rs                           CLI boundary
 src/config.rs                        versioned runtime configuration
 src/credential.rs                    read-only Grok credential boundary
@@ -327,6 +328,7 @@ src/protocol.rs                      Responses provider projection and SSE extra
 src/server.rs                        capability-scoped loopback service
 src/lifecycle.rs                     reversible install and rollback ownership
 src/picker.rs                        merged Native GPT/Grok catalog generation
+Grok.md                              Grok overlay SSOT read at picker catalog generation
 src/picker_activation.rs             atomic picker publication and activation
 src/launchd.rs                       typed user LaunchAgent boundary
 scripts/materialize-macos.sh         deterministic macOS arm64 materialization
