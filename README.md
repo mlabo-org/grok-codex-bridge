@@ -86,7 +86,7 @@ grok-codex-bridge (native Rust executable)
 Grok / xAI
 ```
 
-The bridge does not execute tool calls. It preserves valid function definitions, ordered tool calls and results, text, image URLs and data URIs, reasoning summaries, and required Responses controls while Codex remains responsible for execution. Function schemas that xAI would reject for the entire request are omitted from the Grok projection only; Codex catalog, tool_search history, and the Native GPT path keep the original tools. On GPT/Grok switches it excludes only provider-unreplayable item IDs and reasoning state while preserving the `call_id` links between tool calls and outputs.
+The bridge does not execute tool calls. It preserves valid function definitions, ordered tool calls and results, text, image URLs and data URIs, reasoning summaries, and required Responses controls while Codex remains responsible for execution. Function schemas that xAI would reject for the entire request are omitted from the Grok projection only; Codex catalog, tool_search history, and the Native GPT path keep the original tools. On GPT/Grok switches it excludes only provider-unreplayable item IDs and reasoning state while preserving the `call_id` links between tool calls and outputs. If Grok closes after useful Codex-consumed events without a terminal marker, the bridge synthesizes only `response.completed`; it does not invent output items, and it does not synthesize after `response.failed` or `response.incomplete`.
 
 ## Project status
 
@@ -104,7 +104,7 @@ V1.0 is the conservative public route: it uses a separate Codex profile and leav
 ## Features
 
 - Tolerant Codex Responses-to-xAI Responses provider projection with `store: false` and full input history; no legacy Chat Completions conversion.
-- Codex-consumed SSE extraction for text, reasoning summaries, function calls, terminal/usage events, while unknown auxiliary events do not terminate the stream.
+- Codex-consumed SSE extraction for text, reasoning summaries, function calls, and terminal/usage events. Unknown auxiliary events do not terminate the stream. If Grok ends a useful stream without `response.completed`, the bridge closes it with that Codex lifecycle marker only so the turn is not reported as `stream closed before response.completed`.
 - Ordered function calls/results and mixed text/image inputs without downloading or re-encoding image data.
 - Read-only bridge-side use of the official Grok session credential, with in-memory zeroizing cache reload when the source changes. On hard expiry during a provider request, one bounded non-interactive official-CLI invocation may trigger the CLI's own silent OIDC refresh; the bridge never handles refresh tokens, performs OAuth, or writes the credential file.
 - Fixed official xAI origin through rustls, redirects disabled, and typed authentication, rate-limit, status, and stream failures.
