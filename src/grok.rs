@@ -263,30 +263,47 @@ impl Stream for ValidatedTextEventStream {
             return std::task::Poll::Ready(None);
         }
 
-        match self.inner.as_mut().poll_next(context) {
-            std::task::Poll::Ready(Some(Ok(data))) => match self.validator.accept_data(&data) {
-                Ok(mut event) => {
-                    event.restore_namespaced_tool_calls(&self.namespace_projection);
-                    std::task::Poll::Ready(Some(Ok(event)))
-                }
-                Err(error) => {
+        loop {
+            match self.inner.as_mut().poll_next(context) {
+                std::task::Poll::Ready(Some(Ok(data))) if data.trim().is_empty() => continue,
+                std::task::Poll::Ready(Some(Ok(data))) => match self.validator.accept_data(&data) {
+                    Ok(mut event) => {
+                        event.restore_namespaced_tool_calls(&self.namespace_projection);
+                        return std::task::Poll::Ready(Some(Ok(event)));
+                    }
+                    Err(error) => {
+                        self.finished = true;
+                        log_rejected_sse_event(&data, &error);
+                        return std::task::Poll::Ready(Some(Err(GrokError::Protocol(error))));
+                    }
+                },
+                std::task::Poll::Ready(Some(Err(error))) => {
                     self.finished = true;
-                    log_rejected_sse_event(&data, &error);
-                    std::task::Poll::Ready(Some(Err(GrokError::Protocol(error))))
+                    return std::task::Poll::Ready(Some(Err(error)));
                 }
-            },
-            std::task::Poll::Ready(Some(Err(error))) => {
-                self.finished = true;
-                std::task::Poll::Ready(Some(Err(error)))
+                std::task::Poll::Ready(None) => match self.validator.finish() {
+                    Ok(()) => {
+                        if let Some(mut event) = self.validator.synthetic_completed_on_eof() {
+                            let response_id = event.original()["response"]["id"].as_str();
+                            tracing::warn!(
+                                route = "responses",
+                                response_id,
+                                "synthesizing response.completed after upstream EOF"
+                            );
+                            event.restore_namespaced_tool_calls(&self.namespace_projection);
+                            self.finished = true;
+                            return std::task::Poll::Ready(Some(Ok(event)));
+                        }
+                        self.finished = true;
+                        return std::task::Poll::Ready(None);
+                    }
+                    Err(error) => {
+                        self.finished = true;
+                        return std::task::Poll::Ready(Some(Err(GrokError::Protocol(error))));
+                    }
+                },
+                std::task::Poll::Pending => return std::task::Poll::Pending,
             }
-            std::task::Poll::Ready(None) => {
-                self.finished = true;
-                match self.validator.finish() {
-                    Ok(()) => std::task::Poll::Ready(None),
-                    Err(error) => std::task::Poll::Ready(Some(Err(GrokError::Protocol(error)))),
-                }
-            }
-            std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
 }
@@ -541,6 +558,97 @@ mod tests {
             events.last().map(ValidatedTextStreamEvent::kind),
             Some(crate::protocol::TextStreamEventKind::ResponseCompleted { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn unterminated_stream_synthesizes_response_completed_at_eof() {
+        let item_done = json!({
+            "type": "reasoning",
+            "id": "rs_1",
+            "status": "completed",
+            "summary": []
+        });
+        let events = [
+            json!({"type":"response.created","sequence_number":0,"response":{"id":"resp_1","output":[]}}),
+            json!({"type":"response.output_item.done","sequence_number":1,"output_index":0,"item":item_done}),
+        ];
+        let stream_body = events
+            .into_iter()
+            .map(|event| format!("data: {event}
+
+"))
+            .collect::<String>();
+        let stream = ResponsesByteStream {
+            inner: Box::pin(futures_util::stream::iter([Ok(Bytes::from(stream_body))])),
+            _credential: Arc::new(test_session_credential("stream-secret", "user-1")),
+            namespace_projection: NamespaceToolProjection::default(),
+        };
+
+        let events = stream
+            .validated_text_events()
+            .map(|event| event.unwrap())
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(events.len(), 3);
+        assert!(matches!(
+            events.last().map(ValidatedTextStreamEvent::kind),
+            Some(crate::protocol::TextStreamEventKind::ResponseCompleted { response_id })
+                if response_id == "resp_1"
+        ));
+        assert_eq!(
+            events.last().unwrap().original()["response"]["status"],
+            "completed"
+        );
+    }
+
+    #[tokio::test]
+    async fn blank_sse_event_after_completed_does_not_fail_the_stream() {
+        let item_done = json!({
+            "type": "message", "id": "msg_1", "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "ok", "annotations": []}]
+        });
+        let events = [
+            json!({"type":"response.created","sequence_number":0,"response":{"id":"resp_1","output":[]}}),
+            json!({"type":"response.output_item.done","sequence_number":1,"output_index":0,"item":item_done.clone()}),
+            json!({"type":"response.completed","sequence_number":2,"response":{"id":"resp_1","output":[item_done]}}),
+        ];
+        let stream_body = events
+            .into_iter()
+            .map(|event| format!("data: {event}
+
+"))
+            .collect::<String>()
+            + "
+
+";
+        let stream = ResponsesByteStream {
+            inner: Box::pin(futures_util::stream::iter([Ok(Bytes::from(stream_body))])),
+            _credential: Arc::new(test_session_credential("stream-secret", "user-1")),
+            namespace_projection: NamespaceToolProjection::default(),
+        };
+
+        let events = stream
+            .validated_text_events()
+            .map(|event| event.unwrap())
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(matches!(
+            events.last().map(ValidatedTextStreamEvent::kind),
+            Some(crate::protocol::TextStreamEventKind::ResponseCompleted { .. })
+        ));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event.kind(),
+                    crate::protocol::TextStreamEventKind::ResponseCompleted { .. }
+                ))
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
