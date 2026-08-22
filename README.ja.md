@@ -83,7 +83,7 @@ grok-codex-bridge（Rust製ネイティブ実行ファイル）
 Grok / xAI
 ```
 
-ブリッジ自身はツールを実行しません。validな関数定義、順序付きツール呼び出しと結果、テキスト、画像URLとdata URI、reasoning summary、必要なResponses制御値を保持し、実行責任はCodexに残します。xAIがrequest全体を拒否するfunction schemaはGrokへの投影からのみ省略し、Codex側のcatalog、tool_search履歴、Native GPT経路は元のtoolを保持します。GPT/Grok切替時はproviderで再生できないitem IDとreasoning stateだけを除外し、tool call/outputを結ぶ`call_id`を保持します。
+ブリッジ自身はツールを実行しません。validな関数定義、順序付きツール呼び出しと結果、テキスト、画像URLとdata URI、reasoning summary、必要なResponses制御値を保持し、実行責任はCodexに残します。xAIがrequest全体を拒否するfunction schemaはGrokへの投影からのみ省略し、Codex側のcatalog、tool_search履歴、Native GPT経路は元のtoolを保持します。GPT/Grok切替時はproviderで再生できないitem IDとreasoning stateだけを除外し、tool call/outputを結ぶ`call_id`を保持します。Grokが有用なCodex向けeventのあとterminal markerなしで接続を閉じた場合、bridgeは出力itemを捏造せず、Codexが要求する`response.completed`だけを合成します。`response.failed`または`response.incomplete`を既に受け取っている場合は合成しません。
 
 ## 現在の状態
 
@@ -101,7 +101,7 @@ V1.0は保守的な公開ルートです。Codexの分離プロファイルを�
 ## 主な機能
 
 - `store: false`と全入力履歴を使う、Codex ResponsesからxAI Responsesへの許容的なprovider projection。旧Chat Completions形式への変換は行いません。
-- text、reasoning summary、function call、terminal/usageをCodex向けに抽出するSSE処理。unknownな補助eventでstreamを終了させません。
+- text、reasoning summary、function call、terminal/usageをCodex向けに抽出するSSE処理。unknownな補助eventでstreamを終了させません。有用なeventのあと`response.completed`なしでGrokが閉じた場合は、そのlifecycle markerだけを合成し、Codexが `stream closed before response.completed` としてターンを落とさないようにします。
 - 画像をダウンロード・再エンコードせず、順序付き関数呼び出し/結果とテキスト・画像混在入力を保持。
 - 公式Grokセッションcredentialをbridge側では読み取り専用で利用し、変更時はゼロ化対応メモリキャッシュを再読み込みします。provider request中に期限切れを検出した場合だけ、公式CLI自身のsilent OIDC refreshを促す非対話起動を一度だけboundedに行います。bridgeはrefresh tokenを扱わず、OAuthを実装せず、credential fileを書き換えません。
 - rustlsで公式xAI接続先に固定し、リダイレクトを禁止。認証、レート制限、HTTP状態、stream障害を型付きで処理。
