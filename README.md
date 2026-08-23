@@ -167,6 +167,10 @@ CODEX_DIR="${CODEX_HOME:-"$HOME/.codex"}"
 
 Start a fresh Codex CLI process after activation. Fully quit and relaunch Codex Desktop before testing the Desktop picker.
 
+![Codex Desktop model picker with Native GPT models plus grok-4.5 and grok-4.6](docs/images/desktop-merged-picker.png)
+
+Codex Desktop after V1.1 picker activation. Native GPT and admitted Grok models appear in one picker. This is a display example; Desktop picker and final rollback acceptance remain pending.
+
 Admitted Grok catalog entries, including the bootstrap `grok-4.5` and `grok-4.6` models, expose a 272,000-token context window. Codex therefore applies the same native 2% skill-description budget calculation instead of falling back to the small unknown-window budget.
 
 ### Grok.md overlay

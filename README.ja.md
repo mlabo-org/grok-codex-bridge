@@ -164,6 +164,10 @@ CODEX_DIR="${CODEX_HOME:-"$HOME/.codex"}"
 
 有効化後は新しいCodex CLIプロセスを起動します。Codex Desktopで試す場合は、完全終了してから再起動してください。
 
+![Native GPTモデルと grok-4.5 / grok-4.6 が並ぶ Codex Desktop のモデルピッカー](docs/images/desktop-merged-picker.png)
+
+V1.1ピッカー有効化後のCodex Desktopです。Native GPTと許可済みGrokモデルが同じピッカーに並ぶ表示例であり、Desktopピッカーと最終rollbackの受け入れ完了を示すものではありません。
+
 許可済みGrokカタログエントリ（bootstrapの `grok-4.5` / `grok-4.6` を含む）は272,000トークンのコンテキストウィンドウを公開します。これによりCodexは、不明なwindow向けの小さなfallbackではなく、Nativeモデルと同じ標準2%のSkills説明予算計算を適用します。
 
 ### Grok.md overlay
