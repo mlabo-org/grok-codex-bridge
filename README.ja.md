@@ -4,7 +4,7 @@
 
 **Native GPTを置き換えず、Codexハーネスの中でGrokを動かすための、Rust製ネイティブResponses-to-Responsesブリッジです。**
 
-`grok-codex-bridge` はApple Silicon搭載macOS向けの、スタンドアロンかつループバック専用のプロバイダーブリッジです。エージェントループ、ツール、権限、MCPサーバー、Skills、セッション状態は引き続きCodexが担当します。本プロジェクトが担当するのは、ローカルのプロバイダー境界、Responses transportの許容的なprovider projection、Codexが消費するSSE抽出、bridge側のGrok credential境界、xAIへの上流接続です。bridgeは公式credentialを読み取り専用で検査し、期限切れ時だけ公式Grok CLIをboundedな更新トリガーとして起動することがあります。credential自体の更新は公式CLIが所有します。
+`grok-codex-bridge` はApple Silicon搭載macOS向けの、スタンドアロンかつループバック専用のプロバイダーブリッジです。エージェントループ、ツール、権限、MCPサーバー、Skills、セッション状態は引き続きCodexが担当します。本プロジェクトが担当するのは、ローカルのプロバイダー境界、Responses transportの許容的なprovider projection、Codexが消費するSSE抽出、bridge側のGrok credential境界、xAIへの上流接続です。bridgeは公式credentialを読み取り専用で検査し、missing、incomplete、expiredの再認証可能な状態では公式Grok CLIをboundedな復旧トリガーとして起動することがあります。credential自体の更新は公式CLIが所有します。
 
 Codexプラグイン、汎用LLMルーター、エージェントハーネスではありません。
 
@@ -103,7 +103,7 @@ V1.0は保守的な公開ルートです。Codexの分離プロファイルを�
 - `store: false`を使う、Codex ResponsesからxAI Responsesへの許容的なprovider projection。replayableなmessage / function / tool-search履歴は転送し、完了済み Native `custom_tool_call` と foreign reasoning は Grok request から除外します。旧Chat Completions形式への変換は行いません。
 - text、reasoning summary、function call、terminal/usageをCodex向けに抽出するSSE処理。unknownな補助eventでstreamを終了させません。function / tool_search argument の integer-valued JSON number は JSON integer へ正規化します。有用なeventのあと`response.completed`なしでGrokが閉じた場合は、そのlifecycle markerだけを合成し、Codexが `stream closed before response.completed` としてターンを落とさないようにします。
 - 画像をダウンロード・再エンコードせず、順序付き関数呼び出し/結果とテキスト・画像混在入力を保持。
-- 公式Grokセッションcredentialをbridge側では読み取り専用で利用し、変更時はゼロ化対応メモリキャッシュを再読み込みします。provider request中に期限切れを検出した場合だけ、公式CLI自身のsilent OIDC refreshを促す非対話起動を一度だけboundedに行います。bridgeはrefresh tokenを扱わず、OAuthを実装せず、credential fileを書き換えません。
+- 公式Grokセッションcredentialをbridge側では読み取り専用で利用し、変更時はゼロ化対応メモリキャッシュを再読み込みします。provider request中の期限切れでは公式CLIのsilent refreshを一度だけboundedに起動し、明示`auth ensure`では再認証可能な状態を公式desktop OAuthへ委譲します。bridgeはrefresh tokenを扱わず、OAuthを実装せず、credential fileを書き換えません。
 - rustlsで公式xAI接続先に固定し、リダイレクトを禁止。認証、レート制限、HTTP状態、stream障害を型付きで処理。
 - Grokモデルをカタログで許可し、メタデータだけのlast-known-good状態をatomicに保存。
 - ループバック専用listenerとcapability保護されたroute。不正なcapabilityには `404` を返します。
@@ -115,7 +115,7 @@ V1.0は保守的な公開ルートです。Codexの分離プロファイルを�
 
 - Apple Silicon搭載macOS。
 - ソースからビルドする場合は [rust-toolchain.toml](rust-toolchain.toml) で固定されたRust 1.95.0。
-- 公式Grok CLIと、live Grokリクエストに使用する公式Grokログイン。
+- 公式Grok CLIと、有効なloginまたは公式browser OAuthを完了できる環境。
 - 現行のCodex CLI。
 
 Intel Mac、Linux、Windows向けのビルド済み成果物は現在提供していません。
@@ -255,16 +255,15 @@ codex resume <SESSION_ID> -m <NATIVE_GPT_MODEL>
 
 公式session recordに `expires_at` があればその時刻を使います。無い場合はparserのfallbackとして `create_time + 30日` を使います。これは公式Grok sessionの有効期間を保証する値ではありません。`auth status` はcredentialの有無だけを表示し、credentialや有効期限は表示しません。
 
-次の復旧経路は、Responses provider requestで期限切れを検出した場合だけ動作します。bridgeは公式 `bin/grok models` をstdin/stdout/stderr切断、7秒timeoutで一度だけ起動し、その後最大60秒、権威fileの再読込を待ちます。bridgeはcredentialを事前更新せず、refresh tokenを読まず、OAuthや対話loginを実装せず、`auth.json`を書き換えません。公式processがfileを更新できなければ、そのrequestは認証errorになります。
+Responses provider requestでmissing、incomplete、expiredの再認証可能なcredential状態を検出した場合、bridgeは公式 `bin/grok models` をstdin/stdout/stderr切断、7秒timeoutで一度だけ起動し、その後最大60秒、権威fileの再読込を待ちます。この非対話経路はbrowserを開きません。公式processが更新できなければ、そのrequestは認証errorになります。
 
-公式loginが期限切れまたは失われた場合は、bridgeを使っていない環境で公式device flowを実行します。
+明示的なlifecycle操作では、`auth ensure`が最初に同じread-only検査とsilent refreshを行います。有効または非対話更新済みなら即時終了し、それでもmissing、incomplete、expiredの場合だけ、公式desktop OAuthをprocess出力なしで一度起動し、最大5分だけbrowser完了を待って権威fileをread-only再検査します。browserとcredential更新は公式CLIが所有し、malformed、ambiguous、unsafeなfileではloginを起動せずfail closedします。
 
 ```sh
-GROK_HOME_DIR="${GROK_HOME:-"$HOME/.grok"}"
-"$GROK_HOME_DIR/bin/grok" login --device-auth
+./dist/aarch64-apple-darwin/grok-codex-bridge auth ensure
 ```
 
-deviceまたはbrowserの確認は、CLIが表示した公式ページだけで完了してください。device codeをchat、log、repositoryへ貼らないでください。完了後、credentialを表示せずにbridgeを確認します。
+browser確認は、公式CLIが開いた`auth.x.ai`の公式ページだけで完了してください。認証情報をchat、log、repositoryへ貼らないでください。導入済みbinary交換scriptはservice停止前に`auth ensure`を実行するため、期限切れloginが再起動後doctorのrollbackを起こしません。完了後、credentialを表示せずにbridgeを確認します。
 
 ```sh
 ./dist/aarch64-apple-darwin/grok-codex-bridge auth status

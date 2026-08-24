@@ -61,6 +61,7 @@ if [ "$new_binary" = "$installed_binary" ]; then
 fi
 
 new_version=$("$new_binary" version)
+"$new_binary" auth ensure
 service_state=$("$installed_binary" service status)
 if [ "$service_state" != "service loaded" ]; then
     fail "installed bridge service is not loaded: $service_state"

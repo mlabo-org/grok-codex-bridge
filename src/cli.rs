@@ -104,6 +104,8 @@ pub struct LifecyclePathArgs {
 pub enum AuthCommand {
     /// Report whether the official Grok session credential is available.
     Status,
+    /// Ensure a usable credential, launching the official browser OAuth flow when needed.
+    Ensure,
 }
 
 #[derive(Debug, Subcommand)]
