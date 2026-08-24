@@ -40,7 +40,7 @@ pub enum Command {
         #[command(subcommand)]
         command: ServiceCommand,
     },
-    /// Prepare or remove the Phase J merged picker and routing state.
+    /// Prepare or remove the merged picker and routing state.
     Picker {
         #[command(subcommand)]
         command: PickerCommand,

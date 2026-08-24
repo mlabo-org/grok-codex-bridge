@@ -36,7 +36,7 @@ Native GPT/Grok統合モデルピッカーを有効にします。
 
 ### ソースリポジトリと導入済みruntime
 
-このリポジトリには、2つのネイティブ構成要素、すなわちRust bridgeとSwift製 `Grok Codex Switch.app` launcherの公開sourceを収録しています。materialize処理はApple Silicon向けに両方をbuildします。install時には、実行ファイル、launcher bundle、設定、catalog state、overlay/resource、lifecycle dataを次へコピーします。
+このリポジトリには、2つのネイティブ構成要素、すなわちRust bridge executableと、それに対応するSwift製 `Grok Codex Switch.app` launcherの公開sourceを収録しています。materialize処理はApple Silicon向けにこのpairを必ず両方buildします。片方だけをinstallしてはいけません。launcherはChatGPT.app終了後も生き残り、Rust switch coordinatorを最後まで実行し、成功した切替後のChatGPT.app再起動をcoordinatorへ任せます。install時には、実行ファイル、対応するlauncher bundle、設定、catalog state、overlay/resource、lifecycle dataを次へコピーします。
 
 ```text
 ~/Library/Application Support/grok-codex-bridge/
@@ -50,12 +50,14 @@ Native GPT/Grok統合モデルピッカーを有効にします。
 
 install後、切替coordinatorが読むのはこの導入済みtreeと、明示的に渡されたCodex/ChatGPTのlive stateだけです。通常の切替中にcompileしたり、Cargoの `target/`、`dist/`、checkout内の `Grok.md`、replacement scriptを探したりしません。したがって導入済みruntimeは、checkoutを移動または削除しても無効になりません。repo所有の `scripts/grok-codex.sh` はbuild/install/updateの入口であり、導入済みbridgeのruntime依存ではありません。
 
-repoの入口は、ローカルでmaterializeしたruntimeをinstallまたはupdateしてからmodeを切り替えます。
+repoの入口は、ローカルでmaterializeしたruntime pairをinstallまたはupdateしてからmodeを切り替えます。
 
 ```sh
-./scripts/grok-codex.sh grok    # 必要ならinstall/updateし、その後Grok modeへ切替
-./scripts/grok-codex.sh native  # 必要ならinstall/updateし、その後Native modeへ切替
+./scripts/grok-codex.sh grok    # materialize済みpairをinstall/updateしてGrok modeへ切替
+./scripts/grok-codex.sh native  # materialize済みpairをinstall/updateしてNative modeへ切替
 ```
+
+`grok-codex.sh` は自動compileを行いません。どちらかのmaterialize成果物が欠落またはstaleの場合は停止し、先に `./scripts/materialize-macos.sh` を実行するよう案内します。したがってsourceのinstall/updateはcheckoutに依存します。install後の通常の `mode grok` / `mode native` 切替は導入済みruntime treeだけを使い、checkoutには依存しません。
 
 install後の通常切り替えはrepo非依存で、導入済みnative executableを直接実行します。
 
@@ -140,7 +142,7 @@ Intel Mac、Linux、Windows向けのビルド済み成果物は現在提供し�
 
 NativeとGrokのmodel slugは一意でなければなりません。catalog生成時とruntime routing時のどちらでも重複slugはfail closedし、Native行の上書きやalias生成は行いません。
 
-2つのnative componentを一度buildしてから移行します。
+対応するnative pairを一度buildしてから移行します。
 
 ```sh
 ./scripts/materialize-macos.sh
@@ -159,7 +161,7 @@ NativeとGrokのmodel slugは一意でなければなりません。catalog生�
 
 ### Grok.md overlay
 
-[`Grok.md`](Grok.md) は Grok 専用実行 overlay の正本です。`picker install` がこのファイルをディスクから読み、生成カタログの許可済み Grok 行の `base_instructions` へそのまま入れます。Codex が消費するのは生成カタログです。Native GPT 行には届きません。本文はコンパイル成果物へ焼き込まず、HTTP 毎に再読込もしません。
+[`Grok.md`](Grok.md) は Grok 専用実行 overlay の正本です。`picker install` がこのファイルをディスクから読み、生成カタログの許可済み Grok 行の `base_instructions` へそのまま入れます。Codex が消費するのは生成カタログです。Native GPT 行には届きません。Rust binaryは `Grok.md` をembedせず、materialize時に内容をlauncherの別名resource snapshotとしてコピーします。HTTP 毎に再読込もしません。
 
 `Grok.md`というfilenameは、稼働中Grokへ渡すこの憲法正本だけに予約します。materialize時は内容だけを、意図的に別名とした導入済みsnapshot `Contents/Resources/grok-codex-bridge-overlay.md`へコピーし、他のresourceには`Grok.md`という名前を使いません。
 
@@ -279,7 +281,7 @@ cargo run -- --version
 ./dist/aarch64-apple-darwin/grok-codex-bridge status
 ```
 
-製品scopeと受け入れcontractは [docs/spec-v0.1.md](docs/spec-v0.1.md)、配布要件は [docs/distribution-contract.md](docs/distribution-contract.md) で定義しています。
+製品scopeと受け入れcontractは [docs/spec.md](docs/spec.md)、配布要件は [docs/distribution-contract.md](docs/distribution-contract.md) で定義しています。
 
 ## ソース構成
 
@@ -299,6 +301,7 @@ Grok.md                              picker catalog生成時に読むGrok overla
 src/picker_activation.rs             pickerのatomicな公開と有効化
 src/launchd.rs                       型付きuser LaunchAgent境界
 scripts/materialize-macos.sh         決定的macOS arm64 materialization
+scripts/macos-switch-launcher/       Swift LaunchServices launcher source
 scripts/grok-codex.sh                Grok/native環境のワンコマンド移行
 scripts/replace-installed-bridge.sh  導入済みnative runtimeの差し替え
 ```

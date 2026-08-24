@@ -19,6 +19,13 @@ launcher_app="$destination_dir/Grok Codex Switch.app"
 launcher_contents="$launcher_app/Contents"
 launcher_executable="$launcher_contents/MacOS/Grok Codex Switch"
 launcher_resources="$launcher_contents/Resources"
+verification_root=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/grok-codex-materialize.XXXXXX")
+verification_app="$verification_root/Grok Codex Switch.app"
+
+cleanup() {
+    /bin/rm -rf "$verification_root"
+}
+trap cleanup 0 1 2 15
 
 cd "$project_root"
 cargo build --release --locked --target "$target"
@@ -30,10 +37,26 @@ mkdir -p "$launcher_resources"
 /usr/bin/swiftc "$launcher_source" -o "$launcher_executable"
 install -m 644 "$launcher_info" "$launcher_contents/Info.plist"
 install -m 644 "$project_root/Grok.md" "$launcher_resources/grok-codex-bridge-overlay.md"
+case "$(/usr/bin/file -b "$destination_binary")" in
+    *Mach-O*arm64*) ;;
+    *)
+        printf '%s\n' "error: materialized bridge is not a macOS arm64 Mach-O executable" >&2
+        exit 1
+        ;;
+esac
+case "$(/usr/bin/file -b "$launcher_executable")" in
+    *Mach-O*arm64*) ;;
+    *)
+        printf '%s\n' "error: materialized switch launcher is not a macOS arm64 Mach-O executable" >&2
+        exit 1
+        ;;
+esac
 /usr/bin/xattr -cr "$launcher_app"
 /usr/bin/codesign --force --deep --sign - "$launcher_app"
 /usr/bin/xattr -cr "$launcher_app"
-/usr/bin/codesign --verify --deep --strict "$launcher_app"
+/usr/bin/ditto "$launcher_app" "$verification_app"
+/usr/bin/xattr -cr "$verification_app"
+/usr/bin/codesign --verify --deep --strict "$verification_app"
 
 printf '%s\n' "$destination_binary"
 printf '%s\n' "$launcher_app"

@@ -77,7 +77,7 @@ pub struct UninstallReceipt {
     pub launch_agent_restored: bool,
 }
 
-/// Inputs for the Phase J generated-catalog lifecycle. The caller supplies
+/// Inputs for the merged-picker generated-catalog lifecycle. The caller supplies
 /// the authoritative local native catalog; it is copied, never edited.
 pub struct PickerInstallRequest {
     pub install_root: PathBuf,
@@ -370,7 +370,7 @@ pub fn preflight_uninstall(request: &UninstallRequest) -> Result<(), LifecycleEr
     preflight_uninstall_picker_if_present(&request.install_root, &request.codex_home)
 }
 
-/// Creates or updates the non-secret Phase J generated picker state. It does
+/// Creates or updates the non-secret merged-picker state. It does
 /// not start a service or reload Codex; callers must cross that boundary
 /// explicitly with the exact accepted Codex binary.
 pub fn install_picker(
@@ -390,9 +390,9 @@ pub fn install_picker(
         launch_agent_path: request.install_root.join(".picker-unused-launch-agent"),
     };
     let (install_manifest, _) = read_manifest(&request.install_root)?;
-    // Picker ownership is possible only on a valid V1.0 bridge root. The
+    // Picker ownership is possible only on a valid managed bridge root. The
     // launch-agent path is checked separately by the root manifest, so use
-    // the deterministic V1.0 fields here rather than an external target.
+    // the deterministic manifest fields here rather than an external target.
     if install_manifest.install_root != request.install_root
         || install_manifest.profile_path != request.codex_home.join(PROFILE_FILE_NAME)
         || install_manifest.catalog_cache_path != request.install_root.join("state/models.json")

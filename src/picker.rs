@@ -116,7 +116,7 @@ pub fn load_grok_overlay(path: &Path) -> Result<String, PickerError> {
     String::from_utf8(bytes).map_err(|_| PickerError::OverlayNotUtf8)
 }
 
-/// Generates the one bridge-owned catalog consumed later by Phase J.
+/// Generates the one bridge-owned catalog consumed by the merged picker.
 ///
 /// `overlay` is the Grok.md SSOT body read at catalog generation. It is not
 /// compiled into the binary.
@@ -467,7 +467,7 @@ fn required_enum(
         .ok_or(PickerError::InvalidModelSchema { index, field })
 }
 
-/// Exact, non-secret identity supplied by the Phase J lifecycle owner.
+/// Exact, non-secret identity supplied by the picker lifecycle owner.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArtifactIdentity {
@@ -566,7 +566,7 @@ impl AdmittedGrokCatalogState {
     }
 }
 
-/// Exact rollback receipt for the Codex config target that Phase J mutates.
+/// Exact rollback receipt for the Codex config target that the picker lifecycle mutates.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(tag = "strategy", rename_all = "snake_case")]
 pub enum ConfigRollbackOwnership {

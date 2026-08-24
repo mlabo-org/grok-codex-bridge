@@ -41,7 +41,8 @@ ensure_materialized() {
         for source_file in \
             "$project_root/Cargo.toml" \
             "$project_root/Cargo.lock" \
-            "$project_root/rust-toolchain.toml"; do
+            "$project_root/rust-toolchain.toml" \
+            "$project_root/scripts/materialize-macos.sh"; do
             if [ "$source_file" -nt "$bridge" ]; then
                 stale=1
             fi

@@ -36,7 +36,7 @@ Both commands hand the transition through the locally built native LaunchService
 
 ### Source repository and installed runtime
 
-The repository contains the complete public source for both native components: the Rust bridge and the Swift `Grok Codex Switch.app` launcher. Materialization builds both for Apple Silicon. Installation copies the resulting executable, launcher bundle, configuration, catalog state, overlay/resource files, and lifecycle data into:
+The repository contains the complete public source for both native components: the Rust bridge executable and its matching Swift `Grok Codex Switch.app` launcher. Materialization must produce this pair for Apple Silicon; do not install one without the other. The launcher survives ChatGPT.app shutdown, runs the Rust switch coordinator to completion, and lets that coordinator relaunch ChatGPT.app after a successful transition. Installation copies the resulting executable, matching launcher bundle, configuration, catalog state, overlay/resource files, and lifecycle data into:
 
 ```text
 ~/Library/Application Support/grok-codex-bridge/
@@ -50,12 +50,14 @@ The repository contains the complete public source for both native components: t
 
 After installation, the switch coordinator reads only this installed tree and the live Codex/ChatGPT state it is explicitly handed. It does not compile, search Cargo's `target/`, read `dist/`, or depend on the checkout's `Grok.md` or replacement scripts during a normal switch. The checkout may therefore be moved or removed without invalidating an already installed runtime. The repository-owned `scripts/grok-codex.sh` remains the build/install/update entry point; it is not the runtime dependency of the installed bridge.
 
-The repository entry points install or update the locally materialized runtime, then switch mode:
+The repository entry points install or update the locally materialized runtime pair, then switch mode:
 
 ```sh
-./scripts/grok-codex.sh grok    # install/update if needed, then switch to Grok mode
-./scripts/grok-codex.sh native  # install/update if needed, then switch to Native mode
+./scripts/grok-codex.sh grok    # install/update the materialized pair, then switch to Grok mode
+./scripts/grok-codex.sh native  # install/update the materialized pair, then switch to Native mode
 ```
+
+`grok-codex.sh` never compiles automatically. If either materialized component is missing or stale, it stops and asks you to run `./scripts/materialize-macos.sh` first. Source installation and updates therefore depend on the checkout; after installation, normal `mode grok` / `mode native` switching uses only the installed runtime tree and does not depend on the checkout.
 
 After installation, normal switching is repository-independent and runs the installed native executable directly:
 
@@ -140,7 +142,7 @@ The primary route publishes a merged model catalog so Native GPT and admitted Gr
 
 Native and Grok model slugs must remain unique. Catalog generation and runtime routing both fail closed on a duplicate slug; the bridge never overwrites a Native row or invents an alias.
 
-Build both native components once, then run the migration:
+Build the matching native pair once, then run the migration:
 
 ```sh
 ./scripts/materialize-macos.sh
@@ -159,7 +161,7 @@ Admitted Grok catalog entries, including the bootstrap `grok-4.5` and `grok-4.6`
 
 ### Grok.md overlay
 
-[`Grok.md`](Grok.md) is the source of truth for the Grok-only execution overlay. `picker install` reads that file from disk and copies it into each admitted Grok row's `base_instructions` in the generated catalog. Codex consumes the generated catalog; Native GPT rows never receive this overlay. The binary does not bake the file in at compile time, and the live HTTP path does not re-read it on every request.
+[`Grok.md`](Grok.md) is the source of truth for the Grok-only execution overlay. `picker install` reads that file from disk and copies it into each admitted Grok row's `base_instructions` in the generated catalog. Codex consumes the generated catalog; Native GPT rows never receive this overlay. The Rust binary does not embed `Grok.md`; materialization copies its bytes as a separately named launcher resource snapshot, and the live HTTP path does not re-read it on every request.
 
 The filename `Grok.md` is reserved exclusively for this live Grok constitution source. Materialization copies its bytes into the installed launcher under the deliberately distinct runtime-snapshot name `Contents/Resources/grok-codex-bridge-overlay.md`; no other resource is named `Grok.md`.
 
@@ -279,7 +281,7 @@ cargo run -- --version
 ./dist/aarch64-apple-darwin/grok-codex-bridge status
 ```
 
-The product scope and acceptance contracts are defined in [docs/spec-v0.1.md](docs/spec-v0.1.md). Distribution requirements are tracked in [docs/distribution-contract.md](docs/distribution-contract.md).
+The product scope and acceptance contracts are defined in [docs/spec.md](docs/spec.md). Distribution requirements are tracked in [docs/distribution-contract.md](docs/distribution-contract.md).
 
 ## Source layout
 
@@ -299,6 +301,7 @@ Grok.md                              Grok overlay SSOT read at picker catalog ge
 src/picker_activation.rs             atomic picker publication and activation
 src/launchd.rs                       typed user LaunchAgent boundary
 scripts/materialize-macos.sh         deterministic macOS arm64 materialization
+scripts/macos-switch-launcher/       Swift LaunchServices launcher source
 scripts/grok-codex.sh                one-command Grok/native environment migration
 scripts/replace-installed-bridge.sh  loaded-install native runtime replacement
 ```
