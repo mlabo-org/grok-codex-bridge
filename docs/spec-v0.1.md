@@ -136,11 +136,11 @@ credential sourceは、`$GROK_AUTH_PATH`、次に`$GROK_HOME/auth.json`、最後
 
 ## 11. Credential Cache
 
-Access tokenのmemory cacheは許容する。disk再保存、debug print、panic dumpは禁止する。secret保持型を使い、process exit時は可能な範囲でzeroizeする。credential fileのmtime変化を検出して再読込する。公式session recordに`expires_at`があればそれを使い、無ければ`create_time + 30日`をparser fallbackとして使う。長時間sleepからの復帰後、Responses requestでcredentialがhard-expiredなら、bridgeは公式`bin/grok models`をstdin/stdout/stderr切断・7秒timeoutで一度だけ起動し、公式プロセス自身のsilent OIDC refreshを促す。その後、Responses requestは最大60秒だけauthoritative fileのread-only再読込を待ってから判定する。bridgeはrefresh tokenを読まず、OAuthを実装せず、対話loginやcredential fileの直接変更、upstream request再送を行わない。
+Access tokenのmemory cacheは許容する。disk再保存、debug print、panic dumpは禁止する。secret保持型を使い、process exit時は可能な範囲でzeroizeする。credential fileのmtime変化を検出して再読込する。公式session recordに`expires_at`があればそれを使い、無ければ`create_time + 30日`をparser fallbackとして使う。Responses requestでcredentialがhard-expired、missing、またはincompleteなら、bridgeは公式`bin/grok models`をstdin/stdout/stderr切断・7秒timeoutで一度だけ起動し、公式プロセス自身のsilent OIDC refreshを促す。その後、Responses requestは最大60秒だけauthoritative fileのread-only再読込を待ってから判定する。明示`auth ensure`も最初に同じ非対話更新を試し、それでも再認証可能な状態なら公式`bin/grok login --oauth`をstdin/stdout/stderr切断で一度起動し、最大5分だけbrowser完了を待ってauthoritative fileをread-only再検査する。bridgeはrefresh tokenを読まず、OAuthを実装せず、credential fileを直接変更せず、upstream requestを再送しない。
 
 ## 12. OAuth Refresh
 
-V1は独自OAuth refresh、browser OAuth、client identity再実装を行わない。期限切れ時は公式`grok models`の非対話起動で公式OIDC refreshを一度だけ促し、それでも更新されなければ、公式Grok login経路（通常は`grok login --device-auth`）が必要であることを明示errorとして返す。bridgeはrefresh tokenを取得・解釈・保存しない。`catalog refresh`はこの更新経路を使わず、現在利用できるcredentialを要求する。
+V1は独自OAuth refresh、browser OAuth、client identity再実装を行わない。期限切れ時は公式`grok models`の非対話起動で公式OIDC refreshを一度だけ促す。明示`auth ensure`は、再認証可能な状態だけを公式desktop OAuth経路`grok login --oauth`へ委譲し、browserとcredential更新を公式CLIに所有させる。malformed、ambiguous、unsafeなcredentialは自動loginで上書きせずfail closedする。bridgeはrefresh tokenを取得・解釈・保存しない。`catalog refresh`はこの更新経路を使わず、現在利用できるcredentialを要求する。
 
 ## 13. xAI Upstream
 
@@ -179,7 +179,7 @@ Credentialを読まず、upstream通信もしない。responseはservice/version
 
 ## 16. `/v1/models`
 
-V1はadmitted model catalogを返す。source snapshot由来のbootstrap catalogを持ち、Phase B以降は公式session endpointから一回のbounded startup refreshまたは明示`catalog refresh`で更新できる。両方のcatalog経路は現在利用できるcredentialを要求し、hard-expiry renewal helperは起動しない。renewal helperはResponses provider request経路だけで使う。
+V1はadmitted model catalogを返す。source snapshot由来のbootstrap catalogを持ち、Phase B以降は公式session endpointから一回のbounded startup refreshまたは明示`catalog refresh`で更新できる。両方のcatalog経路は現在利用できるcredentialを要求し、credential更新helperは起動しない。非対話更新helperはResponses provider requestと明示`auth ensure`だけで使い、browser OAuthは`auth ensure`だけで使う。
 
 ```json
 {"object":"list","data":[{"id":"grok-4.6","object":"model","owned_by":"xai"},{"id":"grok-4.5","object":"model","owned_by":"xai"}]}
@@ -339,7 +339,7 @@ Fingerprint spoofing、device spoofing、rate-limit evasion、account rotation�
 
 ## 50. CLI Commands
 
-V1完成時の最低限候補：`run`、`install`、`uninstall`、`status`、`doctor`、`auth status`、`catalog refresh`、`service install`、`service uninstall`。`catalog refresh`は現在利用できるcredentialで公式session `/v1/models`からatomicにlast-known-good catalogを更新し、credentialやNative GPT catalogを変更しない。`catalog refresh`とstartup refreshはhard-expiry renewal helperを起動せず、credential renewalはResponses provider request経路に限る。Phase ownershipと実装時点の必要性に合わせて追加する。
+V1完成時の最低限候補：`run`、`install`、`uninstall`、`status`、`doctor`、`auth status`、`auth ensure`、`catalog refresh`、`service install`、`service uninstall`。`catalog refresh`は現在利用できるcredentialで公式session `/v1/models`からatomicにlast-known-good catalogを更新し、credentialやNative GPT catalogを変更しない。`catalog refresh`とstartup refreshはcredential更新helperを起動しない。非対話更新helperはResponses provider requestと明示`auth ensure`だけ、browser OAuthは`auth ensure`だけで使う。Phase ownershipと実装時点の必要性に合わせて追加する。
 
 ## 51. `doctor`
 

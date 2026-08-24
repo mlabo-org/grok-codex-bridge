@@ -4,7 +4,7 @@
 
 **A native Rust Responses-to-Responses bridge that lets Grok run inside the Codex harness without replacing Native GPT.**
 
-`grok-codex-bridge` is a standalone, loopback-only provider bridge for macOS on Apple Silicon. Codex continues to own the agent loop, tools, permissions, MCP servers, Skills, and session state. This project owns only the local provider boundary, tolerant provider projection for Responses transport, Codex-consumed SSE extraction, the bridge-side Grok credential boundary, and the upstream connection to xAI. The bridge inspects the official credential read-only; on hard expiry it may invoke the official Grok CLI as a bounded renewal trigger, while the official CLI owns any credential update.
+`grok-codex-bridge` is a standalone, loopback-only provider bridge for macOS on Apple Silicon. Codex continues to own the agent loop, tools, permissions, MCP servers, Skills, and session state. This project owns only the local provider boundary, tolerant provider projection for Responses transport, Codex-consumed SSE extraction, the bridge-side Grok credential boundary, and the upstream connection to xAI. The bridge inspects the official credential read-only; recoverable missing, incomplete, or expired state may invoke the official Grok CLI through bounded recovery triggers, while the official CLI owns any credential update.
 
 It is not a Codex plugin, a general-purpose LLM router, or an agent harness.
 
@@ -106,7 +106,7 @@ V1.0 is the conservative public route: it uses a separate Codex profile and leav
 - Tolerant Codex Responses-to-xAI Responses provider projection with `store: false`. Replayable message, function, and tool-search history is forwarded; completed Native `custom_tool_call` items and foreign reasoning are omitted from Grok requests. No legacy Chat Completions conversion.
 - Codex-consumed SSE extraction for text, reasoning summaries, function calls, and terminal/usage events. Unknown auxiliary events do not terminate the stream. Integer-valued JSON numbers in function and tool_search arguments are canonicalized to JSON integers. If Grok ends a useful stream without `response.completed`, the bridge closes it with that Codex lifecycle marker only so the turn is not reported as `stream closed before response.completed`.
 - Ordered function calls/results and mixed text/image inputs without downloading or re-encoding image data.
-- Read-only bridge-side use of the official Grok session credential, with in-memory zeroizing cache reload when the source changes. On hard expiry during a provider request, one bounded non-interactive official-CLI invocation may trigger the CLI's own silent OIDC refresh; the bridge never handles refresh tokens, performs OAuth, or writes the credential file.
+- Read-only bridge-side use of the official Grok session credential, with in-memory zeroizing cache reload when the source changes. Provider hard expiry can trigger one bounded silent official-CLI refresh; explicit `auth ensure` delegates recoverable login state to the official desktop OAuth flow. The bridge never handles refresh tokens, performs OAuth, or writes the credential file.
 - Fixed official xAI origin through rustls, redirects disabled, and typed authentication, rate-limit, status, and stream failures.
 - Catalog-driven Grok model admission with atomic metadata-only last-known-good state.
 - Loopback-only listener and capability-scoped routes; invalid capabilities return `404`.
@@ -118,7 +118,7 @@ V1.0 is the conservative public route: it uses a separate Codex profile and leav
 
 - macOS on Apple Silicon.
 - Rust 1.95.0 for building from source, pinned by [rust-toolchain.toml](rust-toolchain.toml).
-- An official Grok CLI installation and an existing official Grok login for live Grok requests.
+- An official Grok CLI installation and either a current login or the ability to complete its official browser OAuth flow.
 - A current Codex CLI installation.
 
 Prebuilt Intel macOS, Linux, and Windows artifacts are not currently provided.
@@ -258,16 +258,15 @@ The selected file is opened read-only without following symlinks. `GROK_AUTH_PAT
 
 The bridge uses `expires_at` when the official session record provides it. If that field is absent, it uses `create_time + 30 days` as its parser fallback; this is not a promise about the official Grok session lifetime. `auth status` reports credential availability without revealing the credential or its expiry timestamp.
 
-The following recovery path runs only when a Responses provider request encounters a hard-expired credential. The bridge invokes the official `bin/grok models` command once with stdin, stdout, and stderr disconnected and a 7-second timeout. It then rereads the authoritative file for up to 60 seconds. The bridge does not proactively refresh a credential, read a refresh token, perform OAuth, invoke interactive login, or rewrite `auth.json`. If the official process does not replace the file, the request fails with an authentication error.
+When a Responses provider request encounters recoverable missing, incomplete, or expired credential state, the bridge invokes the official `bin/grok models` command once with stdin, stdout, and stderr disconnected and a 7-second timeout. It then rereads the authoritative file for up to 60 seconds. This non-interactive path does not open a browser; if it cannot refresh, the request fails with an authentication error.
 
-To restore an expired or missing official login, run the official device flow outside the bridge session:
+For explicit lifecycle work, `auth ensure` first performs the same read-only check and silent refresh. A valid or silently renewed credential exits immediately. If recoverable missing, incomplete, or expired state remains, it launches the official desktop OAuth flow once with process output suppressed, waits up to five minutes for browser completion, and rereads the authoritative file. The official CLI owns the browser and credential update; malformed, ambiguous, or unsafe files fail closed without launching login.
 
 ```sh
-GROK_HOME_DIR="${GROK_HOME:-"$HOME/.grok"}"
-"$GROK_HOME_DIR/bin/grok" login --device-auth
+./dist/aarch64-apple-darwin/grok-codex-bridge auth ensure
 ```
 
-Complete any device or browser confirmation only on the official page shown by the CLI. Never paste a device code into chat, logs, or the repository. Then verify the bridge without revealing credentials:
+Complete browser confirmation only on the official `auth.x.ai` page opened by the CLI. Never paste authentication material into chat, logs, or the repository. The loaded-binary replacement script runs `auth ensure` before it stops the current service, so an expired login no longer causes a post-restart doctor rollback. Verify without revealing credentials:
 
 ```sh
 ./dist/aarch64-apple-darwin/grok-codex-bridge auth status

@@ -20,6 +20,7 @@ const TOKEN_TTL: Duration = Duration::days(30);
 const MAX_AUTH_FILE_BYTES: u64 = 1024 * 1024;
 const RENEWAL_POLL_INTERVAL: StdDuration = StdDuration::from_millis(250);
 const OFFICIAL_REFRESH_TIMEOUT: StdDuration = StdDuration::from_secs(7);
+const OFFICIAL_LOGIN_TIMEOUT: StdDuration = StdDuration::from_secs(300);
 
 pub struct CredentialStore {
     path: PathBuf,
@@ -107,7 +108,7 @@ impl CredentialStore {
                 Ok(credential) => return Ok(credential),
                 Err(error) => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
-                    if !matches!(error, CredentialError::ExpiredSessionCredential) {
+                    if !error.allows_official_login() {
                         return Err(error);
                     }
                     if remaining.is_zero() {
@@ -122,6 +123,40 @@ impl CredentialStore {
                 }
             }
         }
+    }
+
+    /// Ensures that the official credential is usable for an explicit,
+    /// foreground lifecycle operation.
+    ///
+    /// Recoverable missing, incomplete, or expired login state delegates once
+    /// to the official desktop OAuth flow. The official CLI owns browser OAuth
+    /// and credential writes; the bridge only waits for its exit and rereads
+    /// the authoritative file. Malformed, ambiguous, or unsafe credential
+    /// state fails closed without launching login.
+    pub fn ensure_with_official_login(&self) -> Result<Arc<SessionCredential>, CredentialError> {
+        match self.load() {
+            Ok(credential) => return Ok(credential),
+            Err(error) if error.allows_official_login() => {}
+            Err(error) => return Err(error),
+        }
+
+        let _ = run_official_refresh(&self.official_cli);
+        match self.reload_uncached() {
+            Ok(credential) => return Ok(credential),
+            Err(error) if error.allows_official_login() => {}
+            Err(error) => return Err(error),
+        }
+
+        run_official_login(&self.official_cli)?;
+        self.reload_uncached()
+    }
+
+    fn reload_uncached(&self) -> Result<Arc<SessionCredential>, CredentialError> {
+        self.cached
+            .lock()
+            .map_err(|_| CredentialError::CacheUnavailable)?
+            .take();
+        self.load()
     }
 }
 
@@ -154,6 +189,39 @@ fn run_official_refresh(helper: &Path) -> bool {
                 let _ = child.kill();
                 let _ = child.wait();
                 return false;
+            }
+        }
+    }
+}
+
+fn run_official_login(helper: &Path) -> Result<(), CredentialError> {
+    let mut child = Command::new(helper)
+        .args(["login", "--oauth"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(CredentialError::StartOfficialLogin)?;
+
+    let deadline = Instant::now() + OFFICIAL_LOGIN_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => return Err(CredentialError::OfficialLoginFailed(status.code())),
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(
+                    RENEWAL_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(CredentialError::OfficialLoginTimedOut);
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(CredentialError::WaitForOfficialLogin(error));
             }
         }
     }
@@ -411,11 +479,30 @@ pub enum CredentialError {
     InvalidSessionCredential,
     #[error("the selected xAI session credential is expired; run the official Grok login flow")]
     ExpiredSessionCredential,
+    #[error("failed to start the official Grok browser login")]
+    StartOfficialLogin(#[source] std::io::Error),
+    #[error("the official Grok browser login failed with exit code {0:?}")]
+    OfficialLoginFailed(Option<i32>),
+    #[error("the official Grok browser login did not finish within five minutes")]
+    OfficialLoginTimedOut,
+    #[error("failed while waiting for the official Grok browser login")]
+    WaitForOfficialLogin(#[source] std::io::Error),
     #[error("credential memory cache is unavailable")]
     CacheUnavailable,
     #[cfg(not(unix))]
     #[error("credential permission validation is unsupported on this platform")]
     UnsupportedPermissionPlatform,
+}
+
+impl CredentialError {
+    fn allows_official_login(&self) -> bool {
+        matches!(
+            self,
+            Self::SessionCredentialMissing
+                | Self::InvalidSessionCredential
+                | Self::ExpiredSessionCredential
+        ) || matches!(self, Self::ReadAuth(error) if error.kind() == std::io::ErrorKind::NotFound)
+    }
 }
 
 #[cfg(test)]
@@ -563,7 +650,6 @@ mod tests {
     fn official_helper_is_not_attempted_for_non_expiry_errors() {
         let current_record = record("current", "2099-01-01T00:00:00Z");
         let cases = [
-            ("missing", None, None),
             ("malformed", Some("not-json"), None),
             ("current", Some(current_record.as_str()), Some("current")),
         ];
@@ -587,6 +673,80 @@ mod tests {
                 Some(token) => assert_eq!(result.unwrap().token(), token, "{name}"),
                 None => assert!(result.is_err(), "{name}"),
             }
+            assert!(!marker.exists(), "{name}");
+        }
+    }
+
+    #[test]
+    fn ensure_launches_official_oauth_once_and_reloads_credential() {
+        let temporary = tempfile::tempdir().unwrap();
+        let auth_home = temporary.path();
+        let path = auth_home.join("auth.json");
+        let helper = auth_home.join("bin/grok");
+        let invocation = auth_home.join("invocation");
+        fs::create_dir(auth_home.join("bin")).unwrap();
+        write_helper(
+            &helper,
+            &format!(
+                "if [ \"$1\" = models ]; then exit 7; fi\nhelper_dir=$(dirname \"$0\")\nauth_path=\"$helper_dir/../auth.json\"\nprintf '%s %s' \"$1\" \"$2\" > \"{}\"\nprintf '%s' '{}' > \"$auth_path.tmp\"\nchmod 600 \"$auth_path.tmp\"\nmv \"$auth_path.tmp\" \"$auth_path\"",
+                invocation.display(),
+                record("renewed", "2099-01-01T00:00:00Z")
+            ),
+        );
+
+        let credential = CredentialStore::new(path)
+            .unwrap()
+            .ensure_with_official_login()
+            .unwrap();
+        assert_eq!(credential.token(), "renewed");
+        assert_eq!(fs::read_to_string(invocation).unwrap(), "login --oauth");
+    }
+
+    #[test]
+    fn missing_credential_uses_silent_refresh_before_browser_login() {
+        let temporary = tempfile::tempdir().unwrap();
+        let auth_home = temporary.path();
+        let path = auth_home.join("auth.json");
+        let helper = auth_home.join("bin/grok");
+        let invocation = auth_home.join("invocation");
+        fs::create_dir(auth_home.join("bin")).unwrap();
+        write_helper(
+            &helper,
+            &format!(
+                "helper_dir=$(dirname \"$0\")\nauth_path=\"$helper_dir/../auth.json\"\nprintf '%s' \"$1\" > \"{}\"\nprintf '%s' '{}' > \"$auth_path.tmp\"\nchmod 600 \"$auth_path.tmp\"\nmv \"$auth_path.tmp\" \"$auth_path\"",
+                invocation.display(),
+                record("renewed", "2099-01-01T00:00:00Z")
+            ),
+        );
+
+        let credential = CredentialStore::new(path)
+            .unwrap()
+            .ensure_with_official_login()
+            .unwrap();
+        assert_eq!(credential.token(), "renewed");
+        assert_eq!(fs::read_to_string(invocation).unwrap(), "models");
+    }
+
+    #[test]
+    fn ensure_does_not_launch_login_for_unsafe_or_malformed_auth() {
+        let cases = [("malformed", "not-json", 0o600), ("unsafe", "{}", 0o640)];
+        for (name, contents, mode) in cases {
+            let temporary = tempfile::tempdir().unwrap();
+            let auth_home = temporary.path();
+            let path = auth_home.join("auth.json");
+            let helper = auth_home.join("bin/grok");
+            let marker = auth_home.join("attempted");
+            fs::create_dir(auth_home.join("bin")).unwrap();
+            write_auth(&path, contents, mode);
+            write_helper(&helper, &format!("touch \"{}\"", marker.display()));
+
+            assert!(
+                CredentialStore::new(path)
+                    .unwrap()
+                    .ensure_with_official_login()
+                    .is_err(),
+                "{name}"
+            );
             assert!(!marker.exists(), "{name}");
         }
     }

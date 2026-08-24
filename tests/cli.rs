@@ -29,7 +29,7 @@ fn status_reports_capability_without_claiming_activation() {
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).expect("status output must be UTF-8"),
-        "phase F source includes local Responses, reversible lifecycle, doctor, auth status, and launchd controls; this command does not inspect installation or activation\n"
+        "phase F source includes local Responses, reversible lifecycle, doctor, auth status/ensure, and launchd controls; this command does not inspect installation or activation\n"
     );
 }
 
@@ -90,6 +90,21 @@ fn lifecycle_subcommands_fail_closed_when_the_operation_is_missing() {
         let stderr = String::from_utf8(output.stderr).expect("error output must be UTF-8");
         assert!(stderr.contains(&format!("Usage: grok-codex-bridge {command} <COMMAND>")));
     }
+}
+
+#[test]
+fn auth_ensure_is_exposed_as_an_explicit_operation() {
+    let output = binary()
+        .args(["auth", "ensure", "--help"])
+        .output()
+        .expect("the test binary must start");
+
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8(output.stdout)
+            .expect("auth ensure help must be UTF-8")
+            .contains("official browser OAuth flow")
+    );
 }
 
 #[test]

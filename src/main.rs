@@ -39,7 +39,7 @@ async fn main() -> ExitCode {
         }
         Some(Command::Status) => {
             println!(
-                "phase F source includes local Responses, reversible lifecycle, doctor, auth status, and launchd controls; this command does not inspect installation or activation"
+                "phase F source includes local Responses, reversible lifecycle, doctor, auth status/ensure, and launchd controls; this command does not inspect installation or activation"
             );
             ExitCode::SUCCESS
         }
@@ -79,6 +79,9 @@ async fn main() -> ExitCode {
         Some(Command::Auth {
             command: AuthCommand::Status,
         }) => command_result(auth_status_command()),
+        Some(Command::Auth {
+            command: AuthCommand::Ensure,
+        }) => command_result(auth_ensure_command()),
         Some(Command::Service { command }) => command_result(service_command(command)),
         Some(Command::Picker { command }) => command_result(picker_command(command)),
         Some(Command::Uninstall(arguments)) => command_result(uninstall_command(arguments)),
@@ -248,6 +251,13 @@ fn auth_status_command() -> Result<ExitCode, OperationError> {
     } else {
         ExitCode::FAILURE
     })
+}
+
+fn auth_ensure_command() -> Result<ExitCode, OperationError> {
+    let store = CredentialStore::from_environment()?;
+    store.ensure_with_official_login()?;
+    println!("auth available: official Grok session credential is valid");
+    Ok(ExitCode::SUCCESS)
 }
 
 fn service_command(command: ServiceCommand) -> Result<ExitCode, OperationError> {

@@ -17,7 +17,7 @@
 ## Responsibility Ownership
 
 - Codexはagent loop、permission、tool call、shell、filesystem、MCP、Skills、Browser、Computer Use、task/session stateを所有する。
-- bridgeは、loopback provider endpoint、Codex側protocolのparse、Grok側protocolへの変換、streaming変換、local caller authentication、credential fileのread-only検査とzeroizing cache、Responses provider requestでhard expiryを検出した場合に限る公式CLI更新trigger、Grok upstream clientを所有する。公式CLIが行うcredential fileの更新、login、OIDC refresh自体はbridgeの所有外である。
+- bridgeは、loopback provider endpoint、Codex側protocolのparse、Grok側protocolへの変換、streaming変換、local caller authentication、credential fileのread-only検査とzeroizing cache、Responses provider requestで再認証可能なcredential状態を検出した場合の非対話更新trigger、明示`auth ensure`時の公式desktop OAuth起動、Grok upstream clientを所有する。公式CLIが行うcredential fileの更新、browser login、OIDC refresh自体はbridgeの所有外である。
 - Grok upstreamはmodel inferenceとupstream authentication contractを所有する。bridgeはGrokのagent harnessまたはtool executorを再実装しない。
 - materialization scriptはrelease binaryのbuildと`dist/aarch64-apple-darwin/`への配置だけを所有する。通常callerの起動、インストール、常駐化を所有しない。
 - coordinatorまたはinstallerを追加する場合、その責務をroute選択、設定適用、起動停止へ限定し、protocol変換やtool実行を重複所有させない。
@@ -26,7 +26,7 @@
 
 - Codexからbridgeへのhandoffは、現在のCodex authoritative sourceと実runtimeで確認したprotocolだけを実装する。過去の会話、README、推測したOpenAI互換性をprotocol authorityにしない。
 - bridgeからGrokへのhandoffは、現在のxAI authoritative sourceまたは観測可能な公式client contractで確認したendpoint、headers、streaming semanticsだけを実装する。private endpoint探索、fingerprint偽装、未確認fallbackを追加しない。
-- credentialは選択されたauthoritative fileをin-placeかつread-onlyで検査する。Responses provider requestで選択recordのhard expiryを検出した場合に限り、公式bin/grok modelsをstdin/stdout/stderr切断・7秒timeoutで一度だけ起動し、authoritative fileを最大60秒read-only再読込してよい。auth status、doctor、catalog refresh、その他のcredential検査経路ではこのtriggerを起動しない。bridgeはcredential fileを直接書き換えず、repo、Codex config、log、SQLite、cache、environment dumpへ複製しない。公式CLIが行う更新はbridgeのread-only検査の外側である。
+- credentialは選択されたauthoritative fileをin-placeかつread-onlyで検査する。Responses provider requestで選択recordのhard expiry、missing、またはincompleteを検出した場合は、公式`bin/grok models`をstdin/stdout/stderr切断・7秒timeoutで一度だけ起動し、authoritative fileを最大60秒read-only再読込してよい。明示`auth ensure`も同じ非対話更新を最初に試し、それでもmissing、incomplete、またはexpiredなら公式`bin/grok login --oauth`をstdin/stdout/stderr切断で一度起動し、最大5分だけbrowser完了を待ってauthoritative fileをread-only再検査する。malformed、ambiguous、unsafeなcredentialではloginを起動せずfail closedする。`auth status`、`doctor`、`catalog refresh`はどちらのtriggerも起動しない。loaded binary交換scriptはservice停止前にnew binaryの`auth ensure`を実行する。bridgeはcredential fileを直接書き換えず、repo、Codex config、log、SQLite、cache、environment dumpへ複製しない。公式CLIが行う更新はbridgeのread-only検査の外側である。
 - normal runtimeは`./scripts/materialize-macos.sh`が配置したconcrete executableを直接実行する。`cargo run`、build-on-first-use、Cargo cache探索、interpreted fallbackをnormal runtimeに使用しない。
 
 ## Public Agent Build And Install Route
@@ -34,7 +34,7 @@
 - このrepoを受け取ったagentは、最初に`git status --short`、`README.md`または`README.ja.md`、`rust-toolchain.toml`、`scripts/materialize-macos.sh`を確認する。既存差分がある場合は保持し、競合するfileを上書きしない。
 - build要求ではrepo rootから`./scripts/materialize-macos.sh`を一度実行し、`./dist/aarch64-apple-darwin/grok-codex-bridge --version`で生成済みnative binaryの代表経路を確認する。normal operationへ`cargo run`または`target/`内binaryを渡さない。
 - installまたはactivationはuserがそのactionを明示した場合だけ実行する。安全側のV1.0既定経路には`./scripts/grok-codex.sh`を使用し、scriptを別locationへcopyまたはsymlinkしない。
-- lifecycleを個別操作する明示要求では、生成済みbinaryの`install`、`service install`、`doctor`、`auth status`、`service status` subcommandだけを使用する。Codex本体binary、Codex config、Grok auth、LaunchAgent plistを直接編集せず、`launchctl`を直接呼ばない。
+- lifecycleを個別操作する明示要求では、生成済みbinaryの`install`、`service install`、`doctor`、`auth status`、`auth ensure`、`service status` subcommandだけを使用する。Codex本体binary、Codex config、Grok auth、LaunchAgent plistを直接編集せず、`launchctl`を直接呼ばない。
 - merged pickerはuserがV1.1を明示した場合だけ有効化する。有効化前にauthoritative Native Codex catalogと実効first-party Responses upstreamを確認し、`picker install --native-catalog <FILE> --native-upstream-base-url <URL>`へ渡す。どちらかを確認できなければ停止し、推測値で有効化しない。
 - `--native-catalog`など絶対pathを要求するruntime引数は実行環境で解決する。README、handoff、commitへ個人固有の絶対path、credential、token、capability、session IDを記録しない。repo内file参照は相対pathで記述する。
 - rollback要求では、統合pickerを使用している場合は最初に`picker uninstall`、次に`service uninstall`、最後に`uninstall`を使用する。manifest外のfileを削除または復元しない。
