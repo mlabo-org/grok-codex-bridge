@@ -51,11 +51,65 @@ impl GeneratedPickerCatalog {
     pub fn grok_model_count(&self) -> usize {
         self.grok_model_count
     }
+
+    /// Adds non-selectable compatibility metadata for saved Grok tasks by
+    /// cloning the selected Native fallback row. App Server can therefore
+    /// resolve the saved slug, while the picker cannot offer it for selection.
+    pub fn with_hidden_grok_compatibility(
+        mut self,
+        grok_catalog: &CatalogSnapshot,
+        fallback_model: &str,
+    ) -> Result<Self, PickerError> {
+        let mut root: Value = serde_json::from_slice(&self.bytes)
+            .map_err(|error| PickerError::MalformedNativeCatalog(error.to_string()))?;
+        let models = root
+            .as_object_mut()
+            .and_then(|object| object.get_mut("models"))
+            .and_then(Value::as_array_mut)
+            .ok_or(PickerError::InvalidNativeCatalog(
+                "catalog must contain a models array",
+            ))?;
+        let fallback = models
+            .iter()
+            .find(|model| model.get("slug").and_then(Value::as_str) == Some(fallback_model))
+            .cloned()
+            .ok_or(PickerError::MissingNativeCompatibilityFallback)?;
+        let mut seen = self
+            .native_model_slugs
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let mut grok_ids = grok_catalog.models().to_vec();
+        grok_ids.sort_unstable();
+        for (index, id) in grok_ids.iter().enumerate() {
+            if !seen.insert(id.clone()) {
+                return Err(PickerError::DuplicateSlug(id.clone()));
+            }
+            let mut entry = fallback.clone();
+            let object = entry
+                .as_object_mut()
+                .expect("validated Native fallback must be an object");
+            object.insert("slug".to_owned(), Value::String(id.clone()));
+            object.insert("display_name".to_owned(), Value::String(id.clone()));
+            object.insert(
+                "description".to_owned(),
+                Value::String("Saved Grok task routed through Native compatibility.".to_owned()),
+            );
+            object.insert("visibility".to_owned(), Value::String("hide".to_owned()));
+            validate_model_entry(&entry, self.native_model_count + index)?;
+            models.push(entry);
+        }
+        self.bytes = serde_json::to_vec_pretty(&root)
+            .map_err(|error| PickerError::SerializeCatalog(error.to_string()))?;
+        self.grok_model_count = grok_ids.len();
+        Ok(self)
+    }
 }
 
 /// Reads the Grok overlay SSOT from disk at catalog generation.
 pub fn load_grok_overlay(path: &Path) -> Result<String, PickerError> {
-    let bytes = fs::read(path).map_err(|error| PickerError::UnreadableOverlay(error.to_string()))?;
+    let bytes =
+        fs::read(path).map_err(|error| PickerError::UnreadableOverlay(error.to_string()))?;
     if bytes.is_empty() {
         return Err(PickerError::EmptyOverlay);
     }
@@ -125,6 +179,44 @@ pub fn generate_picker_catalog(
         native_model_slugs,
         native_model_count,
         grok_model_count: grok_ids.len(),
+    })
+}
+
+/// Publishes the authoritative Native catalog without Grok rows while keeping
+/// the same provider definition available for legacy saved tasks. The runtime
+/// resolver still uses its separately managed Grok catalog for slug
+/// recognition; this artifact controls only what the picker can select.
+pub fn generate_native_compatibility_catalog(
+    native_catalog: &[u8],
+) -> Result<GeneratedPickerCatalog, PickerError> {
+    let root: Value = serde_json::from_slice(native_catalog)
+        .map_err(|error| PickerError::MalformedNativeCatalog(error.to_string()))?;
+    let native_models = root
+        .as_object()
+        .and_then(|object| object.get("models"))
+        .and_then(Value::as_array)
+        .ok_or(PickerError::InvalidNativeCatalog(
+            "catalog must contain a models array",
+        ))?;
+    if native_models.is_empty() {
+        return Err(PickerError::InvalidNativeCatalog(
+            "native models array must not be empty",
+        ));
+    }
+    let mut seen = HashSet::with_capacity(native_models.len());
+    let mut native_model_slugs = Vec::with_capacity(native_models.len());
+    for (index, model) in native_models.iter().enumerate() {
+        let slug = validate_model_entry(model, index)?;
+        if !seen.insert(slug.to_owned()) {
+            return Err(PickerError::DuplicateSlug(slug.to_owned()));
+        }
+        native_model_slugs.push(slug.to_owned());
+    }
+    Ok(GeneratedPickerCatalog {
+        bytes: native_catalog.to_vec(),
+        native_model_slugs,
+        native_model_count: native_models.len(),
+        grok_model_count: 0,
     })
 }
 
@@ -656,6 +748,8 @@ pub enum PickerError {
     DuplicateSlug(String),
     #[error("model catalog contains too many models")]
     TooManyModels,
+    #[error("Native compatibility fallback is missing from the Native catalog")]
+    MissingNativeCompatibilityFallback,
     #[error("could not serialize generated picker catalog: {0}")]
     SerializeCatalog(String),
     #[error("Grok overlay file is unreadable: {0}")]
@@ -762,11 +856,30 @@ mod tests {
         );
         assert_eq!(after["models"][1]["include_apps_usage_instructions"], true);
         assert_eq!(after["models"][1]["supports_parallel_tool_calls"], true);
-        assert_eq!(
-            after["models"][1]["base_instructions"],
-            overlay()
-        );
+        assert_eq!(after["models"][1]["base_instructions"], overlay());
         assert_eq!(serde_json::from_slice::<Value>(&source).unwrap(), before);
+    }
+
+    #[test]
+    fn native_compatibility_catalog_hides_grok_rows_and_preserves_native_bytes() {
+        let source = native_catalog();
+        let generated = generate_native_compatibility_catalog(&source).unwrap();
+        assert_eq!(generated.bytes(), source);
+        assert_eq!(generated.native_model_slugs(), ["gpt-native"]);
+        assert_eq!(generated.native_model_count(), 1);
+        assert_eq!(generated.grok_model_count(), 0);
+        let grok = CatalogSnapshot::new(["grok-4.6"], None).unwrap();
+        let generated = generated
+            .with_hidden_grok_compatibility(&grok, "gpt-native")
+            .unwrap();
+        let value: Value = serde_json::from_slice(generated.bytes()).unwrap();
+        assert_eq!(generated.grok_model_count(), 1);
+        assert_eq!(value["models"][1]["slug"], "grok-4.6");
+        assert_eq!(value["models"][1]["visibility"], "hide");
+        assert_eq!(
+            value["models"][1]["base_instructions"],
+            value["models"][0]["base_instructions"]
+        );
     }
 
     #[test]

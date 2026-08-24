@@ -108,6 +108,37 @@ fn auth_ensure_is_exposed_as_an_explicit_operation() {
 }
 
 #[test]
+fn desktop_switch_exposes_native_compatibility_without_an_uninstall_alias() {
+    let output = binary()
+        .args(["switch", "--help"])
+        .output()
+        .expect("the test binary must start");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("switch help must be UTF-8");
+    assert!(stdout.contains("--native-compatibility"));
+    assert!(stdout.contains("--replacement-script"));
+    assert!(stdout.contains("--replacement-launcher"));
+    assert!(!stdout.contains("uninstall"));
+}
+
+#[test]
+fn installed_mode_commands_are_explicit_and_do_not_expose_build_options() {
+    for mode in ["grok", "native"] {
+        let output = binary()
+            .args(["mode", mode, "--help"])
+            .output()
+            .expect("the test binary must start");
+
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).expect("mode help must be UTF-8");
+        assert!(!stdout.contains("cargo"));
+        assert!(!stdout.contains("materialize"));
+        assert!(!stdout.contains("replacement"));
+    }
+}
+
+#[test]
 fn install_rejects_unknown_options() {
     let output = binary()
         .args(["install", "--activate"])
@@ -129,19 +160,44 @@ fn install_materializes_without_activation_or_secret_output() {
     let codex_home = home.join(".codex");
     let install_parent = home.join("Library/Application Support");
     let install_root = install_parent.join("grok-codex-bridge");
+    let source_launcher = temporary.path().join("Grok Codex Switch.app");
+    let launcher_executable = source_launcher.join("Contents/MacOS/Grok Codex Switch");
     let launch_parent = home.join("Library/LaunchAgents");
     let launch_agent = launch_parent.join("com.local.grok-codex-bridge.plist");
     fs::create_dir_all(&codex_home).expect("the temporary Codex home must be created");
     fs::create_dir_all(&install_parent).expect("the temporary install parent must be created");
     fs::create_dir_all(&launch_parent).expect("the temporary LaunchAgents parent must be created");
+    fs::create_dir_all(launcher_executable.parent().unwrap())
+        .expect("the launcher bundle must be created");
+    fs::create_dir_all(source_launcher.join("Contents/Resources"))
+        .expect("the launcher resources must be created");
+    fs::write(
+        source_launcher.join("Contents/Info.plist"),
+        "<plist><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleExecutable</key><string>Grok Codex Switch</string></plist>",
+    )
+    .expect("the launcher Info.plist must be written");
+    fs::write(&launcher_executable, b"fake launcher executable")
+        .expect("the launcher executable must be written");
+    fs::write(
+        source_launcher.join("Contents/Resources/grok-codex-bridge-overlay.md"),
+        b"Grok overlay",
+    )
+    .expect("the launcher overlay must be written");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&launcher_executable, fs::Permissions::from_mode(0o755))
+            .expect("the launcher executable must be executable");
+    }
 
     let output = binary()
         .args([
             "install",
             "--source-binary",
             env!("CARGO_BIN_EXE_grok-codex-bridge"),
-            "--install-root",
+            "--source-launcher",
         ])
+        .arg(&source_launcher)
+        .args(["--install-root"])
         .arg(&install_root)
         .args(["--codex-home"])
         .arg(&codex_home)
@@ -164,6 +220,16 @@ fn install_materializes_without_activation_or_secret_output() {
     assert!(!stderr.contains(&capability));
     assert_eq!(capability.len(), 64);
     assert_materialized(&install_root.join("bin/grok-codex-bridge"));
+    assert!(
+        install_root
+            .join("bin/Grok Codex Switch.app/Contents/MacOS/Grok Codex Switch")
+            .is_file()
+    );
+    assert!(
+        install_root
+            .join("bin/Grok Codex Switch.app/Contents/Resources/grok-codex-bridge-overlay.md")
+            .is_file()
+    );
     assert!(install_root.join("config/bridge.toml").is_file());
     assert!(install_root.join("install-manifest.json").is_file());
     assert!(codex_home.join("grok-bridge.config.toml").is_file());

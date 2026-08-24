@@ -85,6 +85,12 @@ pub struct CatalogSnapshot {
 }
 
 impl CatalogSnapshot {
+    /// Source-owned last-resort catalog used to keep previously saved Grok
+    /// model slugs resolvable before an authenticated catalog refresh.
+    pub fn bootstrap() -> Result<Self, CatalogError> {
+        Self::new(BOOTSTRAP_MODELS.iter().copied(), None)
+    }
+
     pub fn new<I, S>(models: I, etag: Option<String>) -> Result<Self, CatalogError>
     where
         I: IntoIterator<Item = S>,

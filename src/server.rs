@@ -41,7 +41,14 @@ struct ServiceState {
 }
 
 pub fn build_router(config: RuntimeConfig, catalog: ModelCatalog) -> Router {
-    let responses_disabled = responses_disabled_from_environment();
+    let native_route = load_native_route(&config).unwrap_or_else(|error| {
+        tracing::error!(error_class = "native_route", %error, "Native route is unavailable");
+        None
+    });
+    let compatibility_mode = native_route
+        .as_ref()
+        .is_some_and(|route| route.native_compatibility_fallback().is_some());
+    let responses_disabled = responses_disabled_from_environment() || compatibility_mode;
     let responses = if responses_disabled {
         None
     } else {
@@ -56,7 +63,7 @@ pub fn build_router(config: RuntimeConfig, catalog: ModelCatalog) -> Router {
             }
         }
     };
-    let native = native_service(&config).unwrap_or_else(|error| {
+    let native = native_service_from_route(native_route).unwrap_or_else(|error| {
         tracing::error!(error_class = "native_route", %error, "Native route is unavailable");
         None
     });
@@ -97,10 +104,7 @@ fn build_router_with_services(
             get(picker_responses_websocket_not_supported).post(picker_responses),
         )
         .route("/v1/responses/compact", post(picker_responses_compact))
-        .route(
-            "/v1/images/generations",
-            post(picker_images_generations),
-        )
+        .route("/v1/images/generations", post(picker_images_generations))
         .route("/v1/images/edits", post(picker_images_edits))
         .route("/v1/alpha/search", post(picker_alpha_search))
         .route("/_grok/{capability}/healthz", get(healthz))
@@ -145,8 +149,12 @@ pub async fn bind(
     catalog: ModelCatalog,
 ) -> Result<BoundServer, ServerError> {
     let bind = config.bind();
-    let native = native_service(&config).map_err(ServerError::NativeRoute)?;
-    let responses_disabled = responses_disabled_from_environment();
+    let native_route = load_native_route(&config).map_err(ServerError::NativeRoute)?;
+    let compatibility_mode = native_route
+        .as_ref()
+        .is_some_and(|route| route.native_compatibility_fallback().is_some());
+    let native = native_service_from_route(native_route).map_err(ServerError::NativeRoute)?;
+    let responses_disabled = responses_disabled_from_environment() || compatibility_mode;
     let responses = if responses_disabled {
         None
     } else {
@@ -165,8 +173,14 @@ pub async fn serve(config: RuntimeConfig, catalog: ModelCatalog) -> Result<(), S
     bind(config, catalog).await?.serve().await
 }
 
-fn native_service(config: &RuntimeConfig) -> Result<Option<Arc<NativeService>>, NativeError> {
-    let Some(route) = NativeRouteState::load_if_present(&config.grok().native_route_file())? else {
+fn load_native_route(config: &RuntimeConfig) -> Result<Option<NativeRouteState>, NativeError> {
+    NativeRouteState::load_if_present(&config.grok().native_route_file())
+}
+
+fn native_service_from_route(
+    route: Option<NativeRouteState>,
+) -> Result<Option<Arc<NativeService>>, NativeError> {
+    let Some(route) = route else {
         return Ok(None);
     };
     let client = NativeClient::production(route.upstream())?;
@@ -408,12 +422,20 @@ async fn route_authorized_responses(
         .native
         .as_ref()
         .is_some_and(|native| native.route.contains(&envelope.model));
+    let compatibility_fallback = state
+        .native
+        .as_ref()
+        .and_then(|native| native.route.native_compatibility_fallback())
+        .filter(|_| is_grok && !is_native);
     match (is_native, is_grok) {
         (true, false) => {
-            let native = state
-                .native
-                .expect("Native classifier requires a Native service");
-            let body = match native_request_body(path, &parts.headers, body, &decoded) {
+            let native = Arc::clone(
+                state
+                    .native
+                    .as_ref()
+                    .expect("Native classifier requires a Native service"),
+            );
+            let body = match native_request_body(path, &parts.headers, body, &decoded, None) {
                 Ok(body) => body,
                 Err(()) => {
                     return route_error(
@@ -444,6 +466,33 @@ async fn route_authorized_responses(
                 "model_not_admitted",
                 "Requested model is not admitted by the current picker state",
             );
+        }
+        (false, true) if let Some(fallback_model) = compatibility_fallback => {
+            let native = Arc::clone(
+                state
+                    .native
+                    .as_ref()
+                    .expect("Native compatibility requires a Native service"),
+            );
+            let body = match native_request_body(
+                path,
+                &parts.headers,
+                body,
+                &decoded,
+                Some(fallback_model),
+            ) {
+                Ok(body) => body,
+                Err(()) => {
+                    return route_error(
+                        StatusCode::BAD_REQUEST,
+                        "request_encoding",
+                        "invalid_request_error",
+                        "request_body_invalid",
+                        "Responses request encoding is invalid or unsupported",
+                    );
+                }
+            };
+            return native_response(native, path, &parts.headers, body.into()).await;
         }
         (false, true) => {}
     }
@@ -657,13 +706,19 @@ fn native_request_body(
     headers: &HeaderMap,
     original: Bytes,
     decoded: &[u8],
+    model_override: Option<&str>,
 ) -> Result<Bytes, ()> {
     if path != NativeApiPath::Responses {
         return Ok(original);
     }
     let mut request: Value = serde_json::from_slice(decoded).map_err(|_| ())?;
+    let model_changed = model_override.is_some_and(|model| {
+        let changed = request.get("model").and_then(Value::as_str) != Some(model);
+        request["model"] = Value::String(model.to_owned());
+        changed
+    });
     let sanitized_unreplayable_history = sanitize_unreplayable_history_for_native(&mut request);
-    if !sanitized_unreplayable_history {
+    if !sanitized_unreplayable_history && !model_changed {
         return Ok(original);
     }
     let serialized = serde_json::to_vec(&request).map_err(|_| ())?;
@@ -1084,13 +1139,7 @@ mod tests {
         credentials: CredentialStore,
         client: GrokClient,
     ) -> Router {
-        test_app_with_renewal_grace(
-            config,
-            catalog,
-            credentials,
-            client,
-            Duration::ZERO,
-        )
+        test_app_with_renewal_grace(config, catalog, credentials, client, Duration::ZERO)
     }
 
     fn test_app_with_renewal_grace(
@@ -1516,6 +1565,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_compatibility_routes_grok_slug_to_fallback_without_mutating_saved_payload() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (client, mock, task) = start_native_mock().await;
+        let route = NativeRouteState::new_native_compatibility(
+            crate::native::NativeUpstream::ChatgptCodex,
+            ["gpt-native".to_owned()],
+            "gpt-native".to_owned(),
+        )
+        .unwrap();
+        let app = build_router_with_services(
+            runtime_config(temporary.path()),
+            ModelCatalog::bootstrap().unwrap(),
+            None,
+            Some(Arc::new(NativeService { route, client })),
+            true,
+        );
+        let saved = request_body("grok-4.6");
+        let saved_bytes = serde_json::to_vec(&saved).unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header(PICKER_CALLER_HEADER, TOKEN)
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer native-caller-secret")
+                    .body(Body::from(saved_bytes.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        to_bytes(response.into_body(), 4096).await.unwrap();
+
+        let observed = mock.observed.lock().unwrap();
+        let (headers, body) = &observed[0];
+        let forwarded: Value = serde_json::from_slice(body).unwrap();
+        assert_eq!(forwarded["model"], "gpt-native");
+        assert_eq!(saved["model"], "grok-4.6");
+        assert_eq!(serde_json::to_vec(&saved).unwrap(), saved_bytes);
+        assert_eq!(headers["authorization"], "Bearer native-caller-secret");
+        assert!(headers.get(PICKER_CALLER_HEADER).is_none());
+        drop(observed);
+        task.abort();
+    }
+
+    #[tokio::test]
     async fn native_route_preserves_codex_transport_state() {
         let temporary = tempfile::tempdir().unwrap();
         let (client, mock, task) = start_native_mock().await;
@@ -1555,10 +1651,7 @@ mod tests {
         let decoded = zstd::stream::decode_all(Cursor::new(upstream_body)).unwrap();
         let upstream: Value = serde_json::from_slice(&decoded).unwrap();
         assert_eq!(upstream["prompt_cache_retention"], "24h");
-        assert_eq!(
-            upstream["previous_response_id"],
-            "resp_grok_store_false"
-        );
+        assert_eq!(upstream["previous_response_id"], "resp_grok_store_false");
         assert_eq!(
             upstream["prompt_cache_key"],
             "11111111-1111-4111-8111-111111111111"
@@ -2177,10 +2270,16 @@ mod tests {
         for name in ["x-grok-conv-id", "x-grok-session-id"] {
             assert_eq!(first_headers[name], second_headers[name]);
         }
-        assert_ne!(first_headers["x-grok-req-id"], second_headers["x-grok-req-id"]);
+        assert_ne!(
+            first_headers["x-grok-req-id"],
+            second_headers["x-grok-req-id"]
+        );
         assert_eq!(first_headers["x-grok-turn-idx"], "1");
         assert_eq!(second_headers["x-grok-turn-idx"], "1");
-        assert_ne!(first_headers["x-grok-agent-id"], second_headers["x-grok-agent-id"]);
+        assert_ne!(
+            first_headers["x-grok-agent-id"],
+            second_headers["x-grok-agent-id"]
+        );
         assert!(
             observed
                 .iter()

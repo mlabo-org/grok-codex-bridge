@@ -9,11 +9,12 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::catalog::CatalogCache;
+use crate::catalog::{CatalogCache, CatalogSnapshot};
 use crate::credential::CredentialStore;
 use crate::native::{NativeRouteState, NativeUpstream};
 use crate::picker::{
-    ArtifactIdentity, ConfigRollbackOwnership, PickerManagedState, generate_picker_catalog,
+    ArtifactIdentity, ConfigRollbackOwnership, PickerManagedState,
+    generate_native_compatibility_catalog, generate_picker_catalog,
 };
 
 const MANIFEST_VERSION: u32 = 1;
@@ -22,6 +23,9 @@ const MANIFEST_FILE_NAME: &str = "install-manifest.json";
 const PROFILE_FILE_NAME: &str = "grok-bridge.config.toml";
 const PROFILE_PROVIDER_NAME: &str = "Grok Codex Bridge";
 const BINARY_FILE_NAME: &str = "grok-codex-bridge";
+const LAUNCHER_APP_PATH: &str = "bin/Grok Codex Switch.app";
+const LAUNCHER_EXECUTABLE_PATH: &str = "Contents/MacOS/Grok Codex Switch";
+const LAUNCHER_OVERLAY_PATH: &str = "Contents/Resources/grok-codex-bridge-overlay.md";
 const MAX_CONTROL_FILE_BYTES: u64 = 1024 * 1024;
 const CAPABILITY_LENGTH: usize = 64;
 const PICKER_CATALOG_FILE_NAME: &str = "picker-models.json";
@@ -36,6 +40,7 @@ pub(crate) const PICKER_CALLER_HEADER: &str = "x-grok-caller-capability";
 /// Complete, explicit inputs owned by the filesystem lifecycle producer.
 pub struct InstallRequest {
     pub source_binary: PathBuf,
+    pub source_launcher: PathBuf,
     pub install_root: PathBuf,
     pub codex_home: PathBuf,
     pub launch_agent_path: PathBuf,
@@ -50,6 +55,7 @@ pub struct InstallRequest {
 pub struct InstallReceipt {
     pub install_root: PathBuf,
     pub binary_path: PathBuf,
+    pub launcher_path: PathBuf,
     pub config_path: PathBuf,
     pub profile_path: PathBuf,
     pub launch_agent_path: PathBuf,
@@ -80,6 +86,7 @@ pub struct PickerInstallRequest {
     pub grok_overlay_path: PathBuf,
     pub native_upstream: NativeUpstream,
     pub bind: SocketAddr,
+    pub native_compatibility: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -166,6 +173,7 @@ fn install_inner(
 ) -> Result<InstallReceipt, LifecycleError> {
     let paths = InstallPaths::validate(request)?;
     let source = read_source_binary(&request.source_binary)?;
+    validate_launcher_bundle(&request.source_launcher)?;
     let capability = generate_capability();
     if request.launch_agent_contents.contains(&capability) {
         return Err(LifecycleError::LaunchAgentContainsCapability);
@@ -179,8 +187,10 @@ fn install_inner(
     let stage_paths = StagePaths::new(&stage_root);
     let stage_result = (|| {
         write_new_file(&stage_paths.binary, &source, 0o755)?;
+        copy_launcher_bundle(&request.source_launcher, &stage_paths.launcher)?;
         write_new_file(&stage_paths.config, config_contents.as_bytes(), 0o600)?;
         write_new_file(&stage_paths.capability, capability.as_bytes(), 0o600)?;
+        CatalogCache::new(&stage_paths.catalog).persist(&CatalogSnapshot::bootstrap()?)?;
         Ok::<(), LifecycleError>(())
     })();
     if let Err(error) = stage_result {
@@ -208,6 +218,7 @@ fn install_inner(
         version: MANIFEST_VERSION,
         install_root: request.install_root.clone(),
         binary_path: paths.binary.clone(),
+        launcher_path: paths.launcher.clone(),
         config_path: paths.config.clone(),
         catalog_cache_path: paths.catalog.clone(),
         caller_token_path: paths.capability.clone(),
@@ -274,6 +285,7 @@ fn install_inner(
     Ok(InstallReceipt {
         install_root: request.install_root.clone(),
         binary_path: paths.binary,
+        launcher_path: paths.launcher,
         config_path: paths.config,
         profile_path: paths.profile,
         launch_agent_path: request.launch_agent_path.clone(),
@@ -284,14 +296,9 @@ fn install_inner(
 }
 
 pub fn uninstall(request: &UninstallRequest) -> Result<UninstallReceipt, LifecycleError> {
-    validate_absolute_clean(&request.install_root)?;
-    validate_absolute_clean(&request.codex_home)?;
-    validate_absolute_clean(&request.launch_agent_path)?;
-    validate_safe_root(&request.install_root, &request.codex_home)?;
-    validate_existing_directory(&request.install_root, || LifecycleError::UnsafeInstallRoot)?;
+    preflight_uninstall(request)?;
 
     let (manifest, raw_manifest) = read_manifest(&request.install_root)?;
-    validate_manifest(&manifest, request)?;
     let managed = validate_managed_install(&manifest, &raw_manifest)?;
 
     // A picker install has its own exact rollback state, but full bridge
@@ -347,6 +354,22 @@ pub fn uninstall(request: &UninstallRequest) -> Result<UninstallReceipt, Lifecyc
     })
 }
 
+/// Proves that every manifest-owned target and picker rollback receipt needed
+/// by a full uninstall is currently readable and valid, without mutating the
+/// service, Codex configuration, or bridge installation.
+pub fn preflight_uninstall(request: &UninstallRequest) -> Result<(), LifecycleError> {
+    validate_absolute_clean(&request.install_root)?;
+    validate_absolute_clean(&request.codex_home)?;
+    validate_absolute_clean(&request.launch_agent_path)?;
+    validate_safe_root(&request.install_root, &request.codex_home)?;
+    validate_existing_directory(&request.install_root, || LifecycleError::UnsafeInstallRoot)?;
+
+    let (manifest, raw_manifest) = read_manifest(&request.install_root)?;
+    validate_manifest(&manifest, request)?;
+    validate_managed_install(&manifest, &raw_manifest)?;
+    preflight_uninstall_picker_if_present(&request.install_root, &request.codex_home)
+}
+
 /// Creates or updates the non-secret Phase J generated picker state. It does
 /// not start a service or reload Codex; callers must cross that boundary
 /// explicitly with the exact accepted Codex binary.
@@ -385,16 +408,14 @@ pub fn install_picker(
         .load()
         .map_err(LifecycleError::Catalog)?
         .ok_or(LifecycleError::PickerCatalogUnavailable)?;
-    let overlay = crate::picker::load_grok_overlay(&request.grok_overlay_path)
-        .map_err(LifecycleError::Picker)?;
-    let generated = generate_picker_catalog(&native_bytes, &grok_catalog, &overlay)
-        .map_err(LifecycleError::Picker)?;
-    let native_route = NativeRouteState::new(
-        request.native_upstream,
-        generated.native_model_slugs().iter().cloned(),
-    )
-    .map_err(LifecycleError::Native)?;
-    let native_route_bytes = native_route.to_json().map_err(LifecycleError::Native)?;
+    let generated = if request.native_compatibility {
+        generate_native_compatibility_catalog(&native_bytes).map_err(LifecycleError::Picker)?
+    } else {
+        let overlay = crate::picker::load_grok_overlay(&request.grok_overlay_path)
+            .map_err(LifecycleError::Picker)?;
+        generate_picker_catalog(&native_bytes, &grok_catalog, &overlay)
+            .map_err(LifecycleError::Picker)?
+    };
     let capability = read_private_control_file(&install_manifest.caller_token_path)?;
     let capability = validate_capability_bytes(&capability)?;
     let config_path = request.codex_home.join("config.toml");
@@ -422,6 +443,28 @@ pub fn install_picker(
         request.bind,
         capability,
     )?;
+    let (generated, native_route) = if request.native_compatibility {
+        let fallback = native_compatibility_fallback(
+            &config_plan.render_base,
+            generated.native_model_slugs(),
+        )?;
+        let native_route = NativeRouteState::new_native_compatibility(
+            request.native_upstream,
+            generated.native_model_slugs().iter().cloned(),
+            fallback.clone(),
+        )?;
+        let generated = generated
+            .with_hidden_grok_compatibility(&grok_catalog, &fallback)
+            .map_err(LifecycleError::Picker)?;
+        (generated, native_route)
+    } else {
+        let native_route = NativeRouteState::new(
+            request.native_upstream,
+            generated.native_model_slugs().iter().cloned(),
+        )?;
+        (generated, native_route)
+    };
+    let native_route_bytes = native_route.to_json().map_err(LifecycleError::Native)?;
     let prepared = (|| {
         let config_contents = render_picker_config(
             &config_plan.render_base,
@@ -498,6 +541,20 @@ pub fn uninstall_picker(install_root: &Path, codex_home: &Path) -> Result<bool, 
     uninstall_picker_if_present(install_root, codex_home)
 }
 
+fn preflight_uninstall_picker_if_present(
+    install_root: &Path,
+    codex_home: &Path,
+) -> Result<(), LifecycleError> {
+    let state_path = install_root.join("state").join(PICKER_STATE_FILE_NAME);
+    let Some(bytes) = read_optional_control_file(&state_path, &[0o600])? else {
+        return Ok(());
+    };
+    let state = PickerManagedState::from_json(&bytes).map_err(LifecycleError::Picker)?;
+    let config_path = codex_home.join("config.toml");
+    validate_picker_uninstall_inputs(install_root, &config_path, &state)?;
+    preflight_picker_config_rollback(install_root, &config_path, &state)
+}
+
 fn uninstall_picker_if_present(
     install_root: &Path,
     codex_home: &Path,
@@ -508,6 +565,20 @@ fn uninstall_picker_if_present(
     };
     let state = PickerManagedState::from_json(&bytes).map_err(LifecycleError::Picker)?;
     let config_path = codex_home.join("config.toml");
+    validate_picker_uninstall_inputs(install_root, &config_path, &state)?;
+    rollback_picker_config(install_root, &config_path, &state)?;
+    fs::remove_file(state.generated_catalog().path()).map_err(LifecycleError::RemoveInstallRoot)?;
+    fs::remove_file(state.native_route().path()).map_err(LifecycleError::RemoveInstallRoot)?;
+    fs::remove_file(&state_path).map_err(LifecycleError::RemoveInstallRoot)?;
+    sync_parent(&state_path)?;
+    Ok(true)
+}
+
+fn validate_picker_uninstall_inputs(
+    install_root: &Path,
+    config_path: &Path,
+    state: &PickerManagedState,
+) -> Result<(), LifecycleError> {
     if state.managed_config().path() != config_path
         || state.generated_catalog().path()
             != install_root.join("state").join(PICKER_CATALOG_FILE_NAME)
@@ -521,12 +592,43 @@ fn uninstall_picker_if_present(
     validate_read_only_picker_input(state.native_catalog())?;
     validate_identity(state.generated_catalog())?;
     validate_identity(state.native_route())?;
-    rollback_picker_config(install_root, &config_path, &state)?;
-    fs::remove_file(state.generated_catalog().path()).map_err(LifecycleError::RemoveInstallRoot)?;
-    fs::remove_file(state.native_route().path()).map_err(LifecycleError::RemoveInstallRoot)?;
-    fs::remove_file(&state_path).map_err(LifecycleError::RemoveInstallRoot)?;
-    sync_parent(&state_path)?;
-    Ok(true)
+    Ok(())
+}
+
+fn preflight_picker_config_rollback(
+    install_root: &Path,
+    config_path: &Path,
+    state: &PickerManagedState,
+) -> Result<(), LifecycleError> {
+    let metadata =
+        fs::symlink_metadata(config_path).map_err(LifecycleError::InspectExternalTarget)?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(LifecycleError::UnsafeExternalTarget);
+    }
+    let mode = file_mode(&metadata)?;
+    if !matches!(mode, 0o600 | 0o644) {
+        return Err(LifecycleError::UnsafeExternalPermissions);
+    }
+    let current = read_control_file_with_modes(config_path, &[mode], MAX_CONTROL_FILE_BYTES)?;
+    if artifact_identity(config_path, &current)? == *state.managed_config() {
+        if let ConfigRollbackOwnership::RestoreExactBackup { backup, .. } = state.config_rollback()
+        {
+            validate_identity(backup)?;
+        }
+        return Ok(());
+    }
+
+    let expectation = picker_config_expectation(install_root)?;
+    remove_rewritten_picker_config(
+        &current,
+        state.generated_catalog().path(),
+        expectation.bind,
+        &expectation.capability,
+    )?;
+    if let ConfigRollbackOwnership::RestoreExactBackup { backup, .. } = state.config_rollback() {
+        validate_identity(backup)?;
+    }
+    Ok(())
 }
 
 fn rollback_picker_config(
@@ -981,6 +1083,27 @@ fn picker_config_value(
     toml::from_str(&rendered).map_err(|_| LifecycleError::InvalidPickerConfig)
 }
 
+fn native_compatibility_fallback(
+    config: &[u8],
+    native_model_slugs: &[String],
+) -> Result<String, LifecycleError> {
+    let source = std::str::from_utf8(config).map_err(|_| LifecycleError::InvalidPickerConfig)?;
+    let parsed: toml::Value =
+        toml::from_str(source).map_err(|_| LifecycleError::InvalidPickerConfig)?;
+    let model = parsed
+        .get("model")
+        .and_then(toml::Value::as_str)
+        .filter(|model| !model.is_empty())
+        .ok_or(LifecycleError::NativeCompatibilityFallbackUnavailable)?;
+    if !native_model_slugs
+        .iter()
+        .any(|candidate| candidate == model)
+    {
+        return Err(LifecycleError::NativeCompatibilityFallbackUnavailable);
+    }
+    Ok(model.to_owned())
+}
+
 fn picker_provider_matches(
     provider: &toml::Value,
     expected: &toml::map::Map<String, toml::Value>,
@@ -1125,6 +1248,7 @@ fn restore_optional_file(
 
 struct InstallPaths {
     binary: PathBuf,
+    launcher: PathBuf,
     config: PathBuf,
     catalog: PathBuf,
     capability: PathBuf,
@@ -1135,6 +1259,7 @@ struct InstallPaths {
 impl InstallPaths {
     fn validate(request: &InstallRequest) -> Result<Self, LifecycleError> {
         validate_absolute_clean(&request.source_binary)?;
+        validate_absolute_clean(&request.source_launcher)?;
         validate_absolute_clean(&request.install_root)?;
         validate_absolute_clean(&request.codex_home)?;
         validate_absolute_clean(&request.launch_agent_path)?;
@@ -1166,6 +1291,7 @@ impl InstallPaths {
         }
         Ok(Self {
             binary: request.install_root.join("bin").join(BINARY_FILE_NAME),
+            launcher: request.install_root.join(LAUNCHER_APP_PATH),
             config: request.install_root.join("config").join("bridge.toml"),
             catalog: request.install_root.join("state").join("models.json"),
             capability: request
@@ -1180,7 +1306,9 @@ impl InstallPaths {
 
 struct StagePaths {
     binary: PathBuf,
+    launcher: PathBuf,
     config: PathBuf,
+    catalog: PathBuf,
     capability: PathBuf,
     manifest: PathBuf,
 }
@@ -1189,7 +1317,9 @@ impl StagePaths {
     fn new(root: &Path) -> Self {
         Self {
             binary: root.join("bin").join(BINARY_FILE_NAME),
+            launcher: root.join(LAUNCHER_APP_PATH),
             config: root.join("config").join("bridge.toml"),
+            catalog: root.join("state").join("models.json"),
             capability: root.join("secrets").join("caller-capability"),
             manifest: root.join(MANIFEST_FILE_NAME),
         }
@@ -1209,6 +1339,7 @@ struct InstallManifest {
     version: u32,
     install_root: PathBuf,
     binary_path: PathBuf,
+    launcher_path: PathBuf,
     config_path: PathBuf,
     catalog_cache_path: PathBuf,
     caller_token_path: PathBuf,
@@ -1567,6 +1698,7 @@ fn validate_managed_install(
     raw_manifest: &str,
 ) -> Result<ManagedInstall, LifecycleError> {
     validate_installed_binary(&manifest.binary_path)?;
+    validate_launcher_bundle(&manifest.launcher_path)?;
     validate_runtime_config(manifest)?;
     validate_catalog_path(manifest)?;
     let token_bytes = read_private_control_file(&manifest.caller_token_path)?;
@@ -1588,6 +1720,7 @@ fn validate_manifest(
     if manifest.version != MANIFEST_VERSION
         || manifest.install_root != request.install_root
         || manifest.binary_path != request.install_root.join("bin").join(BINARY_FILE_NAME)
+        || manifest.launcher_path != request.install_root.join(LAUNCHER_APP_PATH)
         || manifest.config_path != request.install_root.join("config").join("bridge.toml")
         || manifest.catalog_cache_path != request.install_root.join("state").join("models.json")
         || manifest.caller_token_path
@@ -1735,6 +1868,84 @@ fn validate_installed_binary(path: &Path) -> Result<(), LifecycleError> {
         return Err(LifecycleError::UnsafeInstalledBinary);
     }
     Ok(())
+}
+
+fn validate_launcher_bundle(path: &Path) -> Result<(), LifecycleError> {
+    let metadata = fs::symlink_metadata(path).map_err(LifecycleError::InspectLauncherBundle)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.file_type().is_dir()
+        || path.extension().and_then(|extension| extension.to_str()) != Some("app")
+    {
+        return Err(LifecycleError::UnsafeLauncherBundle);
+    }
+    validate_tree_has_no_symlinks(path)?;
+    let executable = path.join(LAUNCHER_EXECUTABLE_PATH);
+    validate_installed_binary(&executable).map_err(|error| match error {
+        LifecycleError::InspectInstalledBinary(source) => {
+            LifecycleError::InspectLauncherBundle(source)
+        }
+        LifecycleError::UnsafeInstalledBinary => LifecycleError::UnsafeLauncherBundle,
+        LifecycleError::SourceBinaryNotExecutable => LifecycleError::UnsafeLauncherBundle,
+        other => other,
+    })?;
+    let info = path.join("Contents/Info.plist");
+    let info_bytes =
+        read_regular_file(&info, MAX_CONTROL_FILE_BYTES).map_err(|error| match error {
+            LifecycleError::OpenFile(source) | LifecycleError::InspectFile(source) => {
+                LifecycleError::InspectLauncherBundle(source)
+            }
+            LifecycleError::UnsafeControlFile => LifecycleError::UnsafeLauncherBundle,
+            other => other,
+        })?;
+    let info =
+        std::str::from_utf8(&info_bytes).map_err(|_| LifecycleError::UnsafeLauncherBundle)?;
+    if !info.contains("<key>CFBundlePackageType</key>")
+        || !info.contains("<string>APPL</string>")
+        || !info.contains("<key>CFBundleExecutable</key>")
+        || !info.contains("<string>Grok Codex Switch</string>")
+    {
+        return Err(LifecycleError::UnsafeLauncherBundle);
+    }
+    let overlay = path.join(LAUNCHER_OVERLAY_PATH);
+    let overlay_bytes =
+        read_regular_file(&overlay, MAX_CONTROL_FILE_BYTES).map_err(|error| match error {
+            LifecycleError::OpenFile(source) | LifecycleError::InspectFile(source) => {
+                LifecycleError::InspectLauncherBundle(source)
+            }
+            LifecycleError::UnsafeControlFile => LifecycleError::UnsafeLauncherBundle,
+            other => other,
+        })?;
+    if overlay_bytes.is_empty() || std::str::from_utf8(&overlay_bytes).is_err() {
+        return Err(LifecycleError::UnsafeLauncherBundle);
+    }
+    Ok(())
+}
+
+fn copy_launcher_bundle(source: &Path, destination: &Path) -> Result<(), LifecycleError> {
+    validate_launcher_bundle(source)?;
+    copy_launcher_tree(source, destination)
+}
+
+fn copy_launcher_tree(source: &Path, destination: &Path) -> Result<(), LifecycleError> {
+    let source_metadata =
+        fs::symlink_metadata(source).map_err(LifecycleError::InspectLauncherBundle)?;
+    if source_metadata.file_type().is_symlink() {
+        return Err(LifecycleError::UnsafeLauncherBundle);
+    }
+    if source_metadata.is_dir() {
+        fs::create_dir(destination).map_err(LifecycleError::CreateStage)?;
+        set_mode(destination, file_mode(&source_metadata)?)?;
+        for entry in fs::read_dir(source).map_err(LifecycleError::InspectLauncherBundle)? {
+            let entry = entry.map_err(LifecycleError::InspectLauncherBundle)?;
+            copy_launcher_tree(&entry.path(), &destination.join(entry.file_name()))?;
+        }
+        return Ok(());
+    }
+    if !source_metadata.is_file() {
+        return Err(LifecycleError::UnsafeLauncherBundle);
+    }
+    fs::copy(source, destination).map_err(LifecycleError::WriteFile)?;
+    set_mode(destination, file_mode(&source_metadata)?)
 }
 
 fn generate_capability() -> String {
@@ -2035,6 +2246,12 @@ pub enum LifecycleError {
     UnsafeSourceBinary,
     #[error("the source binary must be non-empty and executable")]
     SourceBinaryNotExecutable,
+    #[error("the launcher bundle cannot be inspected")]
+    InspectLauncherBundle(#[source] std::io::Error),
+    #[error(
+        "the launcher bundle must be a regular non-symlink .app with a valid executable and Info.plist"
+    )]
+    UnsafeLauncherBundle,
     #[error("the installed binary cannot be inspected")]
     InspectInstalledBinary(#[source] std::io::Error),
     #[error("the installed binary must be a non-empty regular 0755 executable")]
@@ -2113,6 +2330,10 @@ pub enum LifecycleError {
     PickerCatalogUnavailable,
     #[error("the Codex base configuration is invalid for managed picker state")]
     InvalidPickerConfig,
+    #[error(
+        "Native compatibility requires the root model to exist in the authoritative Native catalog"
+    )]
+    NativeCompatibilityFallbackUnavailable,
     #[error("the Codex base configuration already owns conflicting picker settings")]
     PickerConfigConflict,
     #[error("picker managed state or its recorded artifacts are invalid or altered")]
@@ -2143,6 +2364,7 @@ mod tests {
         codex_home: PathBuf,
         install_root: PathBuf,
         source_binary: PathBuf,
+        source_launcher: PathBuf,
         launch_agent: PathBuf,
         credential: PathBuf,
     }
@@ -2160,6 +2382,22 @@ mod tests {
             let source_binary = temporary.path().join("source-binary");
             fs::write(&source_binary, b"fake native executable").unwrap();
             fs::set_permissions(&source_binary, fs::Permissions::from_mode(0o755)).unwrap();
+            let source_launcher = temporary.path().join("Grok Codex Switch.app");
+            let launcher_executable = source_launcher.join("Contents/MacOS/Grok Codex Switch");
+            fs::create_dir_all(launcher_executable.parent().unwrap()).unwrap();
+            fs::create_dir_all(source_launcher.join("Contents/Resources")).unwrap();
+            fs::write(
+                source_launcher.join("Contents/Info.plist"),
+                br#"<plist><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleExecutable</key><string>Grok Codex Switch</string></plist>"#,
+            )
+            .unwrap();
+            fs::write(
+                source_launcher.join("Contents/Resources/grok-codex-bridge-overlay.md"),
+                b"Grok overlay",
+            )
+            .unwrap();
+            fs::write(&launcher_executable, b"fake launcher executable").unwrap();
+            fs::set_permissions(&launcher_executable, fs::Permissions::from_mode(0o755)).unwrap();
             let credential = temporary.path().join("auth.json");
             fs::write(
                 &credential,
@@ -2174,6 +2412,7 @@ mod tests {
                 home,
                 codex_home,
                 source_binary,
+                source_launcher,
                 credential,
             }
         }
@@ -2181,6 +2420,7 @@ mod tests {
         fn install_request(&self) -> InstallRequest {
             InstallRequest {
                 source_binary: self.source_binary.clone(),
+                source_launcher: self.source_launcher.clone(),
                 install_root: self.install_root.clone(),
                 codex_home: self.codex_home.clone(),
                 launch_agent_path: self.launch_agent.clone(),
@@ -2246,6 +2486,7 @@ mod tests {
             grok_overlay_path: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Grok.md"),
             native_upstream: NativeUpstream::ChatgptCodex,
             bind: "127.0.0.1:4545".parse().unwrap(),
+            native_compatibility: false,
         })
         .unwrap();
         (receipt, native_catalog)
@@ -2264,6 +2505,46 @@ mod tests {
             b"fake native executable"
         );
         assert_eq!(mode(&receipt.binary_path), 0o755);
+        assert_eq!(
+            receipt.launcher_path,
+            fixture.install_root.join("bin/Grok Codex Switch.app")
+        );
+        assert_eq!(
+            fs::read(
+                fixture
+                    .install_root
+                    .join("bin/Grok Codex Switch.app/Contents/MacOS/Grok Codex Switch")
+            )
+            .unwrap(),
+            b"fake launcher executable"
+        );
+        assert_eq!(
+            mode(
+                &fixture
+                    .install_root
+                    .join("bin/Grok Codex Switch.app/Contents/MacOS/Grok Codex Switch")
+            ),
+            0o755
+        );
+        assert_eq!(
+            fs::read(
+                fixture.install_root.join(
+                    "bin/Grok Codex Switch.app/Contents/Resources/grok-codex-bridge-overlay.md"
+                )
+            )
+            .unwrap(),
+            b"Grok overlay"
+        );
+        let (installed_manifest, _) = manifest(&fixture);
+        assert_eq!(installed_manifest.launcher_path, receipt.launcher_path);
+        assert_eq!(
+            CatalogCache::new(fixture.install_root.join("state/models.json"))
+                .load()
+                .unwrap()
+                .unwrap()
+                .model_ids(),
+            ["grok-4.6", "grok-4.5"]
+        );
         assert_eq!(mode(&receipt.config_path), 0o600);
         assert_eq!(mode(&receipt.profile_path), 0o600);
         assert_eq!(mode(&receipt.manifest_path), 0o600);
@@ -2377,6 +2658,7 @@ mod tests {
             grok_overlay_path: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Grok.md"),
             native_upstream: NativeUpstream::ChatgptCodex,
             bind: "127.0.0.1:4545".parse().unwrap(),
+            native_compatibility: false,
         })
         .unwrap();
         let generated: serde_json::Value =
@@ -2437,6 +2719,62 @@ mod tests {
     }
 
     #[test]
+    fn native_compatibility_uses_existing_root_model_without_changing_config() {
+        let fixture = Fixture::new();
+        let original =
+            b"# keep this comment\nmodel = \"gpt-native\"\n\n[features]\nfuture = true\n";
+        let (_grok_receipt, native_catalog) = install_test_picker(&fixture, original);
+        let config = fixture.codex_home.join("config.toml");
+        let before: toml::Value = toml::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+        let receipt = install_picker(&PickerInstallRequest {
+            install_root: fixture.install_root.clone(),
+            codex_home: fixture.codex_home.clone(),
+            native_catalog_path: native_catalog,
+            grok_overlay_path: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Grok.md"),
+            native_upstream: NativeUpstream::ChatgptCodex,
+            bind: "127.0.0.1:4545".parse().unwrap(),
+            native_compatibility: true,
+        })
+        .unwrap();
+        let route =
+            NativeRouteState::from_json(&fs::read(receipt.native_route_path).unwrap()).unwrap();
+        assert_eq!(route.native_compatibility_fallback(), Some("gpt-native"));
+        assert_eq!(receipt.grok_model_count, 1);
+        let catalog: serde_json::Value =
+            serde_json::from_slice(&fs::read(receipt.generated_catalog_path).unwrap()).unwrap();
+        assert_eq!(catalog["models"].as_array().unwrap().len(), 2);
+        assert_eq!(catalog["models"][0]["slug"], "gpt-native");
+        assert_eq!(catalog["models"][1]["slug"], "grok-4.6");
+        assert_eq!(catalog["models"][1]["visibility"], "hide");
+        assert_eq!(
+            catalog["models"][1]["base_instructions"],
+            catalog["models"][0]["base_instructions"]
+        );
+        let after: toml::Value = toml::from_str(&fs::read_to_string(config).unwrap()).unwrap();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn native_compatibility_rejects_root_model_missing_from_native_catalog() {
+        let fixture = Fixture::new();
+        let original = b"model = \"gpt-missing\"\n";
+        let (_grok_receipt, native_catalog) = install_test_picker(&fixture, original);
+        let result = install_picker(&PickerInstallRequest {
+            install_root: fixture.install_root.clone(),
+            codex_home: fixture.codex_home.clone(),
+            native_catalog_path: native_catalog,
+            grok_overlay_path: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Grok.md"),
+            native_upstream: NativeUpstream::ChatgptCodex,
+            bind: "127.0.0.1:4545".parse().unwrap(),
+            native_compatibility: true,
+        });
+        assert!(matches!(
+            result,
+            Err(LifecycleError::NativeCompatibilityFallbackUnavailable)
+        ));
+    }
+
+    #[test]
     fn picker_update_and_uninstall_recover_desktop_rewrite_and_native_catalog_refresh() {
         let fixture = Fixture::new();
         let original = b"model = \"gpt-native\"\n\n[features]\nfuture = true\n";
@@ -2466,6 +2804,7 @@ mod tests {
             grok_overlay_path: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Grok.md"),
             native_upstream: NativeUpstream::ChatgptCodex,
             bind: "127.0.0.1:4545".parse().unwrap(),
+            native_compatibility: false,
         })
         .unwrap();
         assert_eq!(updated.config_path, receipt.config_path);
@@ -2570,6 +2909,77 @@ mod tests {
     }
 
     #[test]
+    fn full_uninstall_preflight_rejects_picker_tampering_without_mutation() {
+        let fixture = Fixture::new();
+        let (receipt, _native_catalog) = install_test_picker(&fixture, b"model = \"gpt-native\"\n");
+        let config = fixture.codex_home.join("config.toml");
+        let mut tampered: toml::Value =
+            toml::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+        tampered["model_providers"][PICKER_PROVIDER_ID]["base_url"] =
+            toml::Value::String("http://127.0.0.1:9999/v1".to_owned());
+        let tampered = toml::to_string(&tampered).unwrap();
+        fs::write(&config, &tampered).unwrap();
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(matches!(
+            preflight_uninstall(&fixture.uninstall_request()),
+            Err(LifecycleError::InvalidPickerState)
+        ));
+        assert_eq!(fs::read_to_string(&config).unwrap(), tampered);
+        assert!(fixture.install_root.exists());
+        assert!(receipt.generated_catalog_path.exists());
+        assert!(receipt.native_route_path.exists());
+        assert!(receipt.managed_state_path.exists());
+    }
+
+    #[test]
+    fn full_uninstall_restores_native_codex_and_supports_clean_picker_reinstall() {
+        let fixture = Fixture::new();
+        let original = b"# native Codex\nmodel = \"gpt-native\"\n\n[features]\nfuture = true\n";
+        let (_first_picker, native_catalog) = install_test_picker(&fixture, original);
+
+        preflight_uninstall(&fixture.uninstall_request()).unwrap();
+        uninstall(&fixture.uninstall_request()).unwrap();
+
+        let config = fixture.codex_home.join("config.toml");
+        assert_eq!(fs::read(&config).unwrap(), original);
+        assert!(!fixture.install_root.exists());
+        assert!(!fixture.codex_home.join(PROFILE_FILE_NAME).exists());
+        assert!(!fixture.launch_agent.exists());
+
+        install(&fixture.install_request()).unwrap();
+        let catalog = CatalogSnapshot::new(["grok-4.6"], Some("\"v2\"".to_owned())).unwrap();
+        CatalogCache::new(fixture.install_root.join("state/models.json"))
+            .persist(&catalog)
+            .unwrap();
+        let second_picker = install_picker(&PickerInstallRequest {
+            install_root: fixture.install_root.clone(),
+            codex_home: fixture.codex_home.clone(),
+            native_catalog_path: native_catalog,
+            grok_overlay_path: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Grok.md"),
+            native_upstream: NativeUpstream::ChatgptCodex,
+            bind: "127.0.0.1:4545".parse().unwrap(),
+            native_compatibility: false,
+        })
+        .unwrap();
+
+        let reinstalled =
+            toml::from_str::<toml::Value>(&fs::read_to_string(&second_picker.config_path).unwrap())
+                .unwrap();
+        assert_eq!(
+            reinstalled["model_provider"].as_str(),
+            Some(PICKER_PROVIDER_ID)
+        );
+        assert_eq!(
+            reinstalled["model_catalog_json"].as_str(),
+            second_picker.generated_catalog_path.to_str()
+        );
+        assert!(second_picker.generated_catalog_path.exists());
+        assert!(second_picker.native_route_path.exists());
+        assert!(second_picker.managed_state_path.exists());
+    }
+
+    #[test]
     fn picker_uninstall_recovers_the_concrete_pre_header_v1_1_provider_block() {
         let fixture = Fixture::new();
         let (receipt, _native_catalog) = install_test_picker(&fixture, b"model = \"gpt-native\"\n");
@@ -2635,6 +3045,7 @@ mod tests {
                 grok_overlay_path: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Grok.md"),
                 native_upstream: NativeUpstream::ChatgptCodex,
                 bind: "127.0.0.1:4545".parse().unwrap(),
+                native_compatibility: false,
             });
             assert!(matches!(result, Err(LifecycleError::PickerConfigConflict)));
             assert_eq!(fs::read_to_string(&config).unwrap(), conflict);

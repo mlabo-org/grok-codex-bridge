@@ -171,12 +171,7 @@ pub fn service_install(spec: &LaunchAgentSpec, plist_path: &Path) -> Result<(), 
 pub fn service_uninstall(spec: &LaunchAgentSpec) -> Result<ServiceUninstallOutcome, LaunchdError> {
     let uid = effective_user_id()?;
     let mut runner = SystemLaunchctlRunner;
-    service_uninstall_and_wait_with_runner(
-        spec,
-        uid,
-        &mut runner,
-        SERVICE_STATE_POLL_INTERVAL,
-    )
+    service_uninstall_and_wait_with_runner(spec, uid, &mut runner, SERVICE_STATE_POLL_INTERVAL)
 }
 
 pub fn service_status(spec: &LaunchAgentSpec) -> Result<ServiceStatus, LaunchdError> {
@@ -855,12 +850,8 @@ mod tests {
             RECOMMENDED_LAUNCH_AGENT_LABEL
         );
 
-        let mut install_runner = FakeRunner::new([
-            success(),
-            success(),
-            failure(113, &exact),
-            success(),
-        ]);
+        let mut install_runner =
+            FakeRunner::new([success(), success(), failure(113, &exact), success()]);
         service_install_and_wait_with_runner(
             &spec,
             &plist_path,

@@ -960,7 +960,6 @@ fn parse_prior_reasoning_parts(
         .collect()
 }
 
-
 fn canonicalize_integer_valued_numbers(value: &mut Value) {
     match value {
         Value::Number(number) => {
@@ -1092,8 +1091,9 @@ impl FunctionCall {
         };
         let native_name = required_nonempty_string(object, "name")?;
         let name = match optional_nonempty_string(object, "namespace")? {
-            Some(namespace) => namespace_projection
-                .ensure_provider_name(&namespace, &native_name)?,
+            Some(namespace) => {
+                namespace_projection.ensure_provider_name(&namespace, &native_name)?
+            }
             None => native_name,
         };
         Ok(Self {
@@ -1430,7 +1430,10 @@ fn parse_input(
             continue;
         };
         let raw_type = raw_object.get("type").and_then(Value::as_str);
-        if matches!(raw_type, Some("function_call_output" | "tool_search_output")) {
+        if matches!(
+            raw_type,
+            Some("function_call_output" | "tool_search_output")
+        ) {
             let call_id = raw_object.get("call_id").and_then(Value::as_str);
             if call_id.is_none_or(str::is_empty) || !calls.contains(call_id.unwrap()) {
                 continue;
@@ -1517,11 +1520,7 @@ impl NamespaceToolProjection {
         {
             return Err(ProtocolError::DuplicateToolName);
         }
-        self.insert(
-            provider_name.clone(),
-            namespace.to_owned(),
-            name.to_owned(),
-        )?;
+        self.insert(provider_name.clone(), namespace.to_owned(), name.to_owned())?;
         Ok(provider_name)
     }
 
@@ -1797,10 +1796,10 @@ fn merge_discovered_tool(
         .provider_to_native
         .get(&candidate.name);
     let existing_native = projection.provider_to_native.get(&candidate.name);
-    let candidate_is_tool_search = discovered_projection.tool_search_provider_name.as_deref()
-        == Some(candidate.name.as_str());
-    let existing_is_tool_search = projection.tool_search_provider_name.as_deref()
-        == Some(candidate.name.as_str());
+    let candidate_is_tool_search =
+        discovered_projection.tool_search_provider_name.as_deref() == Some(candidate.name.as_str());
+    let existing_is_tool_search =
+        projection.tool_search_provider_name.as_deref() == Some(candidate.name.as_str());
 
     if let Some(current) = existing.iter().find_map(|tool| match tool {
         ProjectedTool::Function(tool) if tool.name == candidate.name => Some(tool),
@@ -2850,13 +2849,30 @@ impl TextStreamValidator {
         let response = object.get("response").and_then(Value::as_object);
         let item = object.get("item").and_then(Value::as_object);
         let string = |source: Option<&Map<String, Value>>, key: &str| {
-            source.and_then(|map| map.get(key)).and_then(Value::as_str).unwrap_or("").to_owned()
+            source
+                .and_then(|map| map.get(key))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned()
         };
         let id = string(item, "id");
-        let item_id = if id.is_empty() { string(Some(object), "item_id") } else { id };
-        let output_index = object.get("output_index").and_then(Value::as_u64).unwrap_or(0);
-        let content_index = object.get("content_index").and_then(Value::as_u64).unwrap_or(0);
-        let summary_index = object.get("summary_index").and_then(Value::as_u64).unwrap_or(0);
+        let item_id = if id.is_empty() {
+            string(Some(object), "item_id")
+        } else {
+            id
+        };
+        let output_index = object
+            .get("output_index")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let content_index = object
+            .get("content_index")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let summary_index = object
+            .get("summary_index")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
         let delta = string(Some(object), "delta");
         let text = string(Some(object), "text");
         let response_id = string(response, "id");
@@ -2866,27 +2882,121 @@ impl TextStreamValidator {
         let kind = match event_type {
             "response.created" => TextStreamEventKind::ResponseCreated { response_id },
             "response.in_progress" => TextStreamEventKind::ResponseInProgress { response_id },
-            "response.output_item.added" => TextStreamEventKind::OutputItemAdded { item_id, output_index },
-            "response.content_part.added" => TextStreamEventKind::ContentPartAdded { item_id, output_index, content_index, text },
-            "response.output_text.delta" => TextStreamEventKind::OutputTextDelta { item_id, output_index, content_index, delta },
-            "response.output_text.done" => TextStreamEventKind::OutputTextDone { item_id, output_index, content_index, text },
-            "response.content_part.done" => TextStreamEventKind::ContentPartDone { item_id, output_index, content_index, text },
-            "response.output_item.done" => TextStreamEventKind::OutputItemDone { item_id, output_index, text },
-            "response.function_call_arguments.delta" => TextStreamEventKind::FunctionCallArgumentsDelta { item_id, output_index, delta },
-            "response.function_call_arguments.done" => TextStreamEventKind::FunctionCallArgumentsDone { item_id, output_index, arguments: string(Some(object), "arguments") },
-            "response.reasoning_summary_part.added" => TextStreamEventKind::ReasoningSummaryPartAdded { item_id, output_index, summary_index, text },
-            "response.reasoning_summary_text.delta" => TextStreamEventKind::ReasoningSummaryTextDelta { item_id, output_index, summary_index, delta },
-            "response.reasoning_summary_text.done" => TextStreamEventKind::ReasoningSummaryTextDone { item_id, output_index, summary_index, text },
-            "response.reasoning_summary_part.done" => TextStreamEventKind::ReasoningSummaryPartDone { item_id, output_index, summary_index, text },
-            "response.reasoning_text.delta" => TextStreamEventKind::ReasoningTextDelta { item_id, output_index, content_index, delta },
-            "response.reasoning_text.done" => TextStreamEventKind::ReasoningTextDone { item_id, output_index, content_index, text },
-            "response.function_call.added" => TextStreamEventKind::FunctionCallAdded { item_id, output_index, call_id: string(item, "call_id"), name: string(item, "name") },
-            "response.reasoning.added" => TextStreamEventKind::ReasoningItemAdded { item_id, output_index },
-            "response.reasoning.done" => TextStreamEventKind::ReasoningItemDone { item_id, output_index, encrypted_content: item.and_then(|i| i.get("encrypted_content")).and_then(Value::as_str).map(str::to_owned) },
+            "response.output_item.added" => TextStreamEventKind::OutputItemAdded {
+                item_id,
+                output_index,
+            },
+            "response.content_part.added" => TextStreamEventKind::ContentPartAdded {
+                item_id,
+                output_index,
+                content_index,
+                text,
+            },
+            "response.output_text.delta" => TextStreamEventKind::OutputTextDelta {
+                item_id,
+                output_index,
+                content_index,
+                delta,
+            },
+            "response.output_text.done" => TextStreamEventKind::OutputTextDone {
+                item_id,
+                output_index,
+                content_index,
+                text,
+            },
+            "response.content_part.done" => TextStreamEventKind::ContentPartDone {
+                item_id,
+                output_index,
+                content_index,
+                text,
+            },
+            "response.output_item.done" => TextStreamEventKind::OutputItemDone {
+                item_id,
+                output_index,
+                text,
+            },
+            "response.function_call_arguments.delta" => {
+                TextStreamEventKind::FunctionCallArgumentsDelta {
+                    item_id,
+                    output_index,
+                    delta,
+                }
+            }
+            "response.function_call_arguments.done" => {
+                TextStreamEventKind::FunctionCallArgumentsDone {
+                    item_id,
+                    output_index,
+                    arguments: string(Some(object), "arguments"),
+                }
+            }
+            "response.reasoning_summary_part.added" => {
+                TextStreamEventKind::ReasoningSummaryPartAdded {
+                    item_id,
+                    output_index,
+                    summary_index,
+                    text,
+                }
+            }
+            "response.reasoning_summary_text.delta" => {
+                TextStreamEventKind::ReasoningSummaryTextDelta {
+                    item_id,
+                    output_index,
+                    summary_index,
+                    delta,
+                }
+            }
+            "response.reasoning_summary_text.done" => {
+                TextStreamEventKind::ReasoningSummaryTextDone {
+                    item_id,
+                    output_index,
+                    summary_index,
+                    text,
+                }
+            }
+            "response.reasoning_summary_part.done" => {
+                TextStreamEventKind::ReasoningSummaryPartDone {
+                    item_id,
+                    output_index,
+                    summary_index,
+                    text,
+                }
+            }
+            "response.reasoning_text.delta" => TextStreamEventKind::ReasoningTextDelta {
+                item_id,
+                output_index,
+                content_index,
+                delta,
+            },
+            "response.reasoning_text.done" => TextStreamEventKind::ReasoningTextDone {
+                item_id,
+                output_index,
+                content_index,
+                text,
+            },
+            "response.function_call.added" => TextStreamEventKind::FunctionCallAdded {
+                item_id,
+                output_index,
+                call_id: string(item, "call_id"),
+                name: string(item, "name"),
+            },
+            "response.reasoning.added" => TextStreamEventKind::ReasoningItemAdded {
+                item_id,
+                output_index,
+            },
+            "response.reasoning.done" => TextStreamEventKind::ReasoningItemDone {
+                item_id,
+                output_index,
+                encrypted_content: item
+                    .and_then(|i| i.get("encrypted_content"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            },
             "response.completed" => TextStreamEventKind::ResponseCompleted { response_id },
             "response.failed" => TextStreamEventKind::ResponseFailed { response_id },
             "response.incomplete" => TextStreamEventKind::ResponseIncomplete { response_id },
-            other => TextStreamEventKind::Passthrough { event_type: other.to_owned() },
+            other => TextStreamEventKind::Passthrough {
+                event_type: other.to_owned(),
+            },
         };
         self.state = match &kind {
             TextStreamEventKind::ResponseCompleted { .. } => TextStreamState::Completed,
@@ -2894,9 +3004,12 @@ impl TextStreamValidator {
             TextStreamEventKind::ResponseIncomplete { .. } => TextStreamState::Incomplete,
             _ => TextStreamState::Streaming,
         };
-        Ok(ValidatedTextStreamEvent { sequence_number, kind, original: value })
+        Ok(ValidatedTextStreamEvent {
+            sequence_number,
+            kind,
+            original: value,
+        })
     }
-
 }
 
 #[cfg(test)]
@@ -3371,7 +3484,9 @@ mod tests {
         });
         NamespaceToolProjection::default().restore_response_event(&mut event);
         let parsed: Value = serde_json::from_str(
-            event["item"]["arguments"].as_str().expect("function arguments"),
+            event["item"]["arguments"]
+                .as_str()
+                .expect("function arguments"),
         )
         .unwrap();
         assert_eq!(parsed["session_id"].as_i64(), Some(42337));
@@ -3844,7 +3959,6 @@ mod tests {
             NormalizedResponsesRequest::parse(oversized).unwrap_err(),
             ProtocolError::InvalidRequestField("encrypted_content")
         );
-
     }
 
     #[test]
@@ -4003,7 +4117,11 @@ mod tests {
         let projected = normalized.to_xai_value();
         let input = projected["input"].as_array().unwrap();
         assert!(input.iter().any(|item| item["type"] == "message"));
-        assert!(input.iter().all(|item| item.get("call_id") != Some(&json!(""))));
+        assert!(
+            input
+                .iter()
+                .all(|item| item.get("call_id") != Some(&json!("")))
+        );
     }
 
     #[test]
@@ -4505,9 +4623,13 @@ mod tests {
         let mut unmatched = function_request_fixture();
         unmatched["input"][3]["call_id"] = json!("call_missing");
         let unmatched = NormalizedResponsesRequest::parse(unmatched).unwrap();
-        assert!(unmatched.to_xai_value()["input"]
-            .as_array().unwrap()
-            .iter().all(|item| item.get("call_id") != Some(&json!("call_missing"))));
+        assert!(
+            unmatched.to_xai_value()["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item.get("call_id") != Some(&json!("call_missing")))
+        );
 
         let mut duplicate_output = function_request_fixture();
         duplicate_output["input"][4]["call_id"] = json!("call_read_1");
@@ -4715,16 +4837,26 @@ mod tests {
     #[test]
     fn unknown_sse_event_is_passthrough_and_does_not_terminate() {
         let mut validator = TextStreamValidator::new();
-        let event = validator.accept_value(json!({
-            "type":"response.xai_auxiliary", "payload":{"opaque":true}
-        })).unwrap();
-        assert_eq!(event.kind(), &TextStreamEventKind::Passthrough {
-            event_type: "response.xai_auxiliary".into()
-        });
-        let text = validator.accept_value(json!({
-            "type":"response.output_text.delta", "item_id":"m1", "delta":"ok"
-        })).unwrap();
-        assert!(matches!(text.kind(), TextStreamEventKind::OutputTextDelta { .. }));
+        let event = validator
+            .accept_value(json!({
+                "type":"response.xai_auxiliary", "payload":{"opaque":true}
+            }))
+            .unwrap();
+        assert_eq!(
+            event.kind(),
+            &TextStreamEventKind::Passthrough {
+                event_type: "response.xai_auxiliary".into()
+            }
+        );
+        let text = validator
+            .accept_value(json!({
+                "type":"response.output_text.delta", "item_id":"m1", "delta":"ok"
+            }))
+            .unwrap();
+        assert!(matches!(
+            text.kind(),
+            TextStreamEventKind::OutputTextDelta { .. }
+        ));
         assert!(validator.finish().is_ok());
     }
 
@@ -4732,23 +4864,51 @@ mod tests {
     fn permissive_sse_projects_text_function_reasoning_and_terminal_events() {
         let mut validator = TextStreamValidator::new();
         let cases = [
-            ("response.output_text.delta", TextStreamEventKind::OutputTextDelta {
-                item_id: "m1".into(), output_index: 0, content_index: 0, delta: "hi".into()
-            }),
-            ("response.function_call_arguments.delta", TextStreamEventKind::FunctionCallArgumentsDelta {
-                item_id: "f1".into(), output_index: 1, delta: "{}".into()
-            }),
-            ("response.reasoning_text.delta", TextStreamEventKind::ReasoningTextDelta {
-                item_id: "r1".into(), output_index: 2, content_index: 0, delta: "why".into()
-            }),
-            ("response.completed", TextStreamEventKind::ResponseCompleted { response_id: "resp".into() }),
+            (
+                "response.output_text.delta",
+                TextStreamEventKind::OutputTextDelta {
+                    item_id: "m1".into(),
+                    output_index: 0,
+                    content_index: 0,
+                    delta: "hi".into(),
+                },
+            ),
+            (
+                "response.function_call_arguments.delta",
+                TextStreamEventKind::FunctionCallArgumentsDelta {
+                    item_id: "f1".into(),
+                    output_index: 1,
+                    delta: "{}".into(),
+                },
+            ),
+            (
+                "response.reasoning_text.delta",
+                TextStreamEventKind::ReasoningTextDelta {
+                    item_id: "r1".into(),
+                    output_index: 2,
+                    content_index: 0,
+                    delta: "why".into(),
+                },
+            ),
+            (
+                "response.completed",
+                TextStreamEventKind::ResponseCompleted {
+                    response_id: "resp".into(),
+                },
+            ),
         ];
         for (event_type, expected) in cases {
             let value = match event_type {
                 "response.completed" => json!({"type":event_type,"response":{"id":"resp"}}),
-                "response.function_call_arguments.delta" => json!({"type":event_type,"item_id":"f1","output_index":1,"delta":"{}"}),
-                "response.reasoning_text.delta" => json!({"type":event_type,"item_id":"r1","output_index":2,"content_index":0,"delta":"why"}),
-                _ => json!({"type":event_type,"item_id":"m1","output_index":0,"content_index":0,"delta":"hi"}),
+                "response.function_call_arguments.delta" => {
+                    json!({"type":event_type,"item_id":"f1","output_index":1,"delta":"{}"})
+                }
+                "response.reasoning_text.delta" => {
+                    json!({"type":event_type,"item_id":"r1","output_index":2,"content_index":0,"delta":"why"})
+                }
+                _ => {
+                    json!({"type":event_type,"item_id":"m1","output_index":0,"content_index":0,"delta":"hi"})
+                }
             };
             let actual = validator.accept_value(value).unwrap();
             assert_eq!(actual.kind(), &expected);
@@ -4828,5 +4988,4 @@ mod tests {
         let mut validator = TextStreamValidator::new();
         assert!(validator.synthetic_completed_on_eof().is_none());
     }
-
 }
