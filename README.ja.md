@@ -8,50 +8,66 @@
 
 Codexプラグイン、汎用LLMルーター、エージェントハーネスではありません。
 
-## Codexにインストールを任せる
+## ワンコマンド環境切り替え
 
-このリポジトリには、coding agentが守る安全境界とライフサイクル契約を [AGENTS.md](AGENTS.md) に収録しています。Codex自身にソースを確認させ、ネイティブ実行ファイルをbuildし、現行のV1.1 Native GPT/Grok統合経路を有効化させる場合は、リポジトリをcloneしてrootからCodexを起動します。
+このリポジトリには、coding agentが守る安全境界とライフサイクル契約を [AGENTS.md](AGENTS.md) に収録しています。リポジトリを一度cloneし、rootからrepo所有の移行コマンドを実行します。
 
 ```sh
 git clone https://github.com/mlabo-org/grok-codex-bridge.git
 cd grok-codex-bridge
-codex
+./scripts/materialize-macos.sh
 ```
 
-起動したCodexへ、目的に応じて次のどちらかを依頼してください。通常はV1.1を使用し、V1.0分離プロファイルは実験的な代替経路として残しています。
+Native GPT/Grok統合モデルピッカーを有効にします。
 
-### V1.1統合ピッカーまで自動でinstallする
+```sh
+./scripts/grok-codex.sh grok
+```
 
-native build、service install、Native GPT/Grok統合ピッカー有効化までを、Codexへ一仕事で任せる場合はこちらを使用します。
+保存済みタスクを維持したままNative互換モードへ切り替えます。
+
+```sh
+./scripts/grok-codex.sh native
+```
+
+`grok` はGrok slugをxAIへ、Native GPT slugをOpenAIへ送ります。Grok modeでは両方のmodel familyをpickerに表示します。Native modeでは新規選択用にNative GPTだけを表示しますが、既存taskを開いて継続するためのGrok provider metadataは保持し、保存済みGrok slugを実行時コピー上だけ現在のNative GPTモデルへ変換します。タスクに保存されたprovider/modelはどちらの方向でも書き換えません。
+
+どちらのコマンドも、ローカルでbuildしたnative LaunchServices launcherからRust coordinatorへ切替を引き渡します。引き渡し後はTerminal.appへ依存しません。coordinatorはChatGPT.appへ正常終了を要求し、本体とapp-serverの停止を確認してからserviceと設定を切り替え、成功後だけChatGPT.appを再起動します。
+
+### ソースリポジトリと導入済みruntime
+
+このリポジトリには、2つのネイティブ構成要素、すなわちRust bridgeとSwift製 `Grok Codex Switch.app` launcherの公開sourceを収録しています。materialize処理はApple Silicon向けに両方をbuildします。install時には、実行ファイル、launcher bundle、設定、catalog state、overlay/resource、lifecycle dataを次へコピーします。
 
 ```text
-AGENTS.mdを最後まで読み、その契約に従ってください。このMacでnative
-grok-codex-bridgeをbuild・installし、同じjobの中でV1.1 Native GPT/Grok統合pickerの
-有効化まで続けてください。picker有効化前に、現在のauthoritative Native
-Codex catalogと、実際に有効なfirst-party Responses upstreamを、credentialの読み取り・
-copy・表示を行わずに特定してください。./scripts/materialize-macos.shとrepo所有のnative
-lifecycle commandだけを使用し、既存差分と完全なrollback境界を保持してください。
-install済みservice、Native/Grok統合catalog、Grokの272,000-token context metadataを、
-最小のprimary-path checkで確認してください。Native Codex入力を推測すること、Codex
-本体binaryへのpatch、Codex設定・Grok認証・LaunchAgent fileの直接編集、commit、push、
-publishは禁止します。authoritative inputを確認できない場合はpicker有効化前に停止し、
-不足内容を説明してください。成功時は必要なCLI/Desktopの完全再起動と、pickerの正確な
-rollback commandを報告してください。
+~/Library/Application Support/grok-codex-bridge/
+├── bin/grok-codex-bridge
+├── bin/Grok Codex Switch.app/
+│   └── Contents/Resources/grok-codex-bridge-overlay.md
+├── config/bridge.toml
+├── state/                 # catalogとpicker管理state
+└── logs/
 ```
 
-### 実験的V1.0分離プロファイルまでinstallする
+install後、切替coordinatorが読むのはこの導入済みtreeと、明示的に渡されたCodex/ChatGPTのlive stateだけです。通常の切替中にcompileしたり、Cargoの `target/`、`dist/`、checkout内の `Grok.md`、replacement scriptを探したりしません。したがって導入済みruntimeは、checkoutを移動または削除しても無効になりません。repo所有の `scripts/grok-codex.sh` はbuild/install/updateの入口であり、導入済みbridgeのruntime依存ではありません。
 
-```text
-AGENTS.mdを最後まで読み、その契約に従ってください。このMacへV1.0の分離型
-grok-bridgeプロファイルをbuild・installしてください。platformと前提条件を確認し、
-既存差分を保持し、./scripts/materialize-macos.shとrepo所有のlifecycle commandだけを
-使用して、最小のprimary-path checkを実行してください。V1.1統合pickerの有効化、
-Codex本体binary・Codex設定・Grok認証・LaunchAgent fileの直接編集、commit、push、
-publishは行わないでください。Apple Silicon搭載macOSでない場合、または必要な
-authoritative inputを確認できない場合は停止して不足境界を説明してください。
+repoの入口は、ローカルでmaterializeしたruntimeをinstallまたはupdateしてからmodeを切り替えます。
+
+```sh
+./scripts/grok-codex.sh grok    # 必要ならinstall/updateし、その後Grok modeへ切替
+./scripts/grok-codex.sh native  # 必要ならinstall/updateし、その後Native modeへ切替
 ```
 
-初回installはCodexから実行できます。すでに稼働中のブリッジを、Grokを使っているCodexセッションから停止・差し替えしないでください。詳細は [既存インストールの更新](#既存インストールの更新) を参照してください。
+install後の通常切り替えはrepo非依存で、導入済みnative executableを直接実行します。
+
+```sh
+BRIDGE="$HOME/Library/Application Support/grok-codex-bridge/bin/grok-codex-bridge"
+"$BRIDGE" mode grok
+"$BRIDGE" mode native
+```
+
+コマンドは、切替完了まで通常およそ15〜20秒かかることを表示します。この時間は、ChatGPT.app/app-serverの正常終了、service/config適用、picker公開、再起動に使われます。この間はChatGPT.appを強制終了しないでください。切替成功は自動再起動が完了した後に確認されます。
+
+2つのnative componentには別々の責務があります。Rust executableはprovider、picker、service、切替stateを所有し、Swift launcherは親のChatGPT.app終了後も残り、LaunchServices経由でcoordinatorを起動します。どちらもinterpreterでもbuild-on-first-use wrapperでもありません。
 
 ## 謝辞
 
@@ -61,7 +77,7 @@ authoritative inputを確認できない場合は停止して不足境界を説�
 
 ## Rustを採用した理由
 
-通常運用を、Python、Node.js、JITランタイムに依存しない単一のビルド済みネイティブ実行ファイルにするため、ブリッジ全体をRustで実装しています。Rustの強い型、明示的なエラー処理、メモリ安全な並行処理、決定的なリリース生成も、プロトコル境界とライフサイクル境界に適しています。
+通常運用を、Python、Node.js、JITランタイムに依存しないローカルbuild済みRust executableとnative Swift launcherにするため、ブリッジ中核をRustで実装しています。Rustの強い型、明示的なエラー処理、メモリ安全な並行処理、決定的なリリース生成も、プロトコル境界とライフサイクル境界に適しています。
 
 通常利用時にオンデマンドコンパイルは行いません。Cargoは開発と構築にだけ使用し、ランチャーは生成済みバイナリを直接実行します。バイナリが存在しない、またはソースより古い場合は安全側に停止します。
 
@@ -87,14 +103,13 @@ Grok / xAI
 
 | 対象 | 状態 |
 | --- | --- |
-| V1.1 Native GPT/Grok統合モデルピッカー | 現行の主要経路。source実装済みで、supportedなmessage/function/tool-search履歴をbridge境界で双方向に保持 |
-| V1.1 Skillsメタデータ予算 | Grokカタログに272,000トークンを設定し、Codex標準の2%計算を使用 |
-| V1.0 分離型 `grok-bridge` プロファイル | 実験的な分離経路。source実装済み |
+| Native GPT/Grok統合モデルピッカー | 現行の主要経路。source実装済みで、supportedなmessage/function/tool-search履歴をbridge境界で双方向に保持 |
+| Skillsメタデータ予算 | Grokカタログに272,000トークンを設定し、Codex標準の2%計算を使用 |
 | Rustネイティブビルドと可逆なユーザーサービス | Apple Silicon macOS向けに実装済み |
-| Desktopピッカーと最終rollback受け入れ | 最終検証待ち |
-| 公開リリースバイナリ | 未公開。ソースからbuild・materializeしてください |
+| ワンコマンド `grok` / `native` 移行 | 保存済みprovider/modelを維持する双方向runtime切替と、Desktop正常終了・再起動coordinatorを実装 |
+| 公開リリースバイナリ | 意図的に配布しない。各利用者が自分の環境でsourceからbuild・materializeする |
 
-V1.1は、bridgeの主要なcatalog、projection、model切替、overlay機能を統合picker上で利用する現行の主要経路です。V1.0はNative GPT設定に触れない実験的な分離プロファイルとして残しています。Desktopピッカーと最終rollbackの受け入れは完了扱いせず、明示的に未完了としています。
+統合pickerを唯一の公開運用経路とします。Native GPTは同じpickerに残り、`native` はproviderを削除せずNative互換routingへ切り替えます。
 
 ## 主な機能
 
@@ -113,48 +128,40 @@ V1.1は、bridgeの主要なcatalog、projection、model切替、overlay機能�
 
 - Apple Silicon搭載macOS。
 - ソースからビルドする場合は [rust-toolchain.toml](rust-toolchain.toml) で固定されたRust 1.95.0。
+- sourceからのローカルbuildが必須です。コンパイル済みbinaryはrepositoryにもGitHub Releasesにも配布しません。利用者自身のmacOS arm64環境でRust bridgeとSwift launcherを一度compileしてinstallし、その後は導入済み成果物を使います。
 - 公式Grok CLIと、有効なloginまたは公式browser OAuthを完了できる環境。
 - 現行のCodex CLI。
 
 Intel Mac、Linux、Windows向けのビルド済み成果物は現在提供していません。
 
-## クイックスタート：V1.1統合ピッカー
+## クイックスタート：統合ピッカー
 
-主要なV1.1経路では、Native GPTと許可済みGrokモデルを同じCodexモデルピッカーで選べる統合カタログを公開します。Native GPTの `responses` と `responses/compact` は取得済みのCodex公式上流に固定します。`images/generations`、`images/edits`、`alpha/search` はNative専用の透過endpointであり、Grok protocol変換には入れません。Grok通信だけをブリッジ経由でxAIへ送ります。Grokには権威ある `responses/compact` 契約がないため、許可済みGrokモデルではこのrouteをfail closedにします。
+主要経路では、Native GPTと許可済みGrokモデルを同じCodexモデルピッカーで選べる統合カタログを公開します。Native GPTの `responses` と `responses/compact` は取得済みのCodex公式上流に固定します。`images/generations`、`images/edits`、`alpha/search` はNative専用の透過endpointであり、Grok protocol変換には入れません。Grok通信だけをブリッジ経由でxAIへ送ります。Grokには権威ある `responses/compact` 契約がないため、許可済みGrokモデルではこのrouteをfail closedにします。
 
 NativeとGrokのmodel slugは一意でなければなりません。catalog生成時とruntime routing時のどちらでも重複slugはfail closedし、Native行の上書きやalias生成は行いません。
 
-最初にネイティブブリッジを生成してインストールします。
+2つのnative componentを一度buildしてから移行します。
 
 ```sh
 ./scripts/materialize-macos.sh
-./dist/aarch64-apple-darwin/grok-codex-bridge install
+./scripts/grok-codex.sh grok
 ```
 
-次に、有効化前に取得した現在のNative Codex公式カタログと、実際に使用されている公式Responses base URLを指定してピッカーを有効化します。以下は標準的なChatGPT認証Codex環境の例です。
-
-```sh
-CODEX_DIR="${CODEX_HOME:-"$HOME/.codex"}"
-
-./dist/aarch64-apple-darwin/grok-codex-bridge picker install \
-  --native-catalog "$CODEX_DIR/models_cache.json" \
-  --native-upstream-base-url "https://chatgpt.com/backend-api/codex" \
-  --grok-overlay "$PWD/Grok.md"
-```
-
-`--native-catalog` は実行時に既存の絶対パスへ解決される必要があります。利用中のCodex認証ルートで別の公式上流が有効な場合、例のURLをそのまま流用しないでください。
+このコマンドはChatGPT認証されたChatGPT.app同梱Codexだけを受け入れ、実効Codex homeの現在の `models_cache.json` を解決します。いずれかのauthoritative inputが得られない場合は、pickerを書き換える前に停止します。
 
 有効化後は新しいCodex CLIプロセスを起動します。Codex Desktopで試す場合は、完全終了してから再起動してください。
 
 ![Native GPTモデルと grok-4.5 / grok-4.6 が並ぶ Codex Desktop のモデルピッカー](docs/images/desktop-merged-picker.png)
 
-V1.1ピッカー有効化後のCodex Desktopです。Native GPTと許可済みGrokモデルが同じピッカーに並ぶ表示例であり、Desktopピッカーと最終rollbackの受け入れ完了を示すものではありません。
+統合picker有効化後のCodex Desktopです。Native GPTと許可済みGrokモデルが同じpickerに並びます。
 
 許可済みGrokカタログエントリ（bootstrapの `grok-4.5` / `grok-4.6` を含む）は272,000トークンのコンテキストウィンドウを公開します。これによりCodexは、不明なwindow向けの小さなfallbackではなく、Nativeモデルと同じ標準2%のSkills説明予算計算を適用します。
 
 ### Grok.md overlay
 
 [`Grok.md`](Grok.md) は Grok 専用実行 overlay の正本です。`picker install` がこのファイルをディスクから読み、生成カタログの許可済み Grok 行の `base_instructions` へそのまま入れます。Codex が消費するのは生成カタログです。Native GPT 行には届きません。本文はコンパイル成果物へ焼き込まず、HTTP 毎に再読込もしません。
+
+`Grok.md`というfilenameは、稼働中Grokへ渡すこの憲法正本だけに予約します。materialize時は内容だけを、意図的に別名とした導入済みsnapshot `Contents/Resources/grok-codex-bridge-overlay.md`へコピーし、他のresourceには`Grok.md`という名前を使いません。
 
 `--grok-overlay` を省略できるのは、カレントディレクトリに `Grok.md` があるときだけです。overlay を直したあとは `picker install` を再実行し、新しい Codex CLI プロセスを起動するか Desktop を完全再起動してください。既存の Grok セッションは、起動時のカタログのままです。
 
@@ -169,29 +176,11 @@ V1.1ピッカー有効化後のCodex Desktopです。Native GPTと許可済みGr
 - 子をGrokで動かすには、`model` を許可済みカタログID（`grok-4.6` や `grok-4.5`）へ明示する。
 - 推論深度も `reasoning_effort` を明示する。現行のGrokカタログは `low` / `medium` / `high` / `xhigh` を公開する。
 
-## 実験的V1.0分離プロファイル
-
-V1.0ランチャーはGrokをCodexの分離プロファイルに閉じ込める実験的な経路として残しています。リポジトリルートでネイティブ実行ファイルを一度生成し、リポジトリ付属ランチャーを実行します。
-
-```sh
-./scripts/materialize-macos.sh
-./scripts/grok-codex.sh
-```
-
-初回はブリッジをインストールし、必要に応じてユーザーサービスを起動して、分離された `grok-bridge` プロファイルでCodexを開きます。2回目以降は導入済みネイティブ実行ファイルを再利用します。引数はCodexへそのまま渡されます。
-
-```sh
-./scripts/grok-codex.sh --version
-./scripts/grok-codex.sh --activate-only
-```
-
-このランチャーはリポジトリ内での利用を前提とします。shell scriptだけを移動またはsymlinkして使う方法は、配布方式としてサポートしていません。
-
 ## ライフサイクルとrollback
 
 ### 既存インストールの更新
 
-このブリッジを使っているCodexセッションは、ローカルのループバックサービスに依存します。対象は分離型 `grok-bridge` プロファイルと、V1.1ピッカーでGrokモデルを選んでいる場合です。そのセッションの中からサービスを停止したり、導入済みバイナリを差し替えたりすると、モデル通信が切れます。再ロードまで完了しないと service は `not_loaded` のまま残り、サービスを起動し直すまでCodexからGrokへ届きません。
+Grokを選択したCodexセッションはローカルのループバックserviceに依存します。そのセッション内でserviceを停止またはbinaryを置換するとモデル接続が切れるため、Native GPT taskまたはTerminalから移行してください。
 
 生成と導入済みバイナリの差し替えは、このブリッジを使っていないセッションから実行してください。この手順の想定オペレーターはGrok Buildです。Native GPTモデルのCodexセッションからでも実行できます。
 
@@ -199,33 +188,27 @@ V1.0ランチャーはGrokをCodexの分離プロファイルに閉じ込める�
 
 ```sh
 ./scripts/materialize-macos.sh
-./scripts/replace-installed-bridge.sh ./dist/aarch64-apple-darwin/grok-codex-bridge
+./scripts/replace-installed-bridge.sh \
+  ./dist/aarch64-apple-darwin/grok-codex-bridge \
+  "./dist/aarch64-apple-darwin/Grok Codex Switch.app"
 ```
 
 `service status` が `service loaded` を返したら、新しいCodex CLIプロセスを起動するか、Desktopを完全再起動してクライアントをつなぎ直してください。
 
-以下のコマンドはすべて生成済み実行ファイルを直接使います。
+同じmigration entry pointが両方向の移行を所有します。
 
 ```sh
-./dist/aarch64-apple-darwin/grok-codex-bridge doctor
-./dist/aarch64-apple-darwin/grok-codex-bridge auth status
-./dist/aarch64-apple-darwin/grok-codex-bridge service status
+./scripts/grok-codex.sh grok
+./scripts/grok-codex.sh native
 ```
 
-統合ピッカー状態だけを削除し、ピッカー有効化直前のCodex設定を完全復元します。
+`native` はuninstallを実行しません。pickerにはNativeモデルだけを選択可能として表示し、保存済みタスクの解決に必要なGrok行は非表示metadataとして保持します。provider定義とloopback resolverを維持し、Grok推論clientを構築せず、Grok slugのrequestだけを現在のroot Nativeモデルへ実行時変換します。元のrequest、保存済みタスク、SQLite、rolloutは変更しません。
 
-```sh
-./dist/aarch64-apple-darwin/grok-codex-bridge picker uninstall
-```
+完全uninstallは日常の環境切替ではありません。resolverを完全削除する場合、残存するpicker provider/model参照を純正Codex形式へ永久移行しなければ旧タスクが開けなくなるため、別の明示的な不可逆操作として扱います。
 
-ユーザーサービスを停止してから、ブリッジ所有のインストールを削除します。
+可逆なNative-only運用には `native` を使います。これは意図的にuninstallではありません。導入済みprovider定義、resolver、互換metadataを残すため、後から `grok` へ戻してもtask履歴を書き換えずにGrok routingを復元できます。bridgeをMacから削除するときだけ完全な `uninstall` を使います。この操作は導入済みruntimeとbridge所有のCodex設定/service stateを削除・復元しますが、過去のtask recordを変換しません。taskにbridgeのprovider/model参照が残っている状態で先にuninstallすると、そのtaskを開けなくなる可能性があります。別途計画した明示的なdata migrationが完了するまで、導入済みruntimeを残してください。
 
-```sh
-./dist/aarch64-apple-darwin/grok-codex-bridge service uninstall
-./dist/aarch64-apple-darwin/grok-codex-bridge uninstall
-```
-
-ライフサイクルmanifestが所有するのは、ブリッジが作成または置換したファイルだけです。完全uninstallでも、Codex本体設定、公式Grok認証状態、Native GPT設定は削除しません。
+source更新はmode切替とは別のlifecycle境界です。新しいnative componentのbuild/materializeとinstallは、Native GPT taskまたはTerminalから実行し、導入済みreplacement経路にserviceの停止・再起動を任せます。通常のmode切替でbinaryを再buildすることはありません。更新後はCodex Desktopを一度再起動し、新しいpicker catalogを読み込ませてください。
 
 ## モデルカタログと認証情報
 
@@ -267,7 +250,7 @@ cp ./docs/bridge-config.example.toml ./bridge-config.local.toml
 
 ## セキュリティ境界
 
-- listenerはloopbackだけにbindします。LAN公開はV1の対象外です。
+- listenerはloopbackだけにbindします。LAN公開は製品scope外です。
 - caller capabilityはローカルrouteに置き、service logには記録しません。
 - 認証情報は公式の権威あるファイルとゼロ化対応メモリキャッシュにだけ保持し、catalogやCodex stateへコピーしません。
 - Grok通信は公式xAI originに限定し、rustlsを使用してredirectを追跡しません。
@@ -316,8 +299,8 @@ Grok.md                              picker catalog生成時に読むGrok overla
 src/picker_activation.rs             pickerのatomicな公開と有効化
 src/launchd.rs                       型付きuser LaunchAgent境界
 scripts/materialize-macos.sh         決定的macOS arm64 materialization
-scripts/grok-codex.sh                V1.0分離プロファイルランチャー
-scripts/replace-installed-bridge.sh  導入済みbinaryの差し替え
+scripts/grok-codex.sh                Grok/native環境のワンコマンド移行
+scripts/replace-installed-bridge.sh  導入済みnative runtimeの差し替え
 ```
 
 ## ライセンス

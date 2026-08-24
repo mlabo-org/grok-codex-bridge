@@ -45,12 +45,42 @@ pub enum Command {
         #[command(subcommand)]
         command: PickerCommand,
     },
+    /// Switch the installed Desktop environment without using the source checkout.
+    Mode {
+        #[command(subcommand)]
+        command: ModeCommand,
+    },
+    /// Quiesce ChatGPT.app, switch picker routing, then relaunch it.
+    Switch(DesktopSwitchArgs),
     /// Stop the service and restore only manifest-owned install changes.
     Uninstall(LifecyclePathArgs),
     /// Report source/runtime capability without probing credentials or network.
     Status,
     /// Print the binary version.
     Version,
+}
+
+#[derive(Debug, Args)]
+pub struct DesktopSwitchArgs {
+    #[command(flatten)]
+    pub picker: PickerInstallArgs,
+    /// Source-owned installed-binary replacement script used only when bytes differ.
+    #[arg(long, value_name = "FILE")]
+    pub replacement_script: Option<PathBuf>,
+    /// Materialized launcher bundle paired with a replacement bridge binary.
+    #[arg(long, value_name = "APP", requires = "replacement_script")]
+    pub replacement_launcher: Option<PathBuf>,
+    /// Delay before requesting app quit so the invoking task can render its handoff.
+    #[arg(long, default_value_t = 1500, value_name = "MILLISECONDS")]
+    pub grace_period_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Subcommand)]
+pub enum ModeCommand {
+    /// Publish Native and Grok models, routing Grok selections through xAI.
+    Grok,
+    /// Hide Grok choices and keep saved Grok tasks usable through Native OpenAI.
+    Native,
 }
 
 #[derive(Debug, Subcommand)]
@@ -68,6 +98,9 @@ pub struct InstallArgs {
     /// Materialized executable to copy; defaults to this executable.
     #[arg(long, value_name = "FILE")]
     pub source_binary: Option<PathBuf>,
+    /// LaunchServices launcher app bundle to copy into the install root.
+    #[arg(long, value_name = "APP")]
+    pub source_launcher: PathBuf,
     #[command(flatten)]
     pub paths: LifecyclePathArgs,
     /// Loopback address for the bridge service.
@@ -142,6 +175,10 @@ pub struct PickerInstallArgs {
     /// Grok.md SSOT read at catalog generation. Defaults to ./Grok.md when that file exists.
     #[arg(long, value_name = "FILE")]
     pub grok_overlay: Option<PathBuf>,
+    /// Publish a Native-only compatibility route while preserving the saved
+    /// picker provider/model values in existing threads.
+    #[arg(long)]
+    pub native_compatibility: bool,
 }
 
 #[derive(Debug, Clone, Args)]

@@ -574,9 +574,13 @@ mod tests {
         ];
         let stream_body = events
             .into_iter()
-            .map(|event| format!("data: {event}
+            .map(|event| {
+                format!(
+                    "data: {event}
 
-"))
+"
+                )
+            })
             .collect::<String>();
         let stream = ResponsesByteStream {
             inner: Box::pin(futures_util::stream::iter([Ok(Bytes::from(stream_body))])),
@@ -616,9 +620,13 @@ mod tests {
         ];
         let stream_body = events
             .into_iter()
-            .map(|event| format!("data: {event}
+            .map(|event| {
+                format!(
+                    "data: {event}
 
-"))
+"
+                )
+            })
             .collect::<String>()
             + "
 

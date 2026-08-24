@@ -2,6 +2,7 @@ pub mod catalog;
 pub mod cli;
 pub mod config;
 pub mod credential;
+pub mod desktop_transition;
 pub mod grok;
 pub mod launchd;
 pub mod lifecycle;
@@ -22,7 +23,8 @@ pub use grok::{
 pub use native::{NativeRouteState, NativeUpstream};
 pub use picker::{
     ArtifactIdentity, ConfigRollbackOwnership, GeneratedPickerCatalog, PickerError,
-    PickerManagedState, generate_picker_catalog, load_grok_overlay,
+    PickerManagedState, generate_native_compatibility_catalog, generate_picker_catalog,
+    load_grok_overlay,
 };
 pub use protocol::{
     NormalizedResponsesRequest, ProtocolError, TextStreamEventKind, TextStreamState,

@@ -56,6 +56,21 @@ pub struct NativeRouteState {
     version: u32,
     upstream: NativeUpstream,
     native_models: Vec<String>,
+    #[serde(default)]
+    mode: NativeRouteMode,
+}
+
+/// Determines whether the bridge may route admitted Grok slugs to Native
+/// during a compatibility-only runtime. The default preserves the original
+/// picker behavior for route-state files written before this field existed.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NativeRouteMode {
+    #[default]
+    GrokEnabled,
+    NativeCompatibility {
+        fallback_model: String,
+    },
 }
 
 impl NativeRouteState {
@@ -69,6 +84,24 @@ impl NativeRouteState {
             version: ROUTE_STATE_VERSION,
             upstream,
             native_models,
+            mode: NativeRouteMode::GrokEnabled,
+        };
+        state.validate()?;
+        Ok(state)
+    }
+
+    pub fn new_native_compatibility(
+        upstream: NativeUpstream,
+        native_models: impl IntoIterator<Item = String>,
+        fallback_model: String,
+    ) -> Result<Self, NativeError> {
+        let mut native_models = native_models.into_iter().collect::<Vec<_>>();
+        native_models.sort_unstable();
+        let state = Self {
+            version: ROUTE_STATE_VERSION,
+            upstream,
+            native_models,
+            mode: NativeRouteMode::NativeCompatibility { fallback_model },
         };
         state.validate()?;
         Ok(state)
@@ -114,6 +147,14 @@ impl NativeRouteState {
         self.upstream
     }
 
+    #[must_use]
+    pub fn native_compatibility_fallback(&self) -> Option<&str> {
+        match &self.mode {
+            NativeRouteMode::GrokEnabled => None,
+            NativeRouteMode::NativeCompatibility { fallback_model } => Some(fallback_model),
+        }
+    }
+
     fn validate(&self) -> Result<(), NativeError> {
         if self.version != ROUTE_STATE_VERSION || self.native_models.is_empty() {
             return Err(NativeError::InvalidState);
@@ -132,6 +173,11 @@ impl NativeRouteState {
         }
         if self.native_models.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err(NativeError::InvalidState);
+        }
+        if let NativeRouteMode::NativeCompatibility { fallback_model } = &self.mode {
+            if !self.contains(fallback_model) {
+                return Err(NativeError::InvalidState);
+            }
         }
         Ok(())
     }
@@ -314,5 +360,28 @@ mod tests {
             NativeUpstream::OpenaiApi
         );
         assert!(NativeUpstream::parse_base_url("https://example.com/v1").is_err());
+    }
+
+    #[test]
+    fn native_compatibility_route_requires_and_serializes_a_native_fallback() {
+        let state = NativeRouteState::new_native_compatibility(
+            NativeUpstream::ChatgptCodex,
+            ["gpt-native".to_owned()],
+            "gpt-native".to_owned(),
+        )
+        .unwrap();
+        assert_eq!(state.native_compatibility_fallback(), Some("gpt-native"));
+        assert_eq!(
+            NativeRouteState::from_json(&state.to_json().unwrap()).unwrap(),
+            state
+        );
+        assert!(
+            NativeRouteState::new_native_compatibility(
+                NativeUpstream::ChatgptCodex,
+                ["gpt-native".to_owned()],
+                "missing-native".to_owned(),
+            )
+            .is_err()
+        );
     }
 }

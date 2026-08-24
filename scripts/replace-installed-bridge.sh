@@ -2,7 +2,7 @@
 set -eu
 
 usage() {
-    printf '%s\n' "usage: $0 NEW_BINARY" >&2
+    printf '%s\n' "usage: $0 NEW_BINARY NEW_LAUNCHER_APP" >&2
     exit 2
 }
 
@@ -33,7 +33,7 @@ wait_for_service_state() {
     return 1
 }
 
-if [ "$#" -ne 1 ]; then
+if [ "$#" -ne 2 ]; then
     usage
 fi
 
@@ -51,13 +51,27 @@ case "$(/usr/bin/file -b "$new_binary")" in
     *) fail "new bridge must be a macOS arm64 Mach-O executable" ;;
 esac
 
+new_launcher_parent=$(CDPATH= cd -- "$(dirname -- "$2")" && pwd -P)
+new_launcher="$new_launcher_parent/$(basename -- "$2")"
+new_launcher_executable="$new_launcher/Contents/MacOS/Grok Codex Switch"
+new_overlay="$new_launcher/Contents/Resources/grok-codex-bridge-overlay.md"
+if [ ! -d "$new_launcher" ] || [ -L "$new_launcher" ] \
+    || [ ! -f "$new_launcher_executable" ] || [ -L "$new_launcher_executable" ] \
+    || [ ! -x "$new_launcher_executable" ] \
+    || [ ! -f "$new_overlay" ] || [ -L "$new_overlay" ]; then
+    fail "new launcher must be a complete regular app bundle"
+fi
 install_root="${HOME:?HOME is required}/Library/Application Support/grok-codex-bridge"
 installed_binary="$install_root/bin/grok-codex-bridge"
+installed_launcher="$install_root/bin/Grok Codex Switch.app"
 if [ ! -f "$installed_binary" ] || [ -L "$installed_binary" ] || [ ! -x "$installed_binary" ]; then
     fail "installed bridge is missing or unsafe: $installed_binary"
 fi
 if [ "$new_binary" = "$installed_binary" ]; then
     fail "new bridge must not be the installed bridge path"
+fi
+if [ ! -d "$installed_launcher" ] || [ -L "$installed_launcher" ]; then
+    fail "installed launcher is missing or unsafe: $installed_launcher"
 fi
 
 new_version=$("$new_binary" version)
@@ -70,24 +84,34 @@ fi
 binary_dir="$install_root/bin"
 staged_binary="$binary_dir/.grok-codex-bridge.new.$$"
 rollback_binary="$binary_dir/.grok-codex-bridge.rollback.$$"
+staged_launcher="$binary_dir/.Grok Codex Switch.app.new.$$"
+rollback_launcher="$binary_dir/.Grok Codex Switch.app.rollback.$$"
 stopped=0
 replaced=0
+launcher_replaced=0
 
 cleanup() {
     exit_code=$?
     trap - 0 1 2 15
 
     if [ "$exit_code" -ne 0 ]; then
-        if [ "$replaced" -eq 1 ] && [ -f "$rollback_binary" ]; then
+        if { [ "$replaced" -eq 1 ] && [ -f "$rollback_binary" ]; } \
+            || { [ "$launcher_replaced" -eq 1 ] && [ -d "$rollback_launcher" ]; }; then
             if "$installed_binary" service uninstall >/dev/null 2>&1 \
-                && wait_for_service_state "$installed_binary" "service not_loaded" \
-                && /bin/mv -f "$rollback_binary" "$installed_binary"; then
-                /bin/chmod 755 "$installed_binary"
+                && wait_for_service_state "$installed_binary" "service not_loaded"; then
+                if [ "$replaced" -eq 1 ] && [ -f "$rollback_binary" ]; then
+                    /bin/mv -f "$rollback_binary" "$installed_binary"
+                    /bin/chmod 755 "$installed_binary"
+                fi
+                if [ "$launcher_replaced" -eq 1 ] && [ -d "$rollback_launcher" ]; then
+                    [ ! -e "$installed_launcher" ] || /bin/rm -rf "$installed_launcher"
+                    /bin/mv "$rollback_launcher" "$installed_launcher"
+                fi
                 if "$installed_binary" service install >/dev/null 2>&1 \
                     && wait_for_service_state "$installed_binary" "service loaded"; then
-                    printf '%s\n' "rollback: restored the previous bridge and restarted its service" >&2
+                    printf '%s\n' "rollback: restored the previous bridge runtime and restarted its service" >&2
                 else
-                    printf '%s\n' "rollback error: previous bridge was restored but its service did not restart" >&2
+                    printf '%s\n' "rollback error: previous runtime was restored but its service did not restart" >&2
                 fi
             else
                 printf '%s\n' "rollback error: unable to restore the previous bridge" >&2
@@ -103,8 +127,10 @@ cleanup() {
     fi
 
     [ ! -e "$staged_binary" ] || /bin/rm -f "$staged_binary"
+    [ ! -e "$staged_launcher" ] || /bin/rm -rf "$staged_launcher"
     if [ "$exit_code" -eq 0 ]; then
         [ ! -e "$rollback_binary" ] || /bin/rm -f "$rollback_binary"
+        [ ! -e "$rollback_launcher" ] || /bin/rm -rf "$rollback_launcher"
     fi
     exit "$exit_code"
 }
@@ -116,7 +142,12 @@ trap 'exit 143' 15
 
 /usr/bin/install -m 755 "$new_binary" "$staged_binary"
 /usr/bin/install -m 755 "$installed_binary" "$rollback_binary"
+/usr/bin/ditto "$new_launcher" "$staged_launcher"
 /usr/bin/cmp -s "$new_binary" "$staged_binary" || fail "staged bridge differs from the new binary"
+/usr/bin/xattr -cr "$staged_launcher"
+if ! /usr/bin/codesign --verify --deep --strict "$staged_launcher" 2>/dev/null; then
+    fail "staged launcher signature is invalid"
+fi
 
 "$installed_binary" service uninstall
 stopped=1
@@ -127,7 +158,13 @@ fi
 /bin/mv -f "$staged_binary" "$installed_binary"
 replaced=1
 /bin/chmod 755 "$installed_binary"
+/bin/mv "$installed_launcher" "$rollback_launcher"
+launcher_replaced=1
+/bin/mv "$staged_launcher" "$installed_launcher"
 /usr/bin/cmp -s "$new_binary" "$installed_binary" || fail "installed bridge differs from the new binary"
+if ! /usr/bin/codesign --verify --deep --strict "$installed_launcher" 2>/dev/null; then
+    fail "installed launcher signature is invalid after replacement"
+fi
 installed_version=$("$installed_binary" version)
 if [ "$installed_version" != "$new_version" ]; then
     fail "installed bridge version does not match the new binary"
@@ -141,5 +178,6 @@ service_state="service loaded"
 "$installed_binary" doctor
 
 printf '%s\n' "bridge replaced: $installed_binary"
+printf '%s\n' "launcher replaced: $installed_launcher"
 printf '%s\n' "version: $installed_version"
 printf '%s\n' "$service_state"

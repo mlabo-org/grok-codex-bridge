@@ -8,53 +8,66 @@
 
 It is not a Codex plugin, a general-purpose LLM router, or an agent harness.
 
-## Install with Codex
+## One-command environment switching
 
-The repository includes [AGENTS.md](AGENTS.md) as a binding safety and lifecycle contract for coding agents. To let Codex inspect the source, build the native executable, and activate the current V1.1 merged Native GPT/Grok route, clone the repository and start Codex from its root:
+The repository includes [AGENTS.md](AGENTS.md) as a binding safety and lifecycle contract for coding agents. Clone the repository once, then use the repository-owned migration command from its root:
 
 ```sh
 git clone https://github.com/mlabo-org/grok-codex-bridge.git
 cd grok-codex-bridge
-codex
+./scripts/materialize-macos.sh
 ```
 
-Then choose one of the following requests. V1.1 is the primary route; the isolated V1.0 profile is retained as an experimental alternative.
+Enable the merged Native GPT/Grok picker:
 
-### Install the V1.1 merged picker
+```sh
+./scripts/grok-codex.sh grok
+```
 
-Use this request when you want Codex to complete the native build, service installation, and merged Native GPT/Grok picker activation in one job:
+Switch to Native compatibility mode without rewriting saved tasks:
+
+```sh
+./scripts/grok-codex.sh native
+```
+
+`grok` routes Grok slugs to xAI and Native GPT slugs to OpenAI. In Grok mode, the picker exposes both families. In Native mode, the picker exposes Native GPT for new selection while retaining the Grok provider metadata needed to open and continue existing tasks; it rewrites a saved Grok slug only in the outbound request copy to the current Native GPT model. Neither direction rewrites the provider or model stored on a task.
+
+Both commands hand the transition through the locally built native LaunchServices launcher to the Rust coordinator, without depending on Terminal.app after handoff. The coordinator asks ChatGPT.app to quit gracefully, waits until the app and app-server are absent, switches service/config state, and relaunches ChatGPT.app only after success.
+
+### Source repository and installed runtime
+
+The repository contains the complete public source for both native components: the Rust bridge and the Swift `Grok Codex Switch.app` launcher. Materialization builds both for Apple Silicon. Installation copies the resulting executable, launcher bundle, configuration, catalog state, overlay/resource files, and lifecycle data into:
 
 ```text
-Read AGENTS.md completely and follow it. On this Mac, build and install the native
-grok-codex-bridge, then activate the V1.1 merged Native GPT/Grok picker in the same
-job. Before picker activation,
-identify the current authoritative Native Codex catalog and the exact effective
-first-party Responses upstream without reading, copying, or printing credentials.
-Use ./scripts/materialize-macos.sh and only the repository-owned native lifecycle
-commands. Preserve existing changes and the exact rollback boundary. Verify the
-installed service, merged native/Grok catalog, and 272,000-token Grok context
-metadata with the minimum primary-path checks. Do not guess either Native Codex
-input, patch the Codex binary, edit Codex configuration, Grok authentication, or
-LaunchAgent files directly, or commit, push, or publish. If an authoritative input
-cannot be verified, stop before picker activation and explain what is missing. On
-success, report the required fresh CLI/Desktop restart and exact picker rollback
-command.
+~/Library/Application Support/grok-codex-bridge/
+├── bin/grok-codex-bridge
+├── bin/Grok Codex Switch.app/
+│   └── Contents/Resources/grok-codex-bridge-overlay.md
+├── config/bridge.toml
+├── state/                 # catalog and picker-managed state
+└── logs/
 ```
 
-### Install the experimental isolated V1.0 profile
+After installation, the switch coordinator reads only this installed tree and the live Codex/ChatGPT state it is explicitly handed. It does not compile, search Cargo's `target/`, read `dist/`, or depend on the checkout's `Grok.md` or replacement scripts during a normal switch. The checkout may therefore be moved or removed without invalidating an already installed runtime. The repository-owned `scripts/grok-codex.sh` remains the build/install/update entry point; it is not the runtime dependency of the installed bridge.
 
-```text
-Read AGENTS.md completely and follow it. Build and install the isolated V1.0
-grok-bridge profile on this Mac. Verify the platform and prerequisites, preserve
-existing changes, use ./scripts/materialize-macos.sh and the repository-owned
-lifecycle commands, and run only the minimum primary-path checks. Do not enable
-the V1.1 merged picker, edit the Codex binary, Codex configuration, Grok
-authentication, or LaunchAgent files directly, or commit, push, or publish.
-Stop and explain the missing boundary if this is not Apple Silicon macOS or a
-required authoritative input cannot be verified.
+The repository entry points install or update the locally materialized runtime, then switch mode:
+
+```sh
+./scripts/grok-codex.sh grok    # install/update if needed, then switch to Grok mode
+./scripts/grok-codex.sh native  # install/update if needed, then switch to Native mode
 ```
 
-A first-time install can run from Codex. Do not stop or replace an already running bridge from a Grok-backed Codex session; see [Updating an existing install](#updating-an-existing-install).
+After installation, normal switching is repository-independent and runs the installed native executable directly:
+
+```sh
+BRIDGE="$HOME/Library/Application Support/grok-codex-bridge/bin/grok-codex-bridge"
+"$BRIDGE" mode grok
+"$BRIDGE" mode native
+```
+
+The command prints that the transition normally takes approximately 15–20 seconds. That time is spent on graceful ChatGPT.app/app-server shutdown, service/config application, picker publication, and relaunch. Do not force-quit ChatGPT.app during this window. A successful transition is confirmed only after the automatic relaunch completes.
+
+The two native components have separate responsibilities: the Rust executable owns provider, picker, service, and transition state; the Swift launcher survives the parent ChatGPT.app shutdown and starts the coordinator through LaunchServices. Neither component is an interpreter or a build-on-first-use wrapper.
 
 ## Acknowledgements
 
@@ -64,7 +77,7 @@ No `codex-router` source code is copied into this repository. `grok-codex-bridge
 
 ## Why Rust
 
-The bridge is written in Rust so the normal runtime is one prebuilt native executable with no Python, Node.js, or JIT runtime dependency. Rust also gives the protocol and lifecycle boundaries strong types, explicit error handling, memory-safe concurrency, and deterministic release materialization.
+The bridge is written in Rust so the normal runtime is a locally built native executable plus a native Swift launcher, with no Python, Node.js, or JIT runtime dependency. Rust also gives the protocol and lifecycle boundaries strong types, explicit error handling, memory-safe concurrency, and deterministic release materialization.
 
 Normal use never compiles on demand. Cargo is used only for development and construction; the launcher executes the materialized binary directly and fails closed when it is missing or stale.
 
@@ -90,14 +103,13 @@ The bridge does not execute tool calls. It preserves valid function definitions,
 
 | Surface | Status |
 | --- | --- |
-| V1.1 merged Native GPT/Grok model picker | Primary route; implemented in source with bidirectional preservation of supported message/function/tool-search history at the bridge boundary |
-| V1.1 skill metadata budget | Grok catalog entries publish a 272,000-token context window, using Codex's native 2% calculation |
-| V1.0 isolated `grok-bridge` profile | Experimental isolated route; implemented in source |
+| Merged Native GPT/Grok model picker | Primary route; implemented in source with bidirectional preservation of supported message/function/tool-search history at the bridge boundary |
+| Skill metadata budget | Grok catalog entries publish a 272,000-token context window, using Codex's native 2% calculation |
 | Native Rust build and reversible user service | Implemented for Apple Silicon macOS |
-| Desktop picker and final rollback acceptance | Pending final verification |
-| Public release binaries | Not published; build and materialize from source |
+| One-command `grok` / `native` migration | Bidirectional runtime switching preserves saved provider/model values and coordinates graceful Desktop quit/relaunch |
+| Public release binaries | Intentionally not distributed; each user builds and materializes locally from source |
 
-V1.1 is the current primary route because the bridge's main catalog, projection, model-switching, and overlay behavior is built around the merged picker. V1.0 is retained as an experimental isolated profile that leaves Native GPT configuration untouched. Desktop picker and final rollback acceptance remain explicitly pending rather than being presented as completed live validation.
+The merged picker is the only documented operating route. Native GPT remains available in the same picker, and `native` switches routing mode without removing the provider.
 
 ## Features
 
@@ -116,48 +128,40 @@ V1.1 is the current primary route because the bridge's main catalog, projection,
 
 - macOS on Apple Silicon.
 - Rust 1.95.0 for building from source, pinned by [rust-toolchain.toml](rust-toolchain.toml).
+- A local source build is required. This project does not ship compiled binaries in the repository or through GitHub Releases; the Rust bridge and Swift launcher are compiled once on the user's own macOS arm64 machine and then installed.
 - An official Grok CLI installation and either a current login or the ability to complete its official browser OAuth flow.
 - A current Codex CLI installation.
 
 Prebuilt Intel macOS, Linux, and Windows artifacts are not currently provided.
 
-## Quick start: V1.1 merged picker
+## Quick start: merged picker
 
-The primary V1.1 route publishes a merged model catalog so Native GPT and admitted Grok models can be selected in one Codex model picker. Native GPT `responses` and `responses/compact` stay on the captured first-party Codex upstream. `images/generations`, `images/edits`, and `alpha/search` are Native-only passthrough endpoints with no Grok protocol conversion. Grok traffic is sent to xAI through the bridge. Grok has no authoritative `responses/compact` contract, so that route fails closed for admitted Grok models.
+The primary route publishes a merged model catalog so Native GPT and admitted Grok models can be selected in one Codex model picker. Native GPT `responses` and `responses/compact` stay on the captured first-party Codex upstream. `images/generations`, `images/edits`, and `alpha/search` are Native-only passthrough endpoints with no Grok protocol conversion. Grok traffic is sent to xAI through the bridge. Grok has no authoritative `responses/compact` contract, so that route fails closed for admitted Grok models.
 
 Native and Grok model slugs must remain unique. Catalog generation and runtime routing both fail closed on a duplicate slug; the bridge never overwrites a Native row or invents an alias.
 
-First materialize and install the native bridge:
+Build both native components once, then run the migration:
 
 ```sh
 ./scripts/materialize-macos.sh
-./dist/aarch64-apple-darwin/grok-codex-bridge install
+./scripts/grok-codex.sh grok
 ```
 
-Then activate the picker with the current authoritative Native Codex catalog and the exact effective first-party Responses base URL captured before activation. The following is an example for a standard ChatGPT-authenticated Codex setup:
-
-```sh
-CODEX_DIR="${CODEX_HOME:-"$HOME/.codex"}"
-
-./dist/aarch64-apple-darwin/grok-codex-bridge picker install \
-  --native-catalog "$CODEX_DIR/models_cache.json" \
-  --native-upstream-base-url "https://chatgpt.com/backend-api/codex" \
-  --grok-overlay "$PWD/Grok.md"
-```
-
-`--native-catalog` must resolve to an absolute existing file. Do not copy the example upstream URL when a different first-party upstream is effective for your Codex authentication route.
+The command accepts only the app-bundled Codex authenticated through ChatGPT, resolves the current `models_cache.json` under the effective Codex home, and fails before picker mutation if either authoritative input is unavailable.
 
 Start a fresh Codex CLI process after activation. Fully quit and relaunch Codex Desktop before testing the Desktop picker.
 
 ![Codex Desktop model picker with Native GPT models plus grok-4.5 and grok-4.6](docs/images/desktop-merged-picker.png)
 
-Codex Desktop after V1.1 picker activation. Native GPT and admitted Grok models appear in one picker. This is a display example; Desktop picker and final rollback acceptance remain pending.
+Codex Desktop after merged picker activation. Native GPT and admitted Grok models appear in one picker.
 
 Admitted Grok catalog entries, including the bootstrap `grok-4.5` and `grok-4.6` models, expose a 272,000-token context window. Codex therefore applies the same native 2% skill-description budget calculation instead of falling back to the small unknown-window budget.
 
 ### Grok.md overlay
 
 [`Grok.md`](Grok.md) is the source of truth for the Grok-only execution overlay. `picker install` reads that file from disk and copies it into each admitted Grok row's `base_instructions` in the generated catalog. Codex consumes the generated catalog; Native GPT rows never receive this overlay. The binary does not bake the file in at compile time, and the live HTTP path does not re-read it on every request.
+
+The filename `Grok.md` is reserved exclusively for this live Grok constitution source. Materialization copies its bytes into the installed launcher under the deliberately distinct runtime-snapshot name `Contents/Resources/grok-codex-bridge-overlay.md`; no other resource is named `Grok.md`.
 
 Omit `--grok-overlay` only when the current working directory already contains `Grok.md`. After changing the overlay, run `picker install` again and start a fresh Codex CLI process or fully relaunch Desktop. Existing Grok sessions keep the overlay that was in the catalog when they started.
 
@@ -172,29 +176,11 @@ Codex owns subagent dispatch. The bridge only translates provider protocol; it d
 - To run the child as Grok, set `model` to an admitted catalog id such as `grok-4.6` or `grok-4.5`.
 - To set reasoning depth, set `reasoning_effort` explicitly. Current Grok catalog entries advertise `low`, `medium`, `high`, and `xhigh`.
 
-## Experimental isolated V1.0 profile
-
-The V1.0 launcher keeps Grok in a separate Codex profile and is retained as an experimental isolated route. From the repository root, materialize the native executable once, then use the repository launcher:
-
-```sh
-./scripts/materialize-macos.sh
-./scripts/grok-codex.sh
-```
-
-The launcher installs the bridge on first use, starts its user service when needed, and opens Codex with the isolated `grok-bridge` profile. Later runs reuse the installed native executable. Arguments are passed through to Codex:
-
-```sh
-./scripts/grok-codex.sh --version
-./scripts/grok-codex.sh --activate-only
-```
-
-The launcher is repository-scoped. Moving or symlinking the shell script by itself is not a supported distribution method.
-
 ## Lifecycle and rollback
 
 ### Updating an existing install
 
-A Codex session that uses this bridge depends on the local loopback service. That includes the isolated `grok-bridge` profile and the V1.1 picker when a Grok model is selected. Stopping the service or replacing the installed binary from inside that session cuts the model connection. If the reload does not finish, the service stays `not_loaded` and Codex cannot reach Grok until the service is started again.
+A Grok-backed Codex session depends on the local loopback service. Stopping the service or replacing the installed binary from inside that session cuts the model connection. Run migration from a Native GPT task or Terminal.
 
 Perform materialization and installed-binary replacement from a session that does not use this bridge. Use Grok Build for that step, or a Codex session on a Native GPT model.
 
@@ -202,33 +188,27 @@ After materializing a new executable, replace the loaded install with the reposi
 
 ```sh
 ./scripts/materialize-macos.sh
-./scripts/replace-installed-bridge.sh ./dist/aarch64-apple-darwin/grok-codex-bridge
+./scripts/replace-installed-bridge.sh \
+  ./dist/aarch64-apple-darwin/grok-codex-bridge \
+  "./dist/aarch64-apple-darwin/Grok Codex Switch.app"
 ```
 
 After `service status` reports `service loaded`, start a fresh Codex CLI process or fully relaunch Desktop so the client reconnects.
 
-All repository commands below use the materialized executable directly:
+The same migration entry point owns both migration directions:
 
 ```sh
-./dist/aarch64-apple-darwin/grok-codex-bridge doctor
-./dist/aarch64-apple-darwin/grok-codex-bridge auth status
-./dist/aarch64-apple-darwin/grok-codex-bridge service status
+./scripts/grok-codex.sh grok
+./scripts/grok-codex.sh native
 ```
 
-Remove only the merged picker state and restore the exact pre-picker Codex configuration:
+`native` does not uninstall the bridge. The picker exposes only Native models for selection while retaining hidden Grok metadata required to resolve saved tasks. It keeps the provider definition and loopback resolver, does not construct the Grok inference client, and rewrites only Grok-slug request copies to the current root Native model. The original request, saved tasks, SQLite state, and rollouts are not modified.
 
-```sh
-./dist/aarch64-apple-darwin/grok-codex-bridge picker uninstall
-```
+Full uninstall is not a routine environment switch. Removing the resolver permanently requires a separate, explicit irreversible migration of remaining picker provider/model references into Native Codex form; otherwise those tasks become unopenable.
 
-Stop the user service, then remove the bridge-owned installation:
+Use `native` for a reversible Native-only operating mode. It is deliberately not an uninstall: the installed provider definition, resolver, and compatibility metadata remain available so a later `grok` transition can restore Grok routing without rewriting task history. Use full `uninstall` only when removing the bridge from the machine. That operation removes the installed runtime and rolls back bridge-owned Codex configuration/service state; it does not convert historical task records. If those records still contain bridge provider/model references, uninstalling first can make them impossible to open. Preserve the installed runtime until any separately planned, explicit data migration has completed.
 
-```sh
-./dist/aarch64-apple-darwin/grok-codex-bridge service uninstall
-./dist/aarch64-apple-darwin/grok-codex-bridge uninstall
-```
-
-The lifecycle manifest owns only files created or replaced by the bridge. Full uninstall does not remove the base Codex configuration, official Grok authentication state, or Native GPT configuration.
+Updating source is a different lifecycle boundary from switching mode. Build/materialize and install the new native components from a Native GPT task or Terminal, then allow the installed replacement path to stop and restart the service. Normal mode switching never rebuilds binaries. After an update, relaunch Codex Desktop once so it reads the newly published picker catalog.
 
 ## Model catalog and credentials
 
@@ -270,7 +250,7 @@ The `refresh_on_start` field controls service startup only; the explicit `catalo
 
 ## Security boundary
 
-- The listener binds to loopback only; LAN exposure is outside the V1 scope.
+- The listener binds to loopback only; LAN exposure is outside the product scope.
 - Caller capability material is placed in the local route and never written to service logs.
 - Credentials remain in their authoritative official file and a zeroizing memory cache; they are not copied into catalog or Codex state.
 - Grok transport is restricted to the official xAI origin, uses rustls, and does not follow redirects.
@@ -319,8 +299,8 @@ Grok.md                              Grok overlay SSOT read at picker catalog ge
 src/picker_activation.rs             atomic picker publication and activation
 src/launchd.rs                       typed user LaunchAgent boundary
 scripts/materialize-macos.sh         deterministic macOS arm64 materialization
-scripts/grok-codex.sh                V1.0 isolated profile launcher
-scripts/replace-installed-bridge.sh  loaded-install binary replacement
+scripts/grok-codex.sh                one-command Grok/native environment migration
+scripts/replace-installed-bridge.sh  loaded-install native runtime replacement
 ```
 
 ## License
