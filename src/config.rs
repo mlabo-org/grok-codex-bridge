@@ -109,7 +109,7 @@ impl GrokConfig {
         self.refresh_on_start
     }
 
-    /// Phase J publishes Native routing state beside the Grok catalog so the
+    /// The merged picker publishes Native routing state beside the Grok catalog so the
     /// runtime config remains a single source-owned V1 schema.
     #[must_use]
     pub fn native_route_file(&self) -> PathBuf {

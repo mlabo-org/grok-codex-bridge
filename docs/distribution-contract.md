@@ -1,146 +1,115 @@
-# Distribution Contract
+# Source-only macOS Distribution Contract
 
-Status: design record only. This document does not start V1.1, publish a release, or change the installed runtime.
+Status: active source-distribution contract for the current Native/Grok environment switcher.
 
-## Purpose
+This repository distributes source and deterministic local build/materialization instructions. It does not distribute compiled binaries.
 
-The repository launcher `scripts/grok-codex.sh` is a source-owner convenience. It resolves the repository from its own location, verifies the materialized binary against the checked-out Rust source, and therefore cannot be copied or symlinked into an unrelated `PATH` directory by itself.
+## Scope
 
-The distributable product must remove that repository dependency. A user installs once, then starts the Grok-backed Codex CLI with:
+The supported target is macOS on Apple Silicon (`arm64`). Each user compiles the runtime locally on their own Mac. Intel macOS, Linux, and Windows are outside this contract.
+
+The product is one paired local runtime:
+
+- `grok-codex-bridge`: the Rust native executable that owns the loopback provider, catalog and picker state, service lifecycle, credentials boundary, and desktop mode-transition coordinator;
+- `Grok Codex Switch.app`: the Swift native launcher that survives the ChatGPT.app shutdown and starts the Rust coordinator through LaunchServices;
+- `Grok.md`: the repository's reserved Grok-only constitution and overlay source of truth;
+- `grok-codex-bridge-overlay.md`: the deliberately distinct installed snapshot name for the bytes copied from `Grok.md` into the launcher bundle.
+
+The Swift launcher and the Rust bridge are one paired materialization unit. A Rust executable without its matching launcher and overlay snapshot is not a complete switcher runtime.
+
+## Source-only distribution
+
+The repository and its normal GitHub source checkout contain source, scripts, manifests, documentation, and the lockfile. They must not contain compiled bridge binaries, compiled `.app` bundles, Cargo build output, or release archives containing compiled artifacts. GitHub Releases are not used to publish compiled binaries for this product.
+
+The user-owned build route is:
 
 ```sh
-grok-codex
+./scripts/materialize-macos.sh
 ```
 
-The ordinary `codex` command must continue to start the native GPT configuration unchanged.
+That script is the sole materialization route. On macOS arm64 it builds the pinned Rust target `aarch64-apple-darwin`, compiles the Swift launcher, copies `Grok.md` into the launcher as `Contents/Resources/grok-codex-bridge-overlay.md`, signs the launcher, verifies an install-equivalent sanitized staging copy, and places both outputs under:
 
-## V1.0 And V1.1 Product Relationship
+```text
+dist/aarch64-apple-darwin/
+├── grok-codex-bridge
+└── Grok Codex Switch.app/
+    └── Contents/Resources/grok-codex-bridge-overlay.md
+```
 
-V1.0 and V1.1 are successive modes of one product, not separate repositories, services, protocol implementations, or independently distributed bridge products.
+`target/` is only a build cache. `dist/` is only local materialized output. Neither is authoritative source or a distribution payload.
 
-- V1.0 is the explicit Safe Provider entry: the repository launcher, and later the installed `grok-codex` command, start Codex CLI with the isolated `grok-bridge` profile. It does not integrate Grok into the native picker.
-- V1.1 adds Native Picker Mode on top of the same bridge, lifecycle, credential boundary, catalog, and installed service.
-- V1.1 targets both user-facing Codex selection surfaces: the CLI model picker and the Codex Desktop GUI model picker. CLI-only picker success is not completion of the V1.1 product goal.
-- Before implementation, V1.1 R0 must verify whether the current CLI and Desktop builds consume the same model/provider catalog and configuration path. If they differ, each surface needs its own source-owned integration boundary and primary-path evidence; one surface must not be assumed to prove the other.
-- Native GPT remains the default and must stay selectable. Grok entries are additive. GPT and Grok traffic separation, byte-preserving GPT behavior where passthrough is required, and complete rollback remain V1.1 acceptance conditions.
+The normal runtime never invokes Cargo, `rustc`, `swiftc`, a build-on-first-use path, an interpreted fallback, or a binary from `target/`. Missing or stale materialized output fails closed and instructs the user to run the materialization script.
 
-The installed `grok-codex` command remains the explicit V1.0 entry while that mode is an active supported route. It must share the installed service and implementation with Native Picker Mode rather than becoming a second bridge or compatibility fork.
+## Install and update boundary
 
-### Picker feasibility reference
+The repository-owned entry point is:
 
-[duolahypercho/codex-router at the pinned reference commit](https://github.com/duolahypercho/codex-router/tree/9995c77278608640759982c98ec5bdaeb371c174) is a concrete feasibility reference for selecting non-native models through the Codex Desktop model picker. V1.1 R0 must identify and verify the exact current catalog/configuration producer that makes those entries visible in both Desktop and CLI before this bridge edits Codex-owned state.
+```sh
+./scripts/grok-codex.sh grok
+./scripts/grok-codex.sh native
+```
 
-Only that picker integration mechanism and its rollback implications are candidates for transfer. codex-router's LiteLLM/Chat multi-hop, namespace conversion, hosted-tool injection, and fixed Grok registry remain outside this direct Responses-to-Responses bridge.
+Before installation or update, the user must run `./scripts/materialize-macos.sh`. The entry point verifies the local materialized pair, the current Native Codex catalog, the ChatGPT-authenticated Native upstream, and the Grok overlay before mutating bridge-owned state.
 
-## Fixed Runtime Decisions
-
-- Normal operation uses prebuilt native executables. It never invokes Cargo, rustc, a source checkout, `target/`, build-on-first-use, or an interpreted fallback.
-- The release package contains two Rust binaries built from this repository:
-  - `grok-codex-bridge`: provider service and lifecycle owner;
-  - `grok-codex`: thin native launch coordinator.
-- `grok-codex` owns only installed-runtime validation, typed service-status/start sequencing, and `exec` of `codex --profile grok-bridge` with the user's remaining arguments. It does not own protocol translation, credentials, model routing, or tool execution.
-- `grok-codex-bridge` remains the only owner of installation, doctor, auth status, catalog refresh, provider service, LaunchAgent rendering, and uninstall.
-- The release initially supports only `aarch64-apple-darwin`. Another platform or architecture requires its own declared artifact and acceptance evidence; it must not reuse an incompatible binary.
-
-## Installed Layout
-
-The per-user installer derives every path from the current user's home directory and records every owned path in the existing private install manifest. No personal absolute path may be compiled into or shipped with an artifact.
+Installation copies the paired runtime and its resource into the per-user installed tree:
 
 ```text
 ~/Library/Application Support/grok-codex-bridge/
-  bin/grok-codex-bridge
-  bin/grok-codex
-  config.toml
-  caller-token
-  catalog.json
-  install-manifest.json
-
-~/.local/bin/grok-codex
-  -> installed native grok-codex executable
-
-~/.codex/grok-bridge.config.toml
-~/Library/LaunchAgents/com.local.grok-codex-bridge.plist
+├── bin/grok-codex-bridge
+├── bin/Grok Codex Switch.app/
+│   └── Contents/Resources/grok-codex-bridge-overlay.md
+├── config/bridge.toml
+├── state/
+└── logs/
 ```
 
-The command entry may be an exact installer-owned symlink to the installed native launcher or an exact copy installed atomically. The manifest must record which form was created. The installer must not edit shell startup files without separate explicit authority. If the selected bin directory is absent from `PATH`, installation fails with one exact corrective instruction or accepts an explicit absolute `--command-path` override.
+The lifecycle manifest and user LaunchAgent record the bridge-owned paths. The installed launcher bundle must be a regular, non-symlink app bundle with a valid executable, Info.plist, and non-empty UTF-8 overlay snapshot. The installed bridge and launcher are replaced as a pair by `scripts/replace-installed-bridge.sh`; replacement stages both, stops the service, swaps both, verifies the new version and launcher signature, restarts the service, and attempts a bounded rollback if the operation fails.
 
-## Responsibility Model
+Source build/materialization and installed-runtime replacement are update operations. They are not normal mode switches and should be initiated from a Native GPT task or Terminal when the current Grok task depends on the bridge service.
 
-### Release producer
+Updating from the repository therefore requires the source checkout containing the new materialized pair and replacement script. This is a deliberate source-install/update boundary. It does not make the repository a dependency of the already installed normal switching path.
 
-- Builds both binaries once per declared target using the pinned toolchain.
-- Places them outside Cargo build caches in one versioned release archive.
-- Publishes checksums and, when a publication decision authorizes it, the selected macOS signing and notarization evidence.
-- Never packages credentials, capability tokens, Codex state, Grok state, logs, or user-specific paths.
+## Installed normal mode switching
 
-### Native setup coordinator
-
-- Runs only from an already downloaded prebuilt artifact.
-- Verifies platform, architecture, executable bytes, destination safety, and prerequisites before mutation.
-- Calls the existing lifecycle boundaries in order: install files/profile, validate with doctor, install the user LaunchAgent, then expose the `grok-codex` command.
-- Rolls back only files created by the failed setup attempt. It does not remove or overwrite unrelated Codex configuration.
-
-### Installed launcher
-
-- Resolves the bridge only from the install manifest and declared install root, never from the repository or Cargo cache.
-- Does not reinstall on every invocation.
-- Starts the service only when typed status says it is not loaded.
-- Executes the current `codex` found through the supported executable-resolution contract with the isolated `grok-bridge` profile.
-- Passes user arguments through without interpreting model prompts or tool requests.
-
-### LaunchAgent service
-
-- Runs in the current user's launchd domain with `RunAtLoad` and `KeepAlive`.
-- Survives Codex CLI exit, stops at logout/shutdown, and starts again at the next login while installed.
-- Listens only on loopback and reads the existing private runtime configuration.
-
-### External owners
-
-- Codex owns its agent loop, permissions, tools, sessions, and native GPT behavior.
-- The official Grok client flow owns login and credential renewal. Distribution checks availability read-only and never copies or refreshes credentials itself.
-
-## User Flow
-
-One-time setup from an extracted, verified release artifact:
+After installation, the checkout may be moved or deleted for ordinary operation. The direct installed entry points are:
 
 ```sh
-./grok-codex-bridge setup
+BRIDGE="$HOME/Library/Application Support/grok-codex-bridge/bin/grok-codex-bridge"
+"$BRIDGE" mode grok
+"$BRIDGE" mode native
 ```
 
-`setup` is a future native coordinator command. It may sequence existing lifecycle operations but must not merge their underlying ownership or weaken rollback.
+These commands use only the installed bridge, installed launcher, installed overlay snapshot, installed bridge state, the effective Codex home, and the live ChatGPT/Codex route explicitly inspected by the binary. They do not read the checkout's `Grok.md`, `dist/`, `target/`, or replacement scripts, and they do not compile.
 
-Normal use after setup:
+`grok` publishes the merged Native GPT/Grok picker, routes admitted Grok models to xAI, and preserves Native GPT routing to the first-party Codex upstream. `native` publishes the Native compatibility mode while retaining the bridge provider metadata and hidden Grok catalog information required to open and continue saved Grok tasks. Neither direction rewrites the provider or model stored in a saved task; request-time compatibility transformation is the bridge's runtime responsibility.
 
-```sh
-grok-codex
-grok-codex --version
-codex
-```
+Every mode switch is handed to the native launcher. The launcher and coordinator request a graceful ChatGPT.app and bundled app-server shutdown, wait for quiescence, apply the service/configuration transition, publish the picker state, and relaunch ChatGPT.app only after successful mutation. The user-facing estimate is approximately 15–20 seconds. The user must not force-quit ChatGPT.app during this handoff.
 
-The first two commands use the isolated Grok provider profile. The last command remains the user's ordinary GPT route. None of them compiles source.
+## Native compatibility mode versus full uninstall
 
-An update installs a newly verified pair of binaries atomically, rewrites only bridge-owned LaunchAgent/runtime entries, restarts the user service when required, and preserves the private config, capability, catalog, credential source, and base Codex configuration. Uninstall removes the command entry and other manifest-proven bridge files and restores exact recorded backups.
+`mode native` is reversible Native-only operation. It is not uninstall and must not remove the provider definition, resolver, launcher, service, or compatibility metadata. A later `mode grok` must remain possible without rewriting task history.
 
-## Distribution Channels
+Full uninstall is a separate explicit lifecycle action. It removes only manifest-proven bridge artifacts, stops/removes the bridge service, restores exact bridge-owned configuration backups, and does not convert historical task records. If saved tasks still refer to the bridge provider or Grok model, uninstalling first can make those tasks unopenable. Any permanent data migration must therefore be separately designed and explicitly completed before full uninstall.
 
-The canonical artifact is a versioned release archive containing the two prebuilt binaries and integrity metadata. A future GitHub Release or Homebrew Tap may transport that same artifact after publication, license, signing, and repository decisions are explicitly authorized. A package manager must not introduce a second implementation, runtime compilation, or a different lifecycle contract.
+## Ownership and invariants
 
-## Release Acceptance
+- Codex owns the agent loop, permissions, tools, MCP servers, Skills, Browser/Computer Use, sessions, and Native GPT behavior.
+- The bridge owns only the local provider boundary, Grok protocol translation, picker projection, service lifecycle, and reversible environment transition.
+- `Grok.md` is reserved exclusively for the live Grok constitution source. No installed or auxiliary resource uses that filename for another purpose.
+- The installed snapshot is named `grok-codex-bridge-overlay.md`; it is a materialized copy of `Grok.md`, not a second source of truth.
+- Credentials, capability tokens, Codex state, Grok state, logs containing secrets, and user-specific absolute paths are never distribution artifacts.
+- The listener remains loopback-only on `127.0.0.1` or `::1`.
+- Normal switching never edits saved task records, SQLite history, rollouts, or the Native catalog source file.
 
-One semantic acceptance bundle for the distribution implementation must prove all of the following on the declared target:
+## Acceptance bundle
 
-1. Both executables are produced by the source-owned materialization route and placed outside `target/`.
-2. Setup succeeds from an extracted release artifact when the source repository and Rust toolchain are unavailable.
-3. `grok-codex --version` and one representative `grok-codex` launch resolve only installed files, never the source checkout.
-4. The user LaunchAgent reaches loaded state and the provider remains available after the launched Codex process exits.
-5. Plain `codex` retains the pre-install native GPT configuration.
-6. Uninstall removes only manifest-proven bridge artifacts and restores exact backups.
-7. Active runtime callers contain no `cargo run`, on-demand build, Cargo-cache search, repository-relative lookup, or user-specific absolute path.
+For a source change affecting this route, the single acceptance bundle must establish:
 
-## Explicitly Deferred
-
-- V1.1 native model picker, merged catalog, GPT passthrough, and aliases;
-- GitHub publication, Homebrew publication, license selection, signing identity, and notarization execution;
-- Intel macOS, Linux, and Windows artifacts;
-- automatic modification of shell profiles;
-- any credential migration, copying, refresh-token exchange, or interactive login automation; the bridge may only invoke the official Grok CLI's bounded non-interactive refresh path.
+1. `./scripts/materialize-macos.sh` produces both native outputs for macOS arm64 and copies the `Grok.md` bytes under the distinct installed snapshot name.
+2. No compiled artifact is tracked or included as a repository distribution payload.
+3. A fresh install copies the bridge, launcher, overlay snapshot, configuration, state, and lifecycle data into the installed tree without symlink substitution.
+4. The installed bridge's direct `mode native` and `mode grok` entry points resolve only installed runtime inputs and do not compile or inspect the checkout.
+5. The paired replacement path verifies, restarts, and rolls back the installed runtime as one unit when an update is required.
+6. Native and Grok picker visibility and routing change in the requested direction while saved provider/model records remain unchanged.
+7. A graceful desktop handoff completes before relaunch, with the user-facing estimate of approximately 15–20 seconds.
+8. Full uninstall remains distinct from reversible Native compatibility mode and preserves the documented saved-task warning.
