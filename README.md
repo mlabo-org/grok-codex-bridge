@@ -4,13 +4,13 @@
 
 **A native Rust Responses-to-Responses bridge that lets Grok run inside the Codex harness without replacing Native GPT.**
 
-`grok-codex-bridge` is a standalone, loopback-only provider bridge for macOS on Apple Silicon. Codex continues to own the agent loop, tools, permissions, MCP servers, Skills, and session state. This project owns only the local provider boundary, tolerant provider projection for Responses transport, Codex-consumed SSE extraction, the bridge-side Grok credential boundary, and the upstream connection to xAI. The bridge inspects the official credential read-only; recoverable missing, incomplete, or expired state may invoke the official Grok CLI through bounded recovery triggers, while the official CLI owns any credential update.
+`grok-codex-bridge` is a standalone, loopback-only provider bridge for macOS on Apple Silicon. Codex continues to own the agent loop, tools, permissions, MCP servers, Skills, and session state. This project owns only the local provider boundary, tolerant provider projection for Responses transport, Codex-consumed SSE extraction, the bridge-side Grok credential boundary, and the upstream connection to xAI. Credential recovery is delegated to the official Grok CLI; see [Model catalog and credentials](#model-catalog-and-credentials).
 
 It is not a Codex plugin, a general-purpose LLM router, or an agent harness.
 
 ## Install with Codex
 
-The repository includes [AGENTS.md](AGENTS.md) as a binding safety and lifecycle contract for coding agents. To let Codex inspect the source, build the native executable, and install the conservative V1.0 isolated profile, clone the repository and start Codex from its root:
+The repository includes [AGENTS.md](AGENTS.md) as a binding safety and lifecycle contract for coding agents. To let Codex inspect the source, build the native executable, and activate the current V1.1 merged Native GPT/Grok route, clone the repository and start Codex from its root:
 
 ```sh
 git clone https://github.com/mlabo-org/grok-codex-bridge.git
@@ -18,29 +18,16 @@ cd grok-codex-bridge
 codex
 ```
 
-Then choose one of the following requests.
+Then choose one of the following requests. V1.1 is the primary route; the isolated V1.0 profile is retained as an experimental alternative.
 
-### Install the isolated V1.0 profile
+### Install the V1.1 merged picker
 
-```text
-Read AGENTS.md completely and follow it. Build and install the isolated V1.0
-grok-bridge profile on this Mac. Verify the platform and prerequisites, preserve
-existing changes, use ./scripts/materialize-macos.sh and the repository-owned
-lifecycle commands, and run only the minimum primary-path checks. Do not enable
-the experimental V1.1 merged picker, edit the Codex binary, Codex configuration,
-Grok authentication, or LaunchAgent files directly, or commit, push, or publish.
-Stop and explain the missing boundary if this is not Apple Silicon macOS or a
-required authoritative input cannot be verified.
-```
-
-### Install through the experimental V1.1 merged picker
-
-Use this request when you want Codex to complete the build, isolated installation, and merged Native GPT/Grok picker activation in one job:
+Use this request when you want Codex to complete the native build, service installation, and merged Native GPT/Grok picker activation in one job:
 
 ```text
-Read AGENTS.md completely and follow it. On this Mac, build and install the V1.0
-isolated grok-bridge profile, then continue through the experimental V1.1 merged
-Native GPT/Grok picker activation in the same job. Before picker activation,
+Read AGENTS.md completely and follow it. On this Mac, build and install the native
+grok-codex-bridge, then activate the V1.1 merged Native GPT/Grok picker in the same
+job. Before picker activation,
 identify the current authoritative Native Codex catalog and the exact effective
 first-party Responses upstream without reading, copying, or printing credentials.
 Use ./scripts/materialize-macos.sh and only the repository-owned native lifecycle
@@ -54,7 +41,18 @@ success, report the required fresh CLI/Desktop restart and exact picker rollback
 command.
 ```
 
-This route automates every repository-owned V1.1 installation step. A fresh Codex CLI process or full Desktop relaunch remains necessary after activation so Codex loads the published catalog and provider state.
+### Install the experimental isolated V1.0 profile
+
+```text
+Read AGENTS.md completely and follow it. Build and install the isolated V1.0
+grok-bridge profile on this Mac. Verify the platform and prerequisites, preserve
+existing changes, use ./scripts/materialize-macos.sh and the repository-owned
+lifecycle commands, and run only the minimum primary-path checks. Do not enable
+the V1.1 merged picker, edit the Codex binary, Codex configuration, Grok
+authentication, or LaunchAgent files directly, or commit, push, or publish.
+Stop and explain the missing boundary if this is not Apple Silicon macOS or a
+required authoritative input cannot be verified.
+```
 
 A first-time install can run from Codex. Do not stop or replace an already running bridge from a Grok-backed Codex session; see [Updating an existing install](#updating-an-existing-install).
 
@@ -92,21 +90,21 @@ The bridge does not execute tool calls. It preserves valid function definitions,
 
 | Surface | Status |
 | --- | --- |
-| V1.0 isolated `grok-bridge` profile | Implemented and validated in the Codex CLI |
-| Native Rust build and reversible user service | Implemented and validated |
-| V1.1 merged Native GPT/Grok model picker | Implemented; CLI switching validated; bidirectional switching preserves supported message/function/tool-search history at the bridge boundary |
+| V1.1 merged Native GPT/Grok model picker | Primary route; implemented in source with bidirectional preservation of supported message/function/tool-search history at the bridge boundary |
 | V1.1 skill metadata budget | Grok catalog entries publish a 272,000-token context window, using Codex's native 2% calculation |
+| V1.0 isolated `grok-bridge` profile | Experimental isolated route; implemented in source |
+| Native Rust build and reversible user service | Implemented for Apple Silicon macOS |
 | Desktop picker and final rollback acceptance | Pending final verification |
 | Public release binaries | Not published; build and materialize from source |
 
-V1.0 is the conservative public route: it uses a separate Codex profile and leaves Native GPT configuration untouched. V1.1 is currently experimental because its Desktop and final rollback acceptance are not complete.
+V1.1 is the current primary route because the bridge's main catalog, projection, model-switching, and overlay behavior is built around the merged picker. V1.0 is retained as an experimental isolated profile that leaves Native GPT configuration untouched. Desktop picker and final rollback acceptance remain explicitly pending rather than being presented as completed live validation.
 
 ## Features
 
 - Tolerant Codex Responses-to-xAI Responses provider projection with `store: false`. Replayable message, function, and tool-search history is forwarded; completed Native `custom_tool_call` items and foreign reasoning are omitted from Grok requests. No legacy Chat Completions conversion.
 - Codex-consumed SSE extraction for text, reasoning summaries, function calls, and terminal/usage events. Unknown auxiliary events do not terminate the stream. Integer-valued JSON numbers in function and tool_search arguments are canonicalized to JSON integers. If Grok ends a useful stream without `response.completed`, the bridge closes it with that Codex lifecycle marker only so the turn is not reported as `stream closed before response.completed`.
 - Ordered function calls/results and mixed text/image inputs without downloading or re-encoding image data.
-- Read-only bridge-side use of the official Grok session credential, with in-memory zeroizing cache reload when the source changes. Provider hard expiry can trigger one bounded silent official-CLI refresh; explicit `auth ensure` delegates recoverable login state to the official desktop OAuth flow. The bridge never handles refresh tokens, performs OAuth, or writes the credential file.
+- Read-only bridge-side use of the official Grok session credential, with bounded recovery delegated to the official Grok CLI. See [Model catalog and credentials](#model-catalog-and-credentials).
 - Fixed official xAI origin through rustls, redirects disabled, and typed authentication, rate-limit, status, and stream failures.
 - Catalog-driven Grok model admission with atomic metadata-only last-known-good state.
 - Loopback-only listener and capability-scoped routes; invalid capabilities return `404`.
@@ -123,27 +121,11 @@ V1.0 is the conservative public route: it uses a separate Codex profile and leav
 
 Prebuilt Intel macOS, Linux, and Windows artifacts are not currently provided.
 
-## Quick start: isolated V1.0 profile
+## Quick start: V1.1 merged picker
 
-From the repository root, materialize the native executable once, then use the repository launcher:
+The primary V1.1 route publishes a merged model catalog so Native GPT and admitted Grok models can be selected in one Codex model picker. Native GPT `responses` and `responses/compact` stay on the captured first-party Codex upstream. `images/generations`, `images/edits`, and `alpha/search` are Native-only passthrough endpoints with no Grok protocol conversion. Grok traffic is sent to xAI through the bridge. Grok has no authoritative `responses/compact` contract, so that route fails closed for admitted Grok models.
 
-```sh
-./scripts/materialize-macos.sh
-./scripts/grok-codex.sh
-```
-
-The launcher installs the bridge on first use, starts its user service when needed, and opens Codex with the isolated `grok-bridge` profile. Later runs reuse the installed native executable. Arguments are passed through to Codex:
-
-```sh
-./scripts/grok-codex.sh --version
-./scripts/grok-codex.sh --activate-only
-```
-
-The launcher is repository-scoped. Moving or symlinking the shell script by itself is not a supported distribution method.
-
-## Experimental V1.1 merged picker
-
-The V1.1 route publishes a merged model catalog so Native GPT and admitted Grok models can be selected in one Codex model picker. Native GPT `responses` and `responses/compact` stay on the captured first-party Codex upstream. `images/generations`, `images/edits`, and `alpha/search` are Native-only passthrough endpoints with no Grok protocol conversion. Grok traffic is sent to xAI through the bridge. Grok has no authoritative `responses/compact` contract, so that route fails closed for admitted Grok models.
+Native and Grok model slugs must remain unique. Catalog generation and runtime routing both fail closed on a duplicate slug; the bridge never overwrites a Native row or invents an alias.
 
 First materialize and install the native bridge:
 
@@ -185,26 +167,28 @@ The overlay is a companion contract, not a second constitution. It tells Grok to
 
 Codex owns subagent dispatch. The bridge only translates provider protocol; it does not spawn workers.
 
-Verified on a live V1.1 picker session:
-
 - A Grok parent can spawn official Codex subagents (`spawn_agent` / `wait_agent` / `close_agent`).
 - Omitting `model` or `reasoning_effort` applies Codex `[agents].default_subagent_model` and `[agents].default_subagent_reasoning_effort`. Those values are not the parent Grok model or effort.
 - To run the child as Grok, set `model` to an admitted catalog id such as `grok-4.6` or `grok-4.5`.
-- To set reasoning depth, set `reasoning_effort` explicitly. Current Grok catalog entries advertise `low`, `medium`, `high`, and `xhigh`. `grok-4.5` at `xhigh` has been verified.
+- To set reasoning depth, set `reasoning_effort` explicitly. Current Grok catalog entries advertise `low`, `medium`, `high`, and `xhigh`.
 
-### Current resume limitation
+## Experimental isolated V1.0 profile
 
-With Grok selected at shutdown, resuming that session directly may show:
-
-```text
-MCP startup interrupted. The following servers were not initialized: codex_apps
-```
-
-Current evidence places this at Codex's TUI resume/MCP-startup boundary, not at the bridge transport or the `codex_apps` handshake. Until the Codex-side behavior is resolved, resume with a Native GPT model and switch to Grok after startup:
+The V1.0 launcher keeps Grok in a separate Codex profile and is retained as an experimental isolated route. From the repository root, materialize the native executable once, then use the repository launcher:
 
 ```sh
-codex resume <SESSION_ID> -m <NATIVE_GPT_MODEL>
+./scripts/materialize-macos.sh
+./scripts/grok-codex.sh
 ```
+
+The launcher installs the bridge on first use, starts its user service when needed, and opens Codex with the isolated `grok-bridge` profile. Later runs reuse the installed native executable. Arguments are passed through to Codex:
+
+```sh
+./scripts/grok-codex.sh --version
+./scripts/grok-codex.sh --activate-only
+```
+
+The launcher is repository-scoped. Moving or symlinking the shell script by itself is not a supported distribution method.
 
 ## Lifecycle and rollback
 
@@ -214,7 +198,7 @@ A Codex session that uses this bridge depends on the local loopback service. Tha
 
 Perform materialization and installed-binary replacement from a session that does not use this bridge. Use Grok Build for that step, or a Codex session on a Native GPT model.
 
-After materializing a new executable, replace the loaded install with the repository-owned replacement script. It stops the service, swaps the installed binary, restarts the service, and runs `doctor`:
+After materializing a new executable, replace the loaded install with the repository-owned replacement script. Before stopping the service, it runs `auth ensure`: silent refresh is attempted first, and the official OAuth browser opens only when interactive recovery is still required. The script then swaps the installed binary, restarts the service, and runs `doctor`. If replacement or restart fails, it attempts to restore the previous binary and service state:
 
 ```sh
 ./scripts/materialize-macos.sh
@@ -273,7 +257,7 @@ Complete browser confirmation only on the official `auth.x.ai` page opened by th
 ./dist/aarch64-apple-darwin/grok-codex-bridge service status
 ```
 
-`catalog refresh` is separate from the expired-credential recovery path. It requires a currently usable credential, does not invoke the renewal helper, and updates only the last-known-good model catalog. The checked-in configuration is a template with placeholder absolute paths and must not be run unchanged. Copy it to an untracked local configuration, replace the placeholders with valid absolute paths, and then run:
+`catalog refresh` is separate from all automatic credential recovery. It requires a currently usable credential, invokes neither the silent-refresh helper nor interactive login, and updates only the last-known-good model catalog. The checked-in configuration is a template with placeholder absolute paths and must not be run unchanged. Copy it to an untracked local configuration, replace the placeholders with valid absolute paths, and then run:
 
 ```sh
 cp ./docs/bridge-config.example.toml ./bridge-config.local.toml

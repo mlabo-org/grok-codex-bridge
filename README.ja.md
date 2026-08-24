@@ -4,13 +4,13 @@
 
 **Native GPTを置き換えず、Codexハーネスの中でGrokを動かすための、Rust製ネイティブResponses-to-Responsesブリッジです。**
 
-`grok-codex-bridge` はApple Silicon搭載macOS向けの、スタンドアロンかつループバック専用のプロバイダーブリッジです。エージェントループ、ツール、権限、MCPサーバー、Skills、セッション状態は引き続きCodexが担当します。本プロジェクトが担当するのは、ローカルのプロバイダー境界、Responses transportの許容的なprovider projection、Codexが消費するSSE抽出、bridge側のGrok credential境界、xAIへの上流接続です。bridgeは公式credentialを読み取り専用で検査し、missing、incomplete、expiredの再認証可能な状態では公式Grok CLIをboundedな復旧トリガーとして起動することがあります。credential自体の更新は公式CLIが所有します。
+`grok-codex-bridge` はApple Silicon搭載macOS向けの、スタンドアロンかつループバック専用のプロバイダーブリッジです。エージェントループ、ツール、権限、MCPサーバー、Skills、セッション状態は引き続きCodexが担当します。本プロジェクトが担当するのは、ローカルのプロバイダー境界、Responses transportの許容的なprovider projection、Codexが消費するSSE抽出、bridge側のGrok credential境界、xAIへの上流接続です。credential復旧は公式Grok CLIへ委譲します。詳細は [モデルカタログと認証情報](#モデルカタログと認証情報) を参照してください。
 
 Codexプラグイン、汎用LLMルーター、エージェントハーネスではありません。
 
 ## Codexにインストールを任せる
 
-このリポジトリには、coding agentが守る安全境界とライフサイクル契約を [AGENTS.md](AGENTS.md) に収録しています。Codex自身にソースを確認させ、ネイティブ実行ファイルをbuildし、安全側のV1.0分離プロファイルをinstallさせる場合は、リポジトリをcloneしてrootからCodexを起動します。
+このリポジトリには、coding agentが守る安全境界とライフサイクル契約を [AGENTS.md](AGENTS.md) に収録しています。Codex自身にソースを確認させ、ネイティブ実行ファイルをbuildし、現行のV1.1 Native GPT/Grok統合経路を有効化させる場合は、リポジトリをcloneしてrootからCodexを起動します。
 
 ```sh
 git clone https://github.com/mlabo-org/grok-codex-bridge.git
@@ -18,28 +18,16 @@ cd grok-codex-bridge
 codex
 ```
 
-起動したCodexへ、目的に応じて次のどちらかを依頼してください。
+起動したCodexへ、目的に応じて次のどちらかを依頼してください。通常はV1.1を使用し、V1.0分離プロファイルは実験的な代替経路として残しています。
 
-### V1.0分離プロファイルまでinstallする
+### V1.1統合ピッカーまで自動でinstallする
 
-```text
-AGENTS.mdを最後まで読み、その契約に従ってください。このMacへV1.0の分離型
-grok-bridgeプロファイルをbuild・installしてください。platformと前提条件を確認し、
-既存差分を保持し、./scripts/materialize-macos.shとrepo所有のlifecycle commandだけを
-使用して、最小のprimary-path checkを実行してください。実験的V1.1統合pickerの有効化、
-Codex本体binary・Codex設定・Grok認証・LaunchAgent fileの直接編集、commit、push、
-publishは行わないでください。Apple Silicon搭載macOSでない場合、または必要な
-authoritative inputを確認できない場合は停止して不足境界を説明してください。
-```
-
-### 実験的V1.1統合ピッカーまで自動でinstallする
-
-build、V1.0分離install、Native GPT/Grok統合ピッカー有効化までを、Codexへ一仕事で任せる場合はこちらを使用します。
+native build、service install、Native GPT/Grok統合ピッカー有効化までを、Codexへ一仕事で任せる場合はこちらを使用します。
 
 ```text
-AGENTS.mdを最後まで読み、その契約に従ってください。このMacでV1.0分離型
-grok-bridgeプロファイルをbuild・installし、同じjobの中で実験的V1.1 Native GPT/Grok
-統合pickerの有効化まで続けてください。picker有効化前に、現在のauthoritative Native
+AGENTS.mdを最後まで読み、その契約に従ってください。このMacでnative
+grok-codex-bridgeをbuild・installし、同じjobの中でV1.1 Native GPT/Grok統合pickerの
+有効化まで続けてください。picker有効化前に、現在のauthoritative Native
 Codex catalogと、実際に有効なfirst-party Responses upstreamを、credentialの読み取り・
 copy・表示を行わずに特定してください。./scripts/materialize-macos.shとrepo所有のnative
 lifecycle commandだけを使用し、既存差分と完全なrollback境界を保持してください。
@@ -51,7 +39,17 @@ publishは禁止します。authoritative inputを確認できない場合はpic
 rollback commandを報告してください。
 ```
 
-この経路はrepoが所有するV1.1導入処理をすべて自動化します。有効化したcatalogとprovider stateをCodexへ読み込ませるため、完了後の新規Codex CLIプロセス起動またはDesktop完全再起動だけは必要です。
+### 実験的V1.0分離プロファイルまでinstallする
+
+```text
+AGENTS.mdを最後まで読み、その契約に従ってください。このMacへV1.0の分離型
+grok-bridgeプロファイルをbuild・installしてください。platformと前提条件を確認し、
+既存差分を保持し、./scripts/materialize-macos.shとrepo所有のlifecycle commandだけを
+使用して、最小のprimary-path checkを実行してください。V1.1統合pickerの有効化、
+Codex本体binary・Codex設定・Grok認証・LaunchAgent fileの直接編集、commit、push、
+publishは行わないでください。Apple Silicon搭載macOSでない場合、または必要な
+authoritative inputを確認できない場合は停止して不足境界を説明してください。
+```
 
 初回installはCodexから実行できます。すでに稼働中のブリッジを、Grokを使っているCodexセッションから停止・差し替えしないでください。詳細は [既存インストールの更新](#既存インストールの更新) を参照してください。
 
@@ -89,21 +87,21 @@ Grok / xAI
 
 | 対象 | 状態 |
 | --- | --- |
-| V1.0 分離型 `grok-bridge` プロファイル | 実装済み・Codex CLIで検証済み |
-| Rustネイティブビルドと可逆なユーザーサービス | 実装済み・検証済み |
-| V1.1 Native GPT/Grok統合モデルピッカー | 実装済み・CLIでの切替を検証済み。supportedなmessage/function/tool-search履歴の双方向切替をbridge境界で保持 |
+| V1.1 Native GPT/Grok統合モデルピッカー | 現行の主要経路。source実装済みで、supportedなmessage/function/tool-search履歴をbridge境界で双方向に保持 |
 | V1.1 Skillsメタデータ予算 | Grokカタログに272,000トークンを設定し、Codex標準の2%計算を使用 |
+| V1.0 分離型 `grok-bridge` プロファイル | 実験的な分離経路。source実装済み |
+| Rustネイティブビルドと可逆なユーザーサービス | Apple Silicon macOS向けに実装済み |
 | Desktopピッカーと最終rollback受け入れ | 最終検証待ち |
-| 公開リリースバイナリ | 提供しません。ソースからbuild・materializeしてください |
+| 公開リリースバイナリ | 未公開。ソースからbuild・materializeしてください |
 
-V1.0は保守的な公開ルートです。Codexの分離プロファイルを使い、Native GPT設定には触れません。V1.1はDesktopと最終rollbackの受け入れが完了していないため、現時点では実験的機能です。
+V1.1は、bridgeの主要なcatalog、projection、model切替、overlay機能を統合picker上で利用する現行の主要経路です。V1.0はNative GPT設定に触れない実験的な分離プロファイルとして残しています。Desktopピッカーと最終rollbackの受け入れは完了扱いせず、明示的に未完了としています。
 
 ## 主な機能
 
 - `store: false`を使う、Codex ResponsesからxAI Responsesへの許容的なprovider projection。replayableなmessage / function / tool-search履歴は転送し、完了済み Native `custom_tool_call` と foreign reasoning は Grok request から除外します。旧Chat Completions形式への変換は行いません。
 - text、reasoning summary、function call、terminal/usageをCodex向けに抽出するSSE処理。unknownな補助eventでstreamを終了させません。function / tool_search argument の integer-valued JSON number は JSON integer へ正規化します。有用なeventのあと`response.completed`なしでGrokが閉じた場合は、そのlifecycle markerだけを合成し、Codexが `stream closed before response.completed` としてターンを落とさないようにします。
 - 画像をダウンロード・再エンコードせず、順序付き関数呼び出し/結果とテキスト・画像混在入力を保持。
-- 公式Grokセッションcredentialをbridge側では読み取り専用で利用し、変更時はゼロ化対応メモリキャッシュを再読み込みします。provider request中の期限切れでは公式CLIのsilent refreshを一度だけboundedに起動し、明示`auth ensure`では再認証可能な状態を公式desktop OAuthへ委譲します。bridgeはrefresh tokenを扱わず、OAuthを実装せず、credential fileを書き換えません。
+- 公式Grokセッションcredentialをbridge側では読み取り専用で利用し、boundedな復旧は公式Grok CLIへ委譲します。詳細は [モデルカタログと認証情報](#モデルカタログと認証情報) を参照してください。
 - rustlsで公式xAI接続先に固定し、リダイレクトを禁止。認証、レート制限、HTTP状態、stream障害を型付きで処理。
 - Grokモデルをカタログで許可し、メタデータだけのlast-known-good状態をatomicに保存。
 - ループバック専用listenerとcapability保護されたroute。不正なcapabilityには `404` を返します。
@@ -120,27 +118,11 @@ V1.0は保守的な公開ルートです。Codexの分離プロファイルを�
 
 Intel Mac、Linux、Windows向けのビルド済み成果物は現在提供していません。
 
-## クイックスタート：V1.0分離プロファイル
+## クイックスタート：V1.1統合ピッカー
 
-リポジトリルートでネイティブ実行ファイルを一度生成し、リポジトリ付属ランチャーを実行します。
+主要なV1.1経路では、Native GPTと許可済みGrokモデルを同じCodexモデルピッカーで選べる統合カタログを公開します。Native GPTの `responses` と `responses/compact` は取得済みのCodex公式上流に固定します。`images/generations`、`images/edits`、`alpha/search` はNative専用の透過endpointであり、Grok protocol変換には入れません。Grok通信だけをブリッジ経由でxAIへ送ります。Grokには権威ある `responses/compact` 契約がないため、許可済みGrokモデルではこのrouteをfail closedにします。
 
-```sh
-./scripts/materialize-macos.sh
-./scripts/grok-codex.sh
-```
-
-初回はブリッジをインストールし、必要に応じてユーザーサービスを起動して、分離された `grok-bridge` プロファイルでCodexを開きます。2回目以降は導入済みネイティブ実行ファイルを再利用します。引数はCodexへそのまま渡されます。
-
-```sh
-./scripts/grok-codex.sh --version
-./scripts/grok-codex.sh --activate-only
-```
-
-このランチャーはリポジトリ内での利用を前提とします。shell scriptだけを移動またはsymlinkして使う方法は、配布方式としてサポートしていません。
-
-## 実験的V1.1統合ピッカー
-
-V1.1ではNative GPTと許可済みGrokモデルを同じCodexモデルピッカーで選べる統合カタログを公開します。Native GPTの `responses` と `responses/compact` は取得済みのCodex公式上流に固定します。`images/generations`、`images/edits`、`alpha/search` はNative専用の透過endpointであり、Grok protocol変換には入れません。Grok通信だけをブリッジ経由でxAIへ送ります。Grokには権威ある `responses/compact` 契約がないため、許可済みGrokモデルではこのrouteをfail closedにします。
+NativeとGrokのmodel slugは一意でなければなりません。catalog生成時とruntime routing時のどちらでも重複slugはfail closedし、Native行の上書きやalias生成は行いません。
 
 最初にネイティブブリッジを生成してインストールします。
 
@@ -182,26 +164,28 @@ V1.1ピッカー有効化後のCodex Desktopです。Native GPTと許可済みGr
 
 サブエージェントの起動はCodexが所有します。bridgeはprovider protocolを変換するだけで、workerを起動しません。
 
-V1.1統合ピッカーのliveセッションで確認済みです。
-
 - Grok親から公式Codexサブエージェント（`spawn_agent` / `wait_agent` / `close_agent`）を起動できる。
 - spawn時に `model` または `reasoning_effort` を省略すると、Codex設定の `[agents].default_subagent_model` と `[agents].default_subagent_reasoning_effort` が使われる。親のGrokモデルや推論深度にはならない。
 - 子をGrokで動かすには、`model` を許可済みカタログID（`grok-4.6` や `grok-4.5`）へ明示する。
-- 推論深度も `reasoning_effort` を明示する。現行のGrokカタログは `low` / `medium` / `high` / `xhigh` を公開する。`grok-4.5` の `xhigh` まで確認済み。
+- 推論深度も `reasoning_effort` を明示する。現行のGrokカタログは `low` / `medium` / `high` / `xhigh` を公開する。
 
-### 現在確認されているresume制限
+## 実験的V1.0分離プロファイル
 
-Grokを選択した状態で終了したセッションを直接resumeすると、次の警告が出る場合があります。
-
-```text
-MCP startup interrupted. The following servers were not initialized: codex_apps
-```
-
-現在の証拠では、ブリッジ通信や `codex_apps` handshakeではなく、Codex TUIのresume/MCP起動境界で発生しています。Codex側の挙動が解消されるまでは、Native GPTモデルを明示してresumeし、起動後にGrokへ切り替えてください。
+V1.0ランチャーはGrokをCodexの分離プロファイルに閉じ込める実験的な経路として残しています。リポジトリルートでネイティブ実行ファイルを一度生成し、リポジトリ付属ランチャーを実行します。
 
 ```sh
-codex resume <SESSION_ID> -m <NATIVE_GPT_MODEL>
+./scripts/materialize-macos.sh
+./scripts/grok-codex.sh
 ```
+
+初回はブリッジをインストールし、必要に応じてユーザーサービスを起動して、分離された `grok-bridge` プロファイルでCodexを開きます。2回目以降は導入済みネイティブ実行ファイルを再利用します。引数はCodexへそのまま渡されます。
+
+```sh
+./scripts/grok-codex.sh --version
+./scripts/grok-codex.sh --activate-only
+```
+
+このランチャーはリポジトリ内での利用を前提とします。shell scriptだけを移動またはsymlinkして使う方法は、配布方式としてサポートしていません。
 
 ## ライフサイクルとrollback
 
@@ -211,7 +195,7 @@ codex resume <SESSION_ID> -m <NATIVE_GPT_MODEL>
 
 生成と導入済みバイナリの差し替えは、このブリッジを使っていないセッションから実行してください。この手順の想定オペレーターはGrok Buildです。Native GPTモデルのCodexセッションからでも実行できます。
 
-新しい実行ファイルを生成したあとは、repo所有の差し替えスクリプトで導入済みbinaryを置換してください。このスクリプトはサービスを停止し、導入済みbinaryを入れ替え、サービスを再起動して `doctor` を実行します。
+新しい実行ファイルを生成したあとは、repo所有の差し替えスクリプトで導入済みbinaryを置換してください。service停止前に`auth ensure`を実行し、まずsilent refreshを試し、対話的な復旧がなお必要な場合だけ公式OAuth browserを開きます。その後に導入済みbinaryを入れ替え、serviceを再起動して`doctor`を実行します。置換または再起動に失敗した場合は、以前のbinaryとservice状態の復元を試みます。
 
 ```sh
 ./scripts/materialize-macos.sh
@@ -270,7 +254,7 @@ browser確認は、公式CLIが開いた`auth.x.ai`の公式ページだけで�
 ./dist/aarch64-apple-darwin/grok-codex-bridge service status
 ```
 
-`catalog refresh` は期限切れcredentialの復旧経路とは別物です。現在利用できるcredentialが必要で、更新helperは起動せず、last-known-goodのmodel catalogだけを更新します。checked-in configは絶対pathがplaceholderのtemplateなので、そのまま実行できません。未追跡のlocal configへコピーし、placeholderを実際の絶対pathへ置き換えてから実行します。
+`catalog refresh` はすべての自動credential復旧とは別物です。現在利用できるcredentialが必要で、silent-refresh helperも対話loginも起動せず、last-known-goodのmodel catalogだけを更新します。checked-in configは絶対pathがplaceholderのtemplateなので、そのまま実行できません。未追跡のlocal configへコピーし、placeholderを実際の絶対pathへ置き換えてから実行します。
 
 ```sh
 cp ./docs/bridge-config.example.toml ./bridge-config.local.toml
