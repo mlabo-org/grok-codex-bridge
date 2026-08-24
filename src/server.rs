@@ -662,19 +662,8 @@ fn native_request_body(
         return Ok(original);
     }
     let mut request: Value = serde_json::from_slice(decoded).map_err(|_| ())?;
-    let removed_prompt_cache_retention = request
-        .as_object_mut()
-        .and_then(|request| request.remove("prompt_cache_retention"))
-        .is_some();
-    let removed_previous_response_id = request
-        .as_object_mut()
-        .and_then(|request| request.remove("previous_response_id"))
-        .is_some();
     let sanitized_unreplayable_history = sanitize_unreplayable_history_for_native(&mut request);
-    if !removed_prompt_cache_retention
-        && !removed_previous_response_id
-        && !sanitized_unreplayable_history
-    {
+    if !sanitized_unreplayable_history {
         return Ok(original);
     }
     let serialized = serde_json::to_vec(&request).map_err(|_| ())?;
@@ -1527,7 +1516,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_route_removes_stateless_transport_fields() {
+    async fn native_route_preserves_codex_transport_state() {
         let temporary = tempfile::tempdir().unwrap();
         let (client, mock, task) = start_native_mock().await;
         let route = NativeRouteState::new(
@@ -1565,8 +1554,11 @@ mod tests {
         assert_eq!(headers["authorization"], "Bearer native-caller-secret");
         let decoded = zstd::stream::decode_all(Cursor::new(upstream_body)).unwrap();
         let upstream: Value = serde_json::from_slice(&decoded).unwrap();
-        assert_eq!(upstream.get("prompt_cache_retention"), None);
-        assert_eq!(upstream.get("previous_response_id"), None);
+        assert_eq!(upstream["prompt_cache_retention"], "24h");
+        assert_eq!(
+            upstream["previous_response_id"],
+            "resp_grok_store_false"
+        );
         assert_eq!(
             upstream["prompt_cache_key"],
             "11111111-1111-4111-8111-111111111111"
