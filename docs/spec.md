@@ -76,9 +76,9 @@ Native compatibility catalogでは、Grok slugを非選択の `visibility = "hid
 
 ## 7. Responsesとtool境界
 
-bridgeは `POST /v1/responses` と、Native補助APIの必要なResponses経路をloopbackで提供する。Grok requestではvalidなtext、画像、function call/output、tool call ID、`call_id`、必要なtool schemaを保持する。provider固有で再利用不能なforeign artifactだけをitem単位で除外する。
+bridgeは `POST /v1/responses` と、Native補助APIの必要なResponses経路をloopbackで提供する。Grok requestではvalidなtext、画像、function call/output、tool call ID、`call_id`、必要なtool schemaを保持する。provider固有で再利用不能なforeign artifactだけをitem単位で除外する。Codex履歴で完了済みparallel tool batchの途中にassistant messageがある場合は、message本文、call順、output順、`call_id`を保持したままxAI projection内だけでそのmessageをbatch直前へ移動し、Codexの保存履歴は変更しない。
 
-Codex側へはResponses-compatible SSEを返す。text、reasoning summary、function call、terminal/usageを投影する。unknown補助eventでstream全体を捨てず、終了markerが欠けた場合もoutput itemを捏造せず、必要な `response.completed` だけを合成する。
+Codex側へはResponses-compatible SSEを返す。text、reasoning summary、function call、terminal/usageを投影する。downstreamへresponse内容を確定する前に限り、upstream transport確立またはbody streamのtransport failureを最大3回再試行する。一度でも有用なresponse内容を送信した後はrequestを再実行しない。unknown補助eventでstream全体を捨てず、終了markerが欠けた場合もoutput itemを捏造せず、必要な `response.completed` だけを合成する。
 
 Native routeではxAI headerを送らず、caller capability headerもNative upstreamへ転送しない。画像生成、画像編集、search等のNative-owned requestはGrok catalogへ誤分類しない。
 

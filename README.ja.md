@@ -99,7 +99,7 @@ grok-codex-bridge（Rust製ネイティブ実行ファイル）
 Grok / xAI
 ```
 
-ブリッジ自身はツールを実行しません。validな関数定義、順序付きツール呼び出しと結果、テキスト、画像URLとdata URI、reasoning summary、必要なResponses制御値を保持し、実行責任はCodexに残します。xAIがrequest全体を拒否するfunction schemaはGrokへの投影からのみ省略し、Codex側のcatalog、tool_search履歴、Native GPT経路は元のtoolを保持します。function / tool_search argument 内の integer-valued JSON number（例: `8.0`）は JSON integer へ直し、実際の小数は変更しません。Grokへ転送するのは replayable な message / function / tool-search 履歴であり、完了済み Native `custom_tool_call` と foreign reasoning は除外します。GPT/Grok切替時はproviderで再生できないitem IDとreasoning stateだけを除外し、tool call/outputを結ぶ`call_id`を保持します。Grokが有用なCodex向けeventのあとterminal markerなしで接続を閉じた場合、bridgeは出力itemを捏造せず、Codexが要求する`response.completed`だけを合成します。`response.failed`または`response.incomplete`を既に受け取っている場合は合成しません。
+ブリッジ自身はツールを実行しません。validな関数定義、順序付きツール呼び出しと結果、テキスト、画像URLとdata URI、reasoning summary、必要なResponses制御値を保持し、実行責任はCodexに残します。xAIがrequest全体を拒否するfunction schemaはGrokへの投影からのみ省略し、Codex側のcatalog、tool_search履歴、Native GPT経路は元のtoolを保持します。function / tool_search argument 内の integer-valued JSON number（例: `8.0`）は JSON integer へ直し、実際の小数は変更しません。Grokへ転送するのは replayable な message / function / tool-search 履歴であり、完了済み Native `custom_tool_call` と foreign reasoning は除外します。Codexが完了済みparallel tool batchの途中へassistant commentaryを記録した場合、xAI向け投影ではcommentary本文、call順、result順、すべての`call_id`を保持したままcommentaryをbatch直前へ移動し、Codexの保存履歴自体は書き換えません。GPT/Grok切替時はproviderで再生できないitem IDとreasoning stateだけを除外し、tool call/outputを結ぶ`call_id`を保持します。response内容をdownstreamへ確定する前に限り、接続確立またはbody streamのtransport failureを最大3回再試行します。有用な内容を送信した後はrequestを再実行しません。Grokが有用なCodex向けeventのあとterminal markerなしで接続を閉じた場合、bridgeは出力itemを捏造せず、Codexが要求する`response.completed`だけを合成します。`response.failed`または`response.incomplete`を既に受け取っている場合は合成しません。
 
 ## 現在の状態
 
@@ -116,7 +116,7 @@ Grok / xAI
 ## 主な機能
 
 - `store: false`を使う、Codex ResponsesからxAI Responsesへの許容的なprovider projection。replayableなmessage / function / tool-search履歴は転送し、完了済み Native `custom_tool_call` と foreign reasoning は Grok request から除外します。旧Chat Completions形式への変換は行いません。
-- text、reasoning summary、function call、terminal/usageをCodex向けに抽出するSSE処理。unknownな補助eventでstreamを終了させません。function / tool_search argument の integer-valued JSON number は JSON integer へ正規化します。有用なeventのあと`response.completed`なしでGrokが閉じた場合は、そのlifecycle markerだけを合成し、Codexが `stream closed before response.completed` としてターンを落とさないようにします。
+- text、reasoning summary、function call、terminal/usageをCodex向けに抽出するSSE処理。unknownな補助eventでstreamを終了させません。downstreamへresponse内容を確定する前に限り、接続確立と初期body streamのtransport failureを最大3回再試行します。function / tool_search argument の integer-valued JSON number は JSON integer へ正規化します。有用なeventのあと`response.completed`なしでGrokが閉じた場合は、そのlifecycle markerだけを合成し、Codexが `stream closed before response.completed` としてターンを落とさないようにします。
 - 画像をダウンロード・再エンコードせず、順序付き関数呼び出し/結果とテキスト・画像混在入力を保持。
 - 公式Grokセッションcredentialをbridge側では読み取り専用で利用し、boundedな復旧は公式Grok CLIへ委譲します。詳細は [モデルカタログと認証情報](#モデルカタログと認証情報) を参照してください。
 - rustlsで公式xAI接続先に固定し、リダイレクトを禁止。認証、レート制限、HTTP状態、stream障害を型付きで処理。

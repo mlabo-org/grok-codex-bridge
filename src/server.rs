@@ -10,7 +10,7 @@ use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use futures_util::StreamExt;
+use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -24,12 +24,16 @@ use crate::lifecycle::PICKER_CALLER_HEADER;
 use crate::native::{
     NativeApiPath, NativeClient, NativeError, NativeRouteState, is_hop_by_hop_response_header,
 };
-use crate::protocol::{NormalizedResponsesRequest, sanitize_unreplayable_history_for_native};
+use crate::protocol::{
+    NormalizedResponsesRequest, TextStreamEventKind, ValidatedTextStreamEvent,
+    sanitize_unreplayable_history_for_native,
+};
 
 const MAX_RESPONSES_BODY_BYTES: usize = 16 * 1024 * 1024;
 const DISABLE_ENVIRONMENT_VARIABLE: &str = "GROK_CODEX_BRIDGE_DISABLE";
 const X_GROK_UPSTREAM_STATUS: &str = "x-grok-upstream-status";
 const CREDENTIAL_RENEWAL_GRACE: Duration = Duration::from_secs(60);
+const EARLY_STREAM_RETRY_LIMIT: usize = 3;
 
 #[derive(Clone)]
 struct ServiceState {
@@ -603,47 +607,117 @@ async fn route_authorized_responses(
         }
     };
 
-    let upstream = match service
-        .client
-        .post_responses(
-            credential,
-            ResponsesTransportRequest {
-                body: &normalized,
-                conversation_id: routing.conversation_id(),
-                request_id: routing.request_id(),
-                agent_id: routing.agent_id(),
-                turn_index: routing.turn_index(),
-            },
-        )
-        .await
-    {
-        Ok(stream) => stream,
-        Err(error) => return upstream_error(error),
+    let mut early_retries = 0;
+    let (prelude, upstream) = 'attempt: loop {
+        let upstream = match service
+            .client
+            .post_responses(
+                Arc::clone(&credential),
+                ResponsesTransportRequest {
+                    body: &normalized,
+                    conversation_id: routing.conversation_id(),
+                    request_id: routing.request_id(),
+                    agent_id: routing.agent_id(),
+                    turn_index: routing.turn_index(),
+                },
+            )
+            .await
+        {
+            Ok(stream) => stream,
+            Err(GrokError::Transport(_)) if early_retries < EARLY_STREAM_RETRY_LIMIT => {
+                early_retries += 1;
+                log_early_stream_retry(early_retries);
+                continue 'attempt;
+            }
+            Err(error) => return upstream_error(error),
+        };
+        let mut upstream = upstream.validated_text_events();
+        let mut prelude = Vec::new();
+        loop {
+            match upstream.next().await {
+                Some(Ok(event)) => {
+                    let commits_downstream = event_commits_downstream(&event);
+                    prelude.push(event);
+                    if commits_downstream {
+                        break 'attempt (prelude, upstream);
+                    }
+                }
+                Some(Err(error))
+                    if matches!(error, GrokError::Stream(_))
+                        && early_retries < EARLY_STREAM_RETRY_LIMIT =>
+                {
+                    early_retries += 1;
+                    log_early_stream_retry(early_retries);
+                    continue 'attempt;
+                }
+                Some(Err(error)) => return upstream_error(error),
+                None => {
+                    return route_error(
+                        StatusCode::BAD_GATEWAY,
+                        "upstream_stream_empty",
+                        "server_error",
+                        "upstream_stream_ended",
+                        "Grok upstream ended before producing a response",
+                    );
+                }
+            }
+        }
     };
 
     tracing::debug!(route = "responses", status = 200_u16, "request accepted");
-    let stream = upstream.validated_text_events().map(|result| match result {
-        Ok(event) => {
-            let original = event.into_codex_value();
-            let event_type = original
-                .get("type")
-                .and_then(Value::as_str)
-                .expect("validated Responses events have a known type");
-            Ok::<Bytes, io::Error>(Bytes::from(format!(
-                "event: {event_type}\ndata: {original}\n\n"
-            )))
-        }
-        Err(error) => {
-            log_stream_error(&error);
-            Err(io::Error::other("validated upstream stream terminated"))
-        }
-    });
+    let stream = stream::iter(prelude.into_iter().map(Ok))
+        .chain(upstream)
+        .map(|result| match result {
+            Ok(event) => {
+                let original = event.into_codex_value();
+                let event_type = original
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .expect("validated Responses events have a known type");
+                Ok::<Bytes, io::Error>(Bytes::from(format!(
+                    "event: {event_type}\ndata: {original}\n\n"
+                )))
+            }
+            Err(error) => {
+                log_stream_error(&error);
+                Err(io::Error::other("validated upstream stream terminated"))
+            }
+        });
     let mut response = Body::from_stream(stream).into_response();
     response.headers_mut().insert(
         CONTENT_TYPE,
         HeaderValue::from_static("text/event-stream; charset=utf-8"),
     );
     response
+}
+
+fn log_early_stream_retry(retry: usize) {
+    tracing::warn!(
+        route = "responses",
+        error_class = "upstream_stream_transport",
+        retry,
+        "retrying upstream stream before downstream output"
+    );
+}
+
+fn event_commits_downstream(event: &ValidatedTextStreamEvent) -> bool {
+    matches!(
+        event.kind(),
+        TextStreamEventKind::OutputTextDelta { .. }
+            | TextStreamEventKind::OutputTextDone { .. }
+            | TextStreamEventKind::OutputItemDone { .. }
+            | TextStreamEventKind::FunctionCallArgumentsDelta { .. }
+            | TextStreamEventKind::FunctionCallArgumentsDone { .. }
+            | TextStreamEventKind::FunctionCallItemDone { .. }
+            | TextStreamEventKind::ReasoningSummaryTextDelta { .. }
+            | TextStreamEventKind::ReasoningSummaryTextDone { .. }
+            | TextStreamEventKind::ReasoningTextDelta { .. }
+            | TextStreamEventKind::ReasoningTextDone { .. }
+            | TextStreamEventKind::ReasoningItemDone { .. }
+            | TextStreamEventKind::ResponseFailed { .. }
+            | TextStreamEventKind::ResponseIncomplete { .. }
+            | TextStreamEventKind::ResponseCompleted { .. }
+    )
 }
 
 async fn native_response(
@@ -1165,6 +1239,7 @@ mod tests {
     enum MockReply {
         Valid,
         Reasoning,
+        EarlyTransportFailuresThenValid,
         Unauthorized,
         RateLimited,
         Unavailable,
@@ -1183,11 +1258,32 @@ mod tests {
         headers: HeaderMap,
         Json(body): Json<Value>,
     ) -> Response {
-        state.hits.fetch_add(1, Ordering::SeqCst);
+        let hit = state.hits.fetch_add(1, Ordering::SeqCst);
         state.observed.lock().unwrap().push((headers, body));
         match state.reply {
             MockReply::Valid => sse_response(valid_text_events()),
             MockReply::Reasoning => sse_response(valid_reasoning_events()),
+            MockReply::EarlyTransportFailuresThenValid if hit < EARLY_STREAM_RETRY_LIMIT => {
+                let created = format!(
+                    "data: {}\n\n",
+                    json!({
+                        "type": "response.created",
+                        "sequence_number": 0,
+                        "response": {"id": "resp_interrupted", "output": []}
+                    })
+                );
+                let chunks = stream::iter([
+                    Ok::<Bytes, io::Error>(Bytes::from(created)),
+                    Err(io::Error::other("simulated upstream body disconnect")),
+                ]);
+                let mut response = Body::from_stream(chunks).into_response();
+                response.headers_mut().insert(
+                    CONTENT_TYPE,
+                    HeaderValue::from_static("text/event-stream; charset=utf-8"),
+                );
+                response
+            }
+            MockReply::EarlyTransportFailuresThenValid => sse_response(valid_text_events()),
             MockReply::Unauthorized => StatusCode::UNAUTHORIZED.into_response(),
             MockReply::RateLimited => (
                 StatusCode::TOO_MANY_REQUESTS,
@@ -2506,6 +2602,30 @@ mod tests {
             assert!(chunk.is_ok());
         }
         assert_eq!(mock.hits.load(Ordering::SeqCst), 1);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn early_transport_disconnects_are_retried_before_downstream_output() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (client, mock, task) = start_mock(MockReply::EarlyTransportFailuresThenValid).await;
+        let app = test_app(
+            runtime_config(temporary.path()),
+            ModelCatalog::bootstrap().unwrap(),
+            CredentialStore::new(write_auth(temporary.path())).unwrap(),
+            client,
+        );
+
+        let response = send(app, TOKEN, request_body("grok-4.6").to_string()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(!body.contains("resp_interrupted"));
+        assert!(body.contains("event: response.completed"));
+        assert_eq!(
+            mock.hits.load(Ordering::SeqCst),
+            EARLY_STREAM_RETRY_LIMIT + 1
+        );
         task.abort();
     }
 

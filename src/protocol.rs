@@ -412,12 +412,7 @@ impl NormalizedResponsesRequest {
         }
         object.insert(
             "input".into(),
-            Value::Array(
-                self.input
-                    .iter()
-                    .filter_map(InputItem::to_grok_value)
-                    .collect(),
-            ),
+            Value::Array(project_input_for_xai(&self.input)),
         );
         let projected_tools = project_tools_for_xai(&self.tools);
         if let Some(tools) = projected_tools {
@@ -460,6 +455,67 @@ impl NormalizedResponsesRequest {
     pub fn into_xai_value(self) -> Value {
         self.to_xai_value()
     }
+}
+
+fn project_input_for_xai(input: &[InputItem]) -> Vec<Value> {
+    let completed_call_ids = input
+        .iter()
+        .filter_map(|item| match item {
+            InputItem::FunctionCallOutput(output) => Some(output.call_id.as_str()),
+            InputItem::ToolSearchOutput(output) => Some(output.call_id.as_str()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let mut open_call_ids = HashSet::new();
+    let mut open_batch_start = None;
+    let mut projected = Vec::with_capacity(input.len());
+
+    for item in input {
+        match item {
+            InputItem::FunctionCall(call) if completed_call_ids.contains(call.call_id.as_str()) => {
+                open_batch_start.get_or_insert(projected.len());
+                open_call_ids.insert(call.call_id.as_str());
+            }
+            InputItem::ToolSearchCall(call)
+                if completed_call_ids.contains(call.call_id.as_str()) =>
+            {
+                open_batch_start.get_or_insert(projected.len());
+                open_call_ids.insert(call.call_id.as_str());
+            }
+            InputItem::Message(TextMessage {
+                role: MessageRole::Assistant,
+                ..
+            }) if !open_call_ids.is_empty() => {
+                if let Some(value) = item.to_grok_value() {
+                    let insertion_index = open_batch_start
+                        .expect("an open call batch always records its projected start");
+                    projected.insert(insertion_index, value);
+                    open_batch_start = Some(insertion_index + 1);
+                }
+                continue;
+            }
+            _ => {}
+        }
+
+        if let Some(value) = item.to_grok_value() {
+            projected.push(value);
+        }
+
+        match item {
+            InputItem::FunctionCallOutput(output) => {
+                open_call_ids.remove(output.call_id.as_str());
+            }
+            InputItem::ToolSearchOutput(output) => {
+                open_call_ids.remove(output.call_id.as_str());
+            }
+            _ => {}
+        }
+        if open_call_ids.is_empty() {
+            open_batch_start = None;
+        }
+    }
+
+    projected
 }
 
 impl TryFrom<Value> for NormalizedResponsesRequest {
@@ -4268,6 +4324,65 @@ mod tests {
         specific["input"][2].as_object_mut().unwrap().remove("id");
         specific["input"][3].as_object_mut().unwrap().remove("id");
         assert_eq!(normalized.into_xai_value(), specific);
+    }
+
+    #[test]
+    fn xai_projection_moves_interleaved_assistant_message_before_parallel_tool_batch() {
+        let mut request = function_request_fixture();
+        request["input"] = json!([
+            {
+                "type": "function_call",
+                "name": "read_file",
+                "call_id": "call-1",
+                "arguments": "{\"path\":\"README.md\"}"
+            },
+            {
+                "type": "function_call",
+                "name": "search",
+                "call_id": "call-2",
+                "arguments": "{\"query\":\"bridge\"}"
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Checking the active runtime."}]
+            },
+            {
+                "type": "function_call",
+                "name": "read_file",
+                "call_id": "call-3",
+                "arguments": "{\"path\":\"src/protocol.rs\"}"
+            },
+            {"type": "function_call_output", "call_id": "call-1", "output": "one"},
+            {"type": "function_call_output", "call_id": "call-2", "output": "two"},
+            {"type": "function_call_output", "call_id": "call-3", "output": "three"}
+        ]);
+
+        let normalized = NormalizedResponsesRequest::parse(request).unwrap();
+        let projected = normalized.to_xai_value();
+        let input = projected["input"].as_array().unwrap();
+        assert_eq!(
+            input
+                .iter()
+                .map(|item| item["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                "message",
+                "function_call",
+                "function_call",
+                "function_call",
+                "function_call_output",
+                "function_call_output",
+                "function_call_output"
+            ]
+        );
+        assert_eq!(input[0]["content"], "Checking the active runtime.");
+        assert_eq!(input[1]["call_id"], "call-1");
+        assert_eq!(input[2]["call_id"], "call-2");
+        assert_eq!(input[3]["call_id"], "call-3");
+        assert_eq!(input[4]["call_id"], "call-1");
+        assert_eq!(input[5]["call_id"], "call-2");
+        assert_eq!(input[6]["call_id"], "call-3");
     }
 
     #[test]
