@@ -920,12 +920,13 @@ impl PriorReasoning {
 /// request is forwarded to Native GPT.
 ///
 /// Bridge-enveloped or explicitly null reasoning identifies Grok history. In
-/// that case the complete reasoning family and provider-owned item IDs are not
-/// portable to the Native Responses store, while function `call_id` values are
-/// retained so Codex can preserve tool call/output pairs. Native tool-search
-/// IDs are only replayable with Codex's `tsc_` prefix, so malformed or foreign
-/// IDs are removed even when older history lacks reasoning provenance.
-/// Native-only GPT sessions otherwise remain byte-for-byte intact.
+/// that case the complete reasoning family, hosted web-search execution items,
+/// and provider-owned item IDs are not portable to the Native Responses store,
+/// while function `call_id` values are retained so Codex can preserve tool
+/// call/output pairs. Native tool-search IDs are only replayable with Codex's
+/// `tsc_` prefix, so malformed or foreign IDs are removed even when older
+/// history lacks reasoning provenance. Native-only GPT sessions otherwise
+/// remain byte-for-byte intact.
 pub fn sanitize_unreplayable_history_for_native(request: &mut Value) -> bool {
     let Some(object) = request.as_object_mut() else {
         return false;
@@ -953,10 +954,12 @@ pub fn sanitize_unreplayable_history_for_native(request: &mut Value) -> bool {
     if contains_grok_reasoning {
         let original_len = input.len();
         input.retain(|item| {
-            item.as_object()
-                .and_then(|item| item.get("type"))
-                .and_then(Value::as_str)
-                != Some("reasoning")
+            !matches!(
+                item.as_object()
+                    .and_then(|item| item.get("type"))
+                    .and_then(Value::as_str),
+                Some("reasoning" | "web_search_call")
+            )
         });
         changed = input.len() != original_len;
     }
@@ -3863,6 +3866,18 @@ mod tests {
     fn model_switch_mixed_provider_native_replay_drops_ids_and_keeps_tool_pairs() {
         let mut mixed = two_turn_reasoning_request();
         mixed["input"].as_array_mut().unwrap().push(json!({
+            "type": "web_search_call",
+            "id": "ws_6d6b35ac-854c-9217-a0ee-c99414e4d2f4_call-b842c3f7-3424-43fd-814e-d8a5c0f15c2f-3",
+            "status": "completed",
+            "action": {
+                "type": "search",
+                "query": "site:developers.openai.com Advanced Account Security Codex"
+            },
+            "internal_chat_message_metadata_passthrough": {
+                "turn_id": "11111111-1111-4111-8111-111111111111"
+            }
+        }));
+        mixed["input"].as_array_mut().unwrap().push(json!({
             "type": "tool_search_call", "id": "msg_foreign_tool_search",
             "call_id": "search-1", "execution": "client",
             "arguments": {"limit": 8, "query": "generate_image_grid"}
@@ -3876,6 +3891,11 @@ mod tests {
         assert!(sanitize_unreplayable_history_for_native(&mut mixed));
         let input = mixed["input"].as_array().unwrap();
         assert!(input.iter().all(|item| item["type"] != "reasoning"));
+        assert!(
+            input
+                .iter()
+                .all(|item| item["type"] != "web_search_call")
+        );
         assert!(
             input
                 .iter()
