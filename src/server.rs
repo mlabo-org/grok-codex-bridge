@@ -1795,6 +1795,18 @@ mod tests {
                 "call_id": "call-1", "output": "pong"
             },
             {
+                "type": "web_search_call",
+                "id": "ws_6d6b35ac-854c-9217-a0ee-c99414e4d2f4_call-b842c3f7-3424-43fd-814e-d8a5c0f15c2f-3",
+                "status": "completed",
+                "action": {
+                    "type": "search",
+                    "query": "site:developers.openai.com Advanced Account Security Codex"
+                },
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": "11111111-1111-4111-8111-111111111111"
+                }
+            },
+            {
                 "type": "tool_search_call",
                 "id": "msg_e2a2848a-4ab3-9328-a1b4-c2318babb894",
                 "call_id": "search-1", "execution": "client",
@@ -1825,6 +1837,11 @@ mod tests {
         let upstream: Value = serde_json::from_slice(&decoded).unwrap();
         let input = upstream["input"].as_array().unwrap();
         assert!(input.iter().all(|item| item["type"] != "reasoning"));
+        assert!(
+            input
+                .iter()
+                .all(|item| item["type"] != "web_search_call")
+        );
         assert!(
             input
                 .iter()

@@ -76,7 +76,7 @@ Native compatibility catalogでは、Grok slugを非選択の `visibility = "hid
 
 ## 7. Responsesとtool境界
 
-bridgeは `POST /v1/responses` と、Native補助APIの必要なResponses経路をloopbackで提供する。Grok requestではvalidなtext、画像、function call/output、tool call ID、`call_id`、必要なtool schemaを保持する。provider固有で再利用不能なforeign artifactだけをitem単位で除外し、非objectなど構造不正なinput itemは削除せず`invalid_request_error`で拒否する。Codex履歴で完了済みparallel tool batchの途中にassistant messageがある場合は、message本文、call順、output順、`call_id`を保持したままxAI projection内だけでそのmessageをbatch直前へ移動し、Codexの保存履歴は変更しない。
+bridgeは `POST /v1/responses` と、Native補助APIの必要なResponses経路をloopbackで提供する。Grok requestではvalidなtext、画像、function call/output、tool call ID、`call_id`、必要なtool schemaを保持する。provider固有で再利用不能なforeign artifactだけをitem単位で除外し、非objectなど構造不正なinput itemは削除せず`invalid_request_error`で拒否する。GrokからNativeへ戻す混在履歴では、Grok reasoningと、それに付随するprovider固有の`web_search_call`実行記録をNative upstreamへ送らず、tool call/outputを結ぶ`call_id`は保持する。Codex履歴で完了済みparallel tool batchの途中にassistant messageがある場合は、message本文、call順、output順、`call_id`を保持したままxAI projection内だけでそのmessageをbatch直前へ移動し、Codexの保存履歴は変更しない。
 
 Codex側へはResponses-compatible SSEを返す。text、reasoning summary、function call、terminal/usageを投影する。既知eventはそのevent種別に必要なresponse ID、item ID、payloadを検証し、欠損を空文字やindex既定値で有効化しない。unknown補助eventは内容を捏造せずpassthroughする。downstreamへresponse内容を確定する前に限り、upstream transport確立またはbody streamのtransport failureを最大3回再試行する。一度でも有用なresponse内容を送信した後はrequestを再実行しない。終了markerが欠けた場合もoutput itemを捏造せず、必要な `response.completed` だけを合成する。
 
