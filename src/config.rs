@@ -59,7 +59,11 @@ impl RuntimeConfig {
         if file.version != CONFIG_VERSION {
             return Err(ConfigError::UnsupportedVersion(file.version));
         }
-        if !file.server.bind.ip().is_loopback() {
+        if !matches!(
+            file.server.bind.ip(),
+            std::net::IpAddr::V4(address) if address == std::net::Ipv4Addr::LOCALHOST
+        ) && file.server.bind.ip() != std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+        {
             return Err(ConfigError::NonLoopbackBind);
         }
         if file.server.bind.port() == 0 {
@@ -292,6 +296,24 @@ mod tests {
             RuntimeConfig::load(&config_path),
             Err(ConfigError::NonLoopbackBind)
         ));
+    }
+
+    #[test]
+    fn alternate_loopback_bind_is_rejected() {
+        let (_temporary, config_path) = write_config("127.0.0.2:4545", 0o600);
+        assert!(matches!(
+            RuntimeConfig::load(&config_path),
+            Err(ConfigError::NonLoopbackBind)
+        ));
+    }
+
+    #[test]
+    fn ipv6_localhost_bind_is_allowed() {
+        let (_temporary, config_path) = write_config("[::1]:4545", 0o600);
+        assert_eq!(
+            RuntimeConfig::load(&config_path).unwrap().bind(),
+            "[::1]:4545".parse().unwrap()
+        );
     }
 
     #[test]

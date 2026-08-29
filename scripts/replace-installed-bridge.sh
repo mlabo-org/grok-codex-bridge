@@ -2,7 +2,7 @@
 set -eu
 
 usage() {
-    printf '%s\n' "usage: $0 NEW_BINARY NEW_LAUNCHER_APP" >&2
+    printf '%s\n' "usage: $0 NEW_BINARY NEW_LAUNCHER_APP [--native-compatibility]" >&2
     exit 2
 }
 
@@ -33,7 +33,10 @@ wait_for_service_state() {
     return 1
 }
 
-if [ "$#" -ne 2 ]; then
+native_compatibility=0
+if [ "$#" -eq 3 ] && [ "$3" = "--native-compatibility" ]; then
+    native_compatibility=1
+elif [ "$#" -ne 2 ]; then
     usage
 fi
 
@@ -75,7 +78,9 @@ if [ ! -d "$installed_launcher" ] || [ -L "$installed_launcher" ]; then
 fi
 
 new_version=$("$new_binary" version)
-"$new_binary" auth ensure
+if [ "$native_compatibility" -eq 0 ]; then
+    "$new_binary" auth ensure
+fi
 service_state=$("$installed_binary" service status)
 if [ "$service_state" != "service loaded" ]; then
     fail "installed bridge service is not loaded: $service_state"

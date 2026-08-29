@@ -28,7 +28,7 @@
 - Codexからbridgeへのhandoffは、現在のCodex authoritative sourceと実runtimeで確認したprotocolだけを実装する。過去の会話、README、推測したOpenAI互換性をprotocol authorityにしない。
 - bridgeからGrokへのhandoffは、現在のxAI authoritative sourceまたは観測可能な公式client contractで確認したendpoint、headers、streaming semanticsだけを実装する。private endpoint探索、fingerprint偽装、未確認fallbackを追加しない。
 - credentialは選択されたauthoritative fileをin-placeかつread-onlyで検査する。Responses provider requestで選択recordのhard expiry、missing、incompleteを検出した場合は、公式`bin/grok models`をstdin/stdout/stderr切断・7秒timeoutで一度だけ起動し、authoritative fileを最大60秒read-only再読込してよい。明示`auth ensure`も同じ非対話更新を先に試し、それでもmissing、incomplete、expiredなら公式`bin/grok login --oauth`をstdin/stdout/stderr切断で一度起動し、最大5分だけbrowser完了を待ってread-only再検査する。malformed、ambiguous、unsafeなcredentialではloginを起動せずfail closedする。`auth status`、`doctor`、`catalog refresh`は再認証triggerを起動しない。
-- source runtime交換ではservice停止前にnew Rust binaryの`auth ensure`を実行する。bridgeはcredential fileを直接書き換えず、repo、Codex config、log、SQLite、cache、environment dumpへ複製しない。
+- source runtime交換では、Grok modeを公開または維持する場合だけservice停止前にnew Rust binaryの`auth ensure`を実行する。`mode native`または`switch --native-compatibility`が所有するNative退避交換はGrok credentialをread、refresh、loginせず、pair検証、service収束、失敗時rollbackは通常交換と同じ経路で完了する。bridgeはcredential fileを直接書き換えず、repo、Codex config、log、SQLite、cache、environment dumpへ複製しない。
 - Grok modeはNativeとGrokのpicker rowを公開し、model slugによりNative OpenAIとGrok upstreamを分離する。Native modeはGrok rowを新規選択不能にするが、provider/resolver/compatibility metadataを保持し、保存済みGrok taskをNative OpenAIで継続可能にする。
 - mode切替は保存済みtaskのprovider/model、SQLite、rolloutを変換または書換しない。Native modeはuninstallではなく可逆的なcompatibility modeであり、Grokへ戻すときは`mode grok`を使用する。
 

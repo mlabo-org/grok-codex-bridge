@@ -53,7 +53,7 @@ source checkout
 
 `grok-codex-bridge install`は、materialized Rust binary、launcher app、runtime config、bootstrap catalog、caller capability、manifestをinstall rootへ原子的に配置し、Codexのisolated `grok-bridge.config.toml`とLaunchAgentを可逆的に用意する。既存のprofileとLaunchAgentは非上書きbackupへ保存する。
 
-source更新は通常の環境切り替えとは別の明示操作である。更新時は新しいRust binaryとSwift launcherを検証し、serviceを停止してから原子的に交換し、serviceが `loaded` へ収束したことを確認する。失敗時は旧binary、旧launcher、service状態を復元する。
+source更新は通常の環境切り替えとは別の明示操作である。更新時は新しいRust binaryとSwift launcherを検証し、Desktop停止要求より前にserviceを停止して原子的に交換し、serviceが `loaded` へ収束したことを確認する。失敗時は旧binary、旧launcher、service状態を復元し、Desktop停止へ進まない。Grok modeを公開または維持する交換はservice停止前にnew binaryの`auth ensure`を完了する。Native compatibilityを明示した退避交換はGrok credentialをread、refresh、loginせず、pair検証とrollbackだけを同じ交換経路で行う。
 
 ## 5. 日常のNative/Grok環境切り替え
 
@@ -64,7 +64,7 @@ source更新は通常の環境切り替えとは別の明示操作である。�
 - Native modeからGrokを選択できてはならない。ただし既存taskの保存済みGrok参照を壊してはならない。
 - Grok modeへ戻すと、保存済みGrok taskはGrok routeへ戻り、Native taskはNative routeを維持する。
 
-切り替えはCodex Desktopを安全に終了し、約15〜20秒を目安に再起動する。launcherはDesktop終了後もRust coordinatorを待ち続ける。picker/service変更とChatGPT.appのrelaunch requestが成功した時点でcoordinatorは完了を記録し、遷移ログへ結果を残す。
+切り替えはCodex Desktopを安全に終了し、約15〜20秒を目安に再起動する。launcherはDesktop終了後もRust coordinatorを待ち続ける。picker mutationが成功し、ChatGPT.appのrelaunch requestも成功した時点でcoordinatorは完了を記録する。picker mutationが失敗した場合は所有するrollbackを完了し、entry時にDesktopが動いていたときは復元済み状態でrelaunchを一度試みたうえで失敗を返す。mutationとrelaunchの両方が失敗した場合は両方のfailureを遷移結果へ残す。
 
 ## 6. Merged pickerと保存task互換性
 
@@ -76,9 +76,9 @@ Native compatibility catalogでは、Grok slugを非選択の `visibility = "hid
 
 ## 7. Responsesとtool境界
 
-bridgeは `POST /v1/responses` と、Native補助APIの必要なResponses経路をloopbackで提供する。Grok requestではvalidなtext、画像、function call/output、tool call ID、`call_id`、必要なtool schemaを保持する。provider固有で再利用不能なforeign artifactだけをitem単位で除外する。Codex履歴で完了済みparallel tool batchの途中にassistant messageがある場合は、message本文、call順、output順、`call_id`を保持したままxAI projection内だけでそのmessageをbatch直前へ移動し、Codexの保存履歴は変更しない。
+bridgeは `POST /v1/responses` と、Native補助APIの必要なResponses経路をloopbackで提供する。Grok requestではvalidなtext、画像、function call/output、tool call ID、`call_id`、必要なtool schemaを保持する。provider固有で再利用不能なforeign artifactだけをitem単位で除外し、非objectなど構造不正なinput itemは削除せず`invalid_request_error`で拒否する。Codex履歴で完了済みparallel tool batchの途中にassistant messageがある場合は、message本文、call順、output順、`call_id`を保持したままxAI projection内だけでそのmessageをbatch直前へ移動し、Codexの保存履歴は変更しない。
 
-Codex側へはResponses-compatible SSEを返す。text、reasoning summary、function call、terminal/usageを投影する。downstreamへresponse内容を確定する前に限り、upstream transport確立またはbody streamのtransport failureを最大3回再試行する。一度でも有用なresponse内容を送信した後はrequestを再実行しない。unknown補助eventでstream全体を捨てず、終了markerが欠けた場合もoutput itemを捏造せず、必要な `response.completed` だけを合成する。
+Codex側へはResponses-compatible SSEを返す。text、reasoning summary、function call、terminal/usageを投影する。既知eventはそのevent種別に必要なresponse ID、item ID、payloadを検証し、欠損を空文字やindex既定値で有効化しない。unknown補助eventは内容を捏造せずpassthroughする。downstreamへresponse内容を確定する前に限り、upstream transport確立またはbody streamのtransport failureを最大3回再試行する。一度でも有用なresponse内容を送信した後はrequestを再実行しない。終了markerが欠けた場合もoutput itemを捏造せず、必要な `response.completed` だけを合成する。
 
 Native routeではxAI headerを送らず、caller capability headerもNative upstreamへ転送しない。画像生成、画像編集、search等のNative-owned requestはGrok catalogへ誤分類しない。
 
@@ -96,13 +96,13 @@ Grok credentialは公式のauthoritative fileをread-onlyで検査する。token
 
 Responses requestでcredentialのmissing、incomplete、hard expiryを検出した場合だけ、公式 `bin/grok models` を切断stdio・7秒timeoutで一度起動し、最大60秒read-only再読込する。明示 `auth ensure` は必要時だけ公式OAuth経路へ委譲する。malformedまたはunsafe credentialは自動loginせずfail closedする。`auth status`、`doctor`、`catalog refresh`は認証更新helperを起動しない。
 
-Native modeのrouting判断はGrok credentialの内容に依存しない。Grok modeへの移行または更新でcredentialが必要な場合だけ、明示的なauth境界を通る。
+Native modeのrouting判断とNative compatibilityを明示したsource runtime交換はGrok credentialの内容に依存しない。Grok modeへの移行またはGrok modeを公開・維持する更新でcredentialが必要な場合だけ、明示的なauth境界を通る。
 
 ## 10. LaunchAgentと停止順序
 
 LaunchAgentはuser domainへ配置し、インストール済みRust binaryとinstall rootのconfigを直接起動する。stdout/stderrへsecretを出さない。service install/uninstallはlaunchctl受付だけで成功にせず、bounded pollで `loaded` または `not_loaded` へ収束してから返す。
 
-picker activationは、既存service状態を確認し、必要なら停止、picker artifacts公開、service起動、状態検証を一つの可逆操作として行う。公開または起動に失敗した場合は、generated artifacts、config、serviceを以前の状態へ戻す。Desktop切り替えでは、app終了前に新runtimeの検証と必要なservice準備を完了させる。
+picker activationは、既存service状態を確認し、必要なら停止、picker artifacts公開、service起動、状態検証を一つの可逆操作として行う。公開または起動に失敗した場合は、generated artifacts、config、serviceを以前の状態へ戻す。Desktop切り替えでは、app終了前にnew runtimeの検証、必要なpair交換、service収束を完了させる。app終了後のpicker mutationがrollbackして失敗した場合は、entry時に動いていたDesktopを復元済み状態でrelaunchしてからfailureを返す。
 
 ## 11. Full uninstall
 
@@ -130,7 +130,7 @@ loopback caller capabilityを要求し、capability tokenはprivate permission�
 - `service install` / `service uninstall` / `service status`: LaunchAgentを収束確認付きで操作
 - `picker install` / `picker uninstall`: merged pickerの公開・復元
 - `mode grok` / `mode native`: installed runtimeによる双方向環境切り替え
-- `switch`: Desktop停止、picker更新、runtime交換、再起動をlauncherへ引き渡す
+- `switch`: runtime交換をDesktop停止前に完了し、Desktop停止後のpicker更新、rollback、再起動をlauncherへ引き渡す
 - `uninstall`: full uninstallの明示境界
 
 通常のmode切り替えはsource build、install、credential file直接編集、session migrationを行わない。
@@ -142,10 +142,13 @@ loopback caller capabilityを要求し、capability tokenはprivate permission�
 - [ ] install rootへbinary、launcher、overlay snapshot、config、catalog、capability、manifestが揃う。
 - [ ] `Grok.md`はrepo正本専用で、runtimeは別名snapshotを使う。
 - [ ] Native modeでGrok rowsが選択不可になり、保存済みGrok taskはNative fallbackで継続できる。
+- [ ] Grok credentialがmissingまたはexpiredでも、Native compatibilityを明示したsource更新とNative modeへの退避が認証更新なしで完了する。
 - [ ] Grok modeでGrok rowsが復帰し、保存済みNative taskはNative routeを維持する。
 - [ ] 保存済みprovider/model値、SQLite、rollout、session/task historyを変更しない。
 - [ ] Native upstreamとGrok upstreamのcredential・header・routingが混線しない。
+- [ ] 構造不正なinput itemと必須fieldが欠けた既知SSE eventをfail closedし、unknown補助eventだけをpassthroughする。
 - [ ] service状態がbounded pollで収束し、更新失敗時に旧runtimeへrollbackできる。
+- [ ] picker mutation失敗時はrollback後にentry時のDesktop起動状態を復元し、mutationとrelaunchの両failureを失わない。
 - [ ] full uninstallがbridge-owned stateだけを復元・削除する。
 - [ ] prompt、response、tool content、credentialがlogやruntime stateへ漏れない。
 
