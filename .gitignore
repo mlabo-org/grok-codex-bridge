@@ -11,3 +11,6 @@
 auth.json
 caller-token
 
+# Local Grok × CAO live probe procedure and receipts. Not product source.
+/docs/grok-cao-live-probe-workflow.md
+/docs/probes/TEMP-grok-cao-live-probe-receipt.md
