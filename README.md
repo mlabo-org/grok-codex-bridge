@@ -32,7 +32,7 @@ Switch to Native compatibility mode without rewriting saved tasks:
 
 `grok` routes Grok slugs to xAI and Native GPT slugs to OpenAI. In Grok mode, the picker exposes both families. In Native mode, the picker exposes Native GPT for new selection while retaining the Grok provider metadata needed to open and continue existing tasks; it rewrites a saved Grok slug only in the outbound request copy to the current Native GPT model. Neither direction rewrites the provider or model stored on a task.
 
-Both commands hand the transition through the locally built native LaunchServices launcher to the Rust coordinator, without depending on Terminal.app after handoff. The coordinator asks ChatGPT.app to quit gracefully, waits until the app and app-server are absent, switches service/config state, and relaunches ChatGPT.app only after success.
+Both commands hand the transition through the locally built native LaunchServices launcher to the Rust coordinator, without depending on Terminal.app after handoff. The coordinator validates and, when needed, replaces the paired runtime before asking ChatGPT.app to quit gracefully. After the app and app-server are absent, it applies the rollback-owned picker transition. A successful transition relaunches ChatGPT.app with the new state; a failed picker transition rolls back and attempts to relaunch the entry state before returning the failure.
 
 ### Source repository and installed runtime
 
@@ -67,7 +67,7 @@ BRIDGE="$HOME/Library/Application Support/grok-codex-bridge/bin/grok-codex-bridg
 "$BRIDGE" mode native
 ```
 
-The command prints that the transition normally takes approximately 15–20 seconds. That time is spent on graceful ChatGPT.app/app-server shutdown, service/config application, picker publication, and relaunch. Do not force-quit ChatGPT.app during this window. A successful transition is confirmed only after the automatic relaunch completes.
+The command prints that the transition normally takes approximately 15–20 seconds. That time is spent on runtime preparation, graceful ChatGPT.app/app-server shutdown, picker publication, and relaunch. Do not force-quit ChatGPT.app during this window. A successful transition is confirmed only after the automatic relaunch completes. If picker publication fails, the coordinator rolls it back and attempts to restore the entry-time Desktop running state before reporting the failure.
 
 The two native components have separate responsibilities: the Rust executable owns provider, picker, service, and transition state; the Swift launcher survives the parent ChatGPT.app shutdown and starts the coordinator through LaunchServices. Neither component is an interpreter or a build-on-first-use wrapper.
 
@@ -171,12 +171,11 @@ The overlay is a companion contract, not a second constitution. It tells Grok to
 
 ### Official subagents
 
-Codex owns subagent dispatch. The bridge only translates provider protocol; it does not spawn workers.
+Codex owns subagent dispatch and lifecycle. The bridge only translates provider protocol; it does not spawn workers, define their tool surface, or own model and reasoning defaults.
 
-- A Grok parent can spawn official Codex subagents (`spawn_agent` / `wait_agent` / `close_agent`).
-- Omitting `model` or `reasoning_effort` applies Codex `[agents].default_subagent_model` and `[agents].default_subagent_reasoning_effort`. Those values are not the parent Grok model or effort.
-- To run the child as Grok, set `model` to an admitted catalog id such as `grok-4.6` or `grok-4.5`.
-- To set reasoning depth, set `reasoning_effort` explicitly. Current Grok catalog entries advertise `low`, `medium`, `high`, and `xhigh`.
+- Use the official subagent tools exposed by the current Codex schema (for example, `spawn_agent`, `wait_agent`, and `interrupt_agent`). Tool names and availability can vary with the client or version; this bridge does not guarantee a particular set.
+- When `model` or `reasoning_effort` is omitted, follow the current official schema and its context-propagation rules. This README does not promise a configured default, parent-model inheritance, or any other fixed behavior.
+- If the current `spawn_agent` schema admits overrides and the child must run as Grok, set an admitted Grok catalog id such as `grok-4.6` or `grok-4.5` explicitly. Set `reasoning_effort` explicitly when that distinction matters and the schema permits it; otherwise the child model or effort must not be assumed.
 
 ## Lifecycle and rollback
 
@@ -186,7 +185,7 @@ A Grok-backed Codex session depends on the local loopback service. Stopping the 
 
 Perform materialization and installed-binary replacement from a session that does not use this bridge. Use Grok Build for that step, or a Codex session on a Native GPT model.
 
-After materializing a new executable, replace the loaded install with the repository-owned replacement script. Before stopping the service, it runs `auth ensure`: silent refresh is attempted first, and the official OAuth browser opens only when interactive recovery is still required. The script then swaps the installed binary, restarts the service, and runs `doctor`. If replacement or restart fails, it attempts to restore the previous binary and service state:
+After materializing a new executable, replace the loaded install with the repository-owned replacement script. A direct replacement or a Grok-mode transition runs `auth ensure` before stopping the service: silent refresh is attempted first, and the official OAuth browser opens only when interactive recovery is still required. A source transition explicitly targeting Native compatibility skips Grok credential read, refresh, and login while retaining the same pair validation and rollback. The script then swaps the installed binary, restarts the service, and runs `doctor`. If replacement or restart fails, it attempts to restore the previous binary and service state:
 
 ```sh
 ./scripts/materialize-macos.sh

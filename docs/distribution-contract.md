@@ -63,7 +63,7 @@ Installation copies the paired runtime and its resource into the per-user instal
 └── logs/
 ```
 
-The lifecycle manifest and user LaunchAgent record the bridge-owned paths. The installed launcher bundle must be a regular, non-symlink app bundle with a valid executable, Info.plist, and non-empty UTF-8 overlay snapshot. The installed bridge and launcher are replaced as a pair by `scripts/replace-installed-bridge.sh`; replacement stages both, stops the service, swaps both, verifies the new version and launcher signature, restarts the service, and attempts a bounded rollback if the operation fails.
+The lifecycle manifest and user LaunchAgent record the bridge-owned paths. The installed launcher bundle must be a regular, non-symlink app bundle with a valid executable, Info.plist, and non-empty UTF-8 overlay snapshot. The installed bridge and launcher are replaced as a pair by `scripts/replace-installed-bridge.sh`; replacement stages both, stops the service, swaps both, verifies the new version and launcher signature, restarts the service, and attempts a bounded rollback if the operation fails. Direct and Grok-mode replacements run the new binary's `auth ensure` before service shutdown. A coordinator invocation explicitly targeting Native compatibility skips Grok credential access while preserving pair validation and rollback.
 
 Source build/materialization and installed-runtime replacement are update operations. They are not normal mode switches and should be initiated from a Native GPT task or Terminal when the current Grok task depends on the bridge service.
 
@@ -83,7 +83,7 @@ These commands use only the installed bridge, installed launcher, installed over
 
 `grok` publishes the merged Native GPT/Grok picker, routes admitted Grok models to xAI, and preserves Native GPT routing to the first-party Codex upstream. `native` publishes the Native compatibility mode while retaining the bridge provider metadata and hidden Grok catalog information required to open and continue saved Grok tasks. Neither direction rewrites the provider or model stored in a saved task; request-time compatibility transformation is the bridge's runtime responsibility.
 
-Every mode switch is handed to the native launcher. The launcher and coordinator request a graceful ChatGPT.app and bundled app-server shutdown, wait for quiescence, apply the service/configuration transition, publish the picker state, and relaunch ChatGPT.app only after successful mutation. The user-facing estimate is approximately 15–20 seconds. The user must not force-quit ChatGPT.app during this handoff.
+Every mode switch is handed to the native launcher. The coordinator validates and, when required, replaces the paired runtime before requesting a graceful ChatGPT.app and bundled app-server shutdown. After quiescence it applies the rollback-owned picker transition. Successful mutation relaunches ChatGPT.app with the new state; failed picker mutation rolls back and attempts to restore the entry-time Desktop running state before returning the failure. The user-facing estimate is approximately 15–20 seconds. The user must not force-quit ChatGPT.app during this handoff.
 
 ## Native compatibility mode versus full uninstall
 

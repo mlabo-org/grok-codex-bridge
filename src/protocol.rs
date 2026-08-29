@@ -1483,7 +1483,7 @@ fn parse_input(
         // provider.  Drop only that item; preserve all valid text and tool
         // history so the next turn remains useful.
         let Some(raw_object) = value.as_object() else {
-            continue;
+            return Err(ProtocolError::InvalidRequestField("input"));
         };
         let raw_type = raw_object.get("type").and_then(Value::as_str);
         if matches!(
@@ -2897,6 +2897,7 @@ impl TextStreamValidator {
     ) -> Result<ValidatedTextStreamEvent, ProtocolError> {
         let object = value.as_object().ok_or(ProtocolError::InvalidSsePayload)?;
         let event_type = object.get("type").and_then(Value::as_str).unwrap_or("");
+        validate_known_sse_event(event_type, object)?;
         let sequence_number = object
             .get("sequence_number")
             .and_then(Value::as_u64)
@@ -3065,6 +3066,72 @@ impl TextStreamValidator {
             kind,
             original: value,
         })
+    }
+}
+
+/// Validate the fields that give a known Responses event its identity and
+/// payload.  Unknown provider-specific events remain opaque passthroughs.
+fn validate_known_sse_event(
+    event_type: &str,
+    object: &Map<String, Value>,
+) -> Result<(), ProtocolError> {
+    let response = object.get("response").and_then(Value::as_object);
+    let item = object.get("item").and_then(Value::as_object);
+    let required_nonempty = |source: Option<&Map<String, Value>>, key: &str| {
+        source
+            .and_then(|map| map.get(key))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or(ProtocolError::InvalidSsePayload)
+            .map(|_| ())
+    };
+    let required_string = |source: Option<&Map<String, Value>>, key: &str| {
+        source
+            .and_then(|map| map.get(key))
+            .and_then(Value::as_str)
+            .ok_or(ProtocolError::InvalidSsePayload)
+            .map(|_| ())
+    };
+    let item_identity = || {
+        required_nonempty(Some(object), "item_id").or_else(|_| required_nonempty(item, "id"))
+    };
+
+    match event_type {
+        "response.created" | "response.in_progress" | "response.completed"
+        | "response.failed" | "response.incomplete" => required_nonempty(response, "id"),
+        "response.output_item.added" | "response.output_item.done"
+        | "response.reasoning.added" | "response.reasoning.done" => {
+            required_nonempty(item, "id").or_else(|_| required_nonempty(Some(object), "item_id"))
+        }
+        "response.content_part.added" => item_identity(),
+        "response.output_text.delta" | "response.reasoning_text.delta"
+        | "response.reasoning_summary_text.delta"
+        | "response.function_call_arguments.delta" => {
+            item_identity()?;
+            required_string(Some(object), "delta")
+        }
+        "response.output_text.done" | "response.reasoning_text.done"
+        | "response.reasoning_summary_text.done" | "response.reasoning_summary_part.done" => {
+            item_identity()?;
+            required_string(Some(object), "text")
+                .or_else(|_| required_string(object.get("part").and_then(Value::as_object), "text"))
+        }
+        "response.content_part.done" => {
+            item_identity()?;
+            required_string(Some(object), "text")
+                .or_else(|_| required_string(object.get("part").and_then(Value::as_object), "text"))
+        }
+        "response.reasoning_summary_part.added" => item_identity(),
+        "response.function_call_arguments.done" => {
+            item_identity()?;
+            required_string(Some(object), "arguments")
+        }
+        "response.function_call.added" => {
+            required_nonempty(item, "id").or_else(|_| required_nonempty(Some(object), "item_id"))?;
+            required_nonempty(item, "call_id")?;
+            required_nonempty(item, "name")
+        }
+        _ => Ok(()),
     }
 }
 
@@ -4973,6 +5040,34 @@ mod tests {
             TextStreamEventKind::OutputTextDelta { .. }
         ));
         assert!(validator.finish().is_ok());
+    }
+
+    #[test]
+    fn malformed_known_sse_events_are_rejected() {
+        let mut validator = TextStreamValidator::new();
+        assert!(matches!(
+            validator.accept_value(json!({"type": "response.output_text.delta"})),
+            Err(ProtocolError::InvalidSsePayload)
+        ));
+
+        let mut validator = TextStreamValidator::new();
+        assert!(matches!(
+            validator.accept_value(json!({
+                "type": "response.completed",
+                "response": {}
+            })),
+            Err(ProtocolError::InvalidSsePayload)
+        ));
+    }
+
+    #[test]
+    fn non_object_input_item_is_rejected_instead_of_dropped() {
+        let mut request = request_fixture();
+        request["input"].as_array_mut().unwrap().push(json!(42));
+        assert_eq!(
+            NormalizedResponsesRequest::parse(request).unwrap_err(),
+            ProtocolError::InvalidRequestField("input")
+        );
     }
 
     #[test]

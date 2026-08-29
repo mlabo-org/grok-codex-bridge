@@ -231,20 +231,20 @@ fn desktop_switch_command(arguments: DesktopSwitchArgs) -> Result<ExitCode, Oper
     let installed_launcher = paths.install_root.join("bin/Grok Codex Switch.app");
     thread::sleep(Duration::from_millis(arguments.grace_period_ms));
 
+    replace_installed_runtime_if_needed(
+        &source_binary,
+        &installed_binary,
+        &installed_launcher,
+        arguments.replacement_script.as_deref(),
+        arguments.replacement_launcher.as_deref(),
+        &paths,
+        arguments.picker.native_compatibility,
+    )?;
+
     desktop_transition::transition(
         Duration::from_secs(30),
         Duration::from_millis(100),
-        || -> Result<(), OperationError> {
-            replace_installed_runtime_if_needed(
-                &source_binary,
-                &installed_binary,
-                &installed_launcher,
-                arguments.replacement_script.as_deref(),
-                arguments.replacement_launcher.as_deref(),
-                &paths,
-            )?;
-            picker_install_command(arguments.picker).map(|_| ())
-        },
+        || picker_install_command(arguments.picker).map(|_| ()),
     )?;
     println!("desktop mode switch: complete");
     Ok(ExitCode::SUCCESS)
@@ -257,6 +257,7 @@ fn replace_installed_runtime_if_needed(
     replacement_script: Option<&Path>,
     replacement_launcher: Option<&Path>,
     paths: &LifecyclePaths,
+    native_compatibility: bool,
 ) -> Result<(), OperationError> {
     let launcher_equal = match replacement_launcher {
         Some(source_launcher) => launcher_bundles_equal(source_launcher, installed_launcher)?,
@@ -283,6 +284,7 @@ fn replace_installed_runtime_if_needed(
     let status = ProcessCommand::new(script)
         .arg(source_binary)
         .arg(launcher)
+        .args(native_compatibility.then_some("--native-compatibility"))
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())

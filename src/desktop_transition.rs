@@ -71,15 +71,18 @@ pub enum DesktopTransitionError {
         stage: DesktopTransitionStage,
         message: String,
     },
+    #[error("desktop transition mutation failed ({mutation}); relaunch also failed ({relaunch})")]
+    MutationAndRelaunch { mutation: String, relaunch: String },
     #[error("ChatGPT.app and bundled app-server did not quiesce before the deadline")]
     QuiescenceTimeout,
 }
 
 /// Run one transition around `mutation`.
 ///
-/// If either process was present at entry, the application is relaunched only
-/// after a successful mutation.  A timeout or mutation failure never relaunches
-/// the application, preventing a half-switched configuration from being read.
+/// If either process was present at entry, the application is relaunched after
+/// both successful and failed mutations so a failed activation cannot leave
+/// the user's desktop unavailable. An initially stopped application is not
+/// launched.
 pub fn transition<F, E>(
     timeout: Duration,
     poll_interval: Duration,
@@ -145,10 +148,25 @@ where
         }
     }
 
-    mutation().map_err(|error| DesktopTransitionError::Mutation {
-        stage: DesktopTransitionStage::Mutate,
-        message: error.to_string(),
-    })?;
+    let mutation_result = mutation().map_err(|error| error.to_string());
+    if let Err(message) = mutation_result {
+        if relaunch {
+            return match operations.launch_app() {
+                Ok(()) => Err(DesktopTransitionError::Mutation {
+                    stage: DesktopTransitionStage::Mutate,
+                    message,
+                }),
+                Err(source) => Err(DesktopTransitionError::MutationAndRelaunch {
+                    mutation: message,
+                    relaunch: source.to_string(),
+                }),
+            };
+        }
+        return Err(DesktopTransitionError::Mutation {
+            stage: DesktopTransitionStage::Mutate,
+            message,
+        });
+    }
 
     if relaunch {
         operations
@@ -471,7 +489,7 @@ mod tests {
     }
 
     #[test]
-    fn mutation_failure_does_not_relaunch() {
+    fn mutation_failure_relaunches_when_app_was_running() {
         let mut fake = Fake {
             app: [vec![11], vec![]].into(),
             server: [vec![], vec![]].into(),
@@ -489,7 +507,27 @@ mod tests {
             result,
             Err(DesktopTransitionError::Mutation { .. })
         ));
-        assert!(!fake.events.contains(&"launch"));
+        assert!(fake.events.contains(&"launch"));
+    }
+
+    #[test]
+    fn mutation_and_relaunch_failure_preserves_both_errors() {
+        let mut fake = Fake {
+            app: [vec![11], vec![]].into(),
+            server: [vec![], vec![]].into(),
+            current: [(11, CHATGPT_EXECUTABLE)].into_iter().collect(),
+            term_signals: Vec::new(),
+            events: Vec::new(),
+            launch_error: true,
+            terminate_on_quit: true,
+        };
+        let result = transition_with_operations(&mut fake, Duration::from_secs(1), Duration::ZERO, || {
+            Err::<(), _>("mutation failed")
+        });
+        assert!(matches!(
+            result,
+            Err(DesktopTransitionError::MutationAndRelaunch { .. })
+        ));
     }
 
     #[test]

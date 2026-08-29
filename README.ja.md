@@ -32,7 +32,7 @@ Native GPT/Grok統合モデルピッカーを有効にします。
 
 `grok` はGrok slugをxAIへ、Native GPT slugをOpenAIへ送ります。Grok modeでは両方のmodel familyをpickerに表示します。Native modeでは新規選択用にNative GPTだけを表示しますが、既存taskを開いて継続するためのGrok provider metadataは保持し、保存済みGrok slugを実行時コピー上だけ現在のNative GPTモデルへ変換します。タスクに保存されたprovider/modelはどちらの方向でも書き換えません。
 
-どちらのコマンドも、ローカルでbuildしたnative LaunchServices launcherからRust coordinatorへ切替を引き渡します。引き渡し後はTerminal.appへ依存しません。coordinatorはChatGPT.appへ正常終了を要求し、本体とapp-serverの停止を確認してからserviceと設定を切り替え、成功後だけChatGPT.appを再起動します。
+どちらのコマンドも、ローカルでbuildしたnative LaunchServices launcherからRust coordinatorへ切替を引き渡します。引き渡し後はTerminal.appへ依存しません。coordinatorはpair runtimeを検証し、必要な交換をChatGPT.app終了要求より前に完了します。本体とapp-serverの停止後はrollbackを所有するpicker切替だけを行い、成功時は新しいstateで再起動し、失敗時はpickerをrollbackしてentry時のDesktop起動状態の復元を試みてからfailureを返します。
 
 ### ソースリポジトリと導入済みruntime
 
@@ -67,7 +67,7 @@ BRIDGE="$HOME/Library/Application Support/grok-codex-bridge/bin/grok-codex-bridg
 "$BRIDGE" mode native
 ```
 
-コマンドは、切替完了まで通常およそ15〜20秒かかることを表示します。この時間は、ChatGPT.app/app-serverの正常終了、service/config適用、picker公開、再起動に使われます。この間はChatGPT.appを強制終了しないでください。切替成功は自動再起動が完了した後に確認されます。
+コマンドは、切替完了まで通常およそ15〜20秒かかることを表示します。この時間は、runtime準備、ChatGPT.app/app-serverの正常終了、picker公開、再起動に使われます。この間はChatGPT.appを強制終了しないでください。切替成功は自動再起動が完了した後に確認されます。picker公開が失敗した場合、coordinatorはrollback後にentry時のDesktop起動状態を復元してからfailureを返します。
 
 2つのnative componentには別々の責務があります。Rust executableはprovider、picker、service、切替stateを所有し、Swift launcherは親のChatGPT.app終了後も残り、LaunchServices経由でcoordinatorを起動します。どちらもinterpreterでもbuild-on-first-use wrapperでもありません。
 
@@ -171,12 +171,11 @@ NativeとGrokのmodel slugは一意でなければなりません。catalog生�
 
 ### 公式サブエージェント
 
-サブエージェントの起動はCodexが所有します。bridgeはprovider protocolを変換するだけで、workerを起動しません。
+サブエージェントの起動とライフサイクルはCodexが所有します。bridgeはprovider protocolを変換するだけで、workerの起動、toolの公開範囲、modelや推論深度の既定値を所有しません。
 
-- Grok親から公式Codexサブエージェント（`spawn_agent` / `wait_agent` / `close_agent`）を起動できる。
-- spawn時に `model` または `reasoning_effort` を省略すると、Codex設定の `[agents].default_subagent_model` と `[agents].default_subagent_reasoning_effort` が使われる。親のGrokモデルや推論深度にはならない。
-- 子をGrokで動かすには、`model` を許可済みカタログID（`grok-4.6` や `grok-4.5`）へ明示する。
-- 推論深度も `reasoning_effort` を明示する。現行のGrokカタログは `low` / `medium` / `high` / `xhigh` を公開する。
+- 現在のCodex schemaが公開している公式サブエージェントtool（例: `spawn_agent` / `wait_agent` / `interrupt_agent`）を、そのschemaに従って使います。tool名や公開状況はclientやversionで変わり得るため、このbridgeは特定のtool集合を保証しません。
+- `model` または `reasoning_effort` を省略した場合は、現在の公式schemaとcontext propagationの規則に従います。このREADMEは、設定済みdefault、親modelの継承、その他の固定動作を約束しません。
+- 現在の `spawn_agent` schemaがoverrideを許し、子をGrokで動かす必要がある場合は、`grok-4.6` や `grok-4.5` など許可済みカタログIDを明示します。その区別が必要でschemaが許す場合は `reasoning_effort` も明示してください。schemaが許さない場合、子のmodelや推論深度を推測してはいけません。
 
 ## ライフサイクルとrollback
 
@@ -186,7 +185,7 @@ Grokを選択したCodexセッションはローカルのループバックservi
 
 生成と導入済みバイナリの差し替えは、このブリッジを使っていないセッションから実行してください。この手順の想定オペレーターはGrok Buildです。Native GPTモデルのCodexセッションからでも実行できます。
 
-新しい実行ファイルを生成したあとは、repo所有の差し替えスクリプトで導入済みbinaryを置換してください。service停止前に`auth ensure`を実行し、まずsilent refreshを試し、対話的な復旧がなお必要な場合だけ公式OAuth browserを開きます。その後に導入済みbinaryを入れ替え、serviceを再起動して`doctor`を実行します。置換または再起動に失敗した場合は、以前のbinaryとservice状態の復元を試みます。
+新しい実行ファイルを生成したあとは、repo所有の差し替えスクリプトで導入済みbinaryを置換してください。直接交換またはGrok modeへの移行ではservice停止前に`auth ensure`を実行し、まずsilent refreshを試し、対話的な復旧がなお必要な場合だけ公式OAuth browserを開きます。Native compatibilityを明示したsource移行ではGrok credentialのread、refresh、loginを省略し、pair検証とrollbackは同じ交換経路で維持します。その後に導入済みbinaryを入れ替え、serviceを再起動して`doctor`を実行します。置換または再起動に失敗した場合は、以前のbinaryとservice状態の復元を試みます。
 
 ```sh
 ./scripts/materialize-macos.sh
