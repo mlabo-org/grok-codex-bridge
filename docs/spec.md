@@ -19,7 +19,7 @@ Codex harness
 ## 2. 責務境界
 
 - Codexはagent loop、session/task assembly、permissions、tool execution、MCP、Skills、Browser、Computer Use、保存履歴を所有する。
-- Rust bridgeはloopback endpoint、caller capability、Responsesの投影とstream変換、Grok catalog、Grok upstream client、read-only credential検査、service/lifecycle操作を所有する。
+- Rust bridgeはloopback endpoint、caller capability、Responsesの投影とstream変換、Native/Grok catalogの継続的な統合、Grok upstream client、read-only credential検査、service/lifecycle操作を所有する。
 - Swift `Grok Codex Switch.app`は、Codex Desktopが終了した後も生き残るLaunchServices launcherである。Rust switch coordinatorを起動して終了まで待ち、graceful quit、service/config/picker変更、Desktop再起動そのものはRust coordinatorが担当する。
 - xAI upstreamはGrok推論とupstream認証契約を所有する。bridgeはGrokのagent harnessやtool executorを再実装しない。
 - `Grok.md`は稼働中Grokモデルへ注入するoverlay本文の唯一のrepo正本である。別用途でこの予約名を使わない。
@@ -70,6 +70,10 @@ source更新は通常の環境切り替えとは別の明示操作である。�
 
 pickerはNative catalogのコピーへ、Grok catalogから許可されたmodel rowsを追加したgenerated catalogである。Native catalog原本は編集しない。Grok rowsには `Grok.md` の本文を `base_instructions` として注入する。
 
+常駐serviceは、Codex所有の `models_cache.json` を起動時と1時間間隔でmetadataだけ確認し、変更時だけ内容とSHA-256を再検証してmerged pickerを再生成する。この監視はrequest処理から独立しており、各requestへcatalog検査を追加しない。Grok modeでは公式Grok catalogもservice起動時と1時間間隔で更新し、同じ再生成経路へ連鎖させる。したがって新しいNative GPT rowと、`grok-` identifier契約を満たす新しいGrok rowは、手動のmode切替や `catalog refresh` なしで統合pickerへ入る。
+
+再生成時はgenerated catalog、Native route state、managed-state identityを一つのrecoverable operationとして更新し、実行中serviceのNative allowlistとGrok allowlistも同じ結果へ切り替える。入力が不正、部分書込み中、またはmanaged stateと競合する場合はlast-known-goodを維持し、次の1時間周期で再試行する。catalog同期だけを理由にChatGPT.appを強制終了または自動再起動しない。
+
 Codex configのmanaged blockは `model_provider = "grok_codex_picker"`、generated catalog path、loopback provider、caller headerを所有する。provider identityはNative modeでも削除・改名・置換しない。これにより保存済みprovider/model値をそのまま認識できる。
 
 Native compatibility catalogでは、Grok slugを非選択の `visibility = "hide"` metadataとして残し、Native fallback modelへrouteする。これはpicker表示用のデータ変換であり、task DB、SQLite、rollout、session履歴の書き換えではない。
@@ -88,7 +92,7 @@ install rootのruntime configは、version、loopback bind、caller capability f
 
 Codexの既存 `config.toml` はmarker-delimited managed blockだけを更新し、無関係なtable、comment、format、user設定を保持する。更新はread、validate、private backup、temp write、atomic renameの順で行う。partial marker、競合managed value、symlink、unsafe permissionはfail closedする。
 
-生成catalog、Native route state、managed state、backup identityはinstall rootで管理し、各artifactのpath、size、SHA-256を記録する。Native catalogはCodex所有のread-only inputであり、更新・uninstallで削除または復元しない。
+生成catalog、Native route state、managed state、backup identityはinstall rootで管理し、各artifactのpath、size、SHA-256を記録する。Native catalogはCodex所有のread-only inputであり、常駐serviceは変更検知と読み取りだけを行う。更新・uninstallで削除または復元しない。
 
 ## 9. Credentialと認証
 
@@ -100,7 +104,7 @@ Native modeのrouting判断とNative compatibilityを明示したsource runtime�
 
 ## 10. LaunchAgentと停止順序
 
-LaunchAgentはuser domainへ配置し、インストール済みRust binaryとinstall rootのconfigを直接起動する。stdout/stderrへsecretを出さない。service install/uninstallはlaunchctl受付だけで成功にせず、bounded pollで `loaded` または `not_loaded` へ収束してから返す。
+LaunchAgentはuser domainへ配置し、インストール済みRust binaryとinstall rootのconfigを直接起動する。この常駐processがprovider endpointとcatalog同期を一緒に所有し、別watcher scriptや手動cronを要求しない。stdout/stderrへsecretを出さない。service install/uninstallはlaunchctl受付だけで成功にせず、bounded pollで `loaded` または `not_loaded` へ収束してから返す。
 
 picker activationは、既存service状態を確認し、必要なら停止、picker artifacts公開、service起動、状態検証を一つの可逆操作として行う。公開または起動に失敗した場合は、generated artifacts、config、serviceを以前の状態へ戻す。Desktop切り替えでは、app終了前にnew runtimeの検証、必要なpair交換、service収束を完了させる。app終了後のpicker mutationがrollbackして失敗した場合は、entry時に動いていたDesktopを復元済み状態でrelaunchしてからfailureを返す。
 
@@ -144,6 +148,8 @@ loopback caller capabilityを要求し、capability tokenはprivate permission�
 - [ ] Native modeでGrok rowsが選択不可になり、保存済みGrok taskはNative fallbackで継続できる。
 - [ ] Grok credentialがmissingまたはexpiredでも、Native compatibilityを明示したsource更新とNative modeへの退避が認証更新なしで完了する。
 - [ ] Grok modeでGrok rowsが復帰し、保存済みNative taskはNative routeを維持する。
+- [ ] `models_cache.json` に追加されたNative modelが手動mode切替なしでmerged pickerと実行中Native routeへ反映される。
+- [ ] 公式Grok catalogに追加された将来の `grok-` modelが定期更新後にmerged pickerと実行中Grok allowlistへ反映される。
 - [ ] 保存済みprovider/model値、SQLite、rollout、session/task historyを変更しない。
 - [ ] Native upstreamとGrok upstreamのcredential・header・routingが混線しない。
 - [ ] 構造不正なinput itemと必須fieldが欠けた既知SSE eventをfail closedし、unknown補助eventだけをpassthroughする。
@@ -154,4 +160,4 @@ loopback caller capabilityを要求し、capability tokenはprivate permission�
 
 ## 15. 非対象
 
-汎用LLM router、別provider marketplace、LAN/remote access、cloud sync、独自OAuth UI、billing/quota dashboard、automatic updater、Codex session database migration、保存履歴の恒久的なprovider/model変換、Codex agent harnessやtool executorの再実装は対象外である。
+汎用LLM router、別provider marketplace、LAN/remote access、cloud sync、独自OAuth UI、billing/quota dashboard、bridge binaryまたはapp bundle自体の自己更新、Codex session database migration、保存履歴の恒久的なprovider/model変換、Codex agent harnessやtool executorの再実装は対象外である。

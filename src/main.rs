@@ -1,11 +1,11 @@
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, ExitCode, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use clap::{CommandFactory, Parser};
 use grok_codex_bridge::cli::{
@@ -19,17 +19,28 @@ use grok_codex_bridge::launchd::{
 };
 use grok_codex_bridge::lifecycle::{
     AuthAvailability, DoctorCheckStatus, DoctorRequest, InstallRequest, PickerInstallRequest,
-    UninstallRequest, auth_status, doctor, install, preflight_uninstall, uninstall,
-    uninstall_picker,
+    UninstallRequest, auth_status, doctor, install, preflight_uninstall,
+    sync_installed_picker_catalog, uninstall, uninstall_picker,
 };
+use grok_codex_bridge::native::NativeError;
 use grok_codex_bridge::picker_activation::{PickerActivationRequest, activate_picker};
+use grok_codex_bridge::server::NativeRouteHandle;
 use grok_codex_bridge::{
-    CatalogCache, CatalogCommand, CatalogSnapshot, Cli, Command, CredentialStore, GrokClient,
-    GrokConfig, ModelCatalog, NativeUpstream, RuntimeConfig, bind,
+    ArtifactIdentity, CatalogCache, CatalogCommand, CatalogError, CatalogSnapshot, Cli, Command,
+    CredentialStore, GrokClient, GrokConfig, ModelCatalog, NativeUpstream, RuntimeConfig, bind,
 };
+use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use tokio::time::{Instant, MissedTickBehavior};
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::filter::Targets;
 use tracing_subscriber::prelude::*;
+
+const NATIVE_CATALOG_POLL_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const GROK_CATALOG_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const CATALOG_SYNC_RETRY_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const CATALOG_SYNC_MAX_ATTEMPTS: usize = 3;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -698,22 +709,245 @@ async fn run(path: &std::path::Path) -> Result<(), RunError> {
     let server = bind(config, catalog.clone())
         .await
         .map_err(RunError::Server)?;
-    let server_future = server.serve();
-    tokio::pin!(server_future);
+    let native_route = server.native_route_handle();
+    tokio::spawn(maintain_catalogs(grok, catalog, native_route));
+    server.serve().await.map_err(RunError::Server)
+}
 
+async fn maintain_catalogs(
+    grok: GrokConfig,
+    catalog: ModelCatalog,
+    native_route: Option<NativeRouteHandle>,
+) {
     if grok.refresh_on_start() {
-        let refresh_future = refresh_catalog(&grok, &catalog);
-        tokio::pin!(refresh_future);
-        tokio::select! {
-            result = &mut server_future => return result.map_err(RunError::Server),
-            result = &mut refresh_future => match result {
-                Ok(count) => tracing::info!(models = count, "model catalog refreshed"),
-                Err(error) => tracing::warn!(error_class = error.class(), "model catalog refresh skipped"),
-            },
+        match refresh_catalog(&grok, &catalog).await {
+            Ok(count) => tracing::info!(models = count, "Grok model catalog refreshed"),
+            Err(error) => tracing::warn!(
+                error_class = error.class(),
+                "Grok model catalog refresh skipped"
+            ),
         }
     }
 
-    server_future.await.map_err(RunError::Server)
+    let mut watch = None;
+    let mut sync_retry_after = Instant::now();
+    let mut sync_failure_reported = false;
+    match sync_runtime_picker(&grok, &catalog, native_route.as_ref()).await {
+        Ok(Some((changed, next_watch))) => {
+            watch = Some(next_watch);
+            if changed {
+                tracing::info!("merged picker catalog synchronized");
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(
+                error_class = error.class(),
+                "merged picker catalog synchronization deferred"
+            );
+            sync_failure_reported = true;
+            sync_retry_after = Instant::now() + CATALOG_SYNC_RETRY_INTERVAL;
+        }
+    }
+
+    let mut native_poll = tokio::time::interval(NATIVE_CATALOG_POLL_INTERVAL);
+    native_poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    native_poll.tick().await;
+    let mut grok_refresh = tokio::time::interval(GROK_CATALOG_REFRESH_INTERVAL);
+    grok_refresh.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    grok_refresh.tick().await;
+
+    loop {
+        tokio::select! {
+            _ = native_poll.tick() => {
+                let inputs_changed = match watch.as_mut() {
+                    Some(watch) => watch.inputs_changed().unwrap_or(true),
+                    None => true,
+                };
+                if inputs_changed && Instant::now() >= sync_retry_after {
+                    match sync_runtime_picker(&grok, &catalog, native_route.as_ref()).await {
+                        Ok(Some((changed, next_watch))) => {
+                            watch = Some(next_watch);
+                            sync_retry_after = Instant::now();
+                            if changed || sync_failure_reported {
+                                tracing::info!("merged picker catalog synchronized");
+                            }
+                            sync_failure_reported = false;
+                        }
+                        Ok(None) => {
+                            watch = None;
+                            sync_retry_after = Instant::now() + CATALOG_SYNC_RETRY_INTERVAL;
+                        }
+                        Err(error) => {
+                            if !sync_failure_reported {
+                                tracing::warn!(
+                                    error_class = error.class(),
+                                    "merged picker catalog synchronization deferred"
+                                );
+                            }
+                            sync_failure_reported = true;
+                            sync_retry_after = Instant::now() + CATALOG_SYNC_RETRY_INTERVAL;
+                        }
+                    }
+                }
+            }
+            _ = grok_refresh.tick(), if grok.refresh_on_start() => {
+                match refresh_catalog(&grok, &catalog).await {
+                    Ok(count) => {
+                        tracing::info!(models = count, "Grok model catalog refreshed");
+                        sync_retry_after = Instant::now();
+                        watch = None;
+                    }
+                    Err(error) => tracing::warn!(
+                        error_class = error.class(),
+                        "Grok model catalog refresh skipped"
+                    ),
+                }
+            }
+        }
+    }
+}
+
+async fn sync_runtime_picker(
+    grok: &GrokConfig,
+    catalog: &ModelCatalog,
+    native_route: Option<&NativeRouteHandle>,
+) -> Result<Option<(bool, CatalogInputWatch)>, CatalogMaintenanceError> {
+    for _ in 0..CATALOG_SYNC_MAX_ATTEMPTS {
+        let Some(receipt) = sync_installed_picker_catalog(grok.catalog_cache_file())? else {
+            return Ok(None);
+        };
+        let mut watch = CatalogInputWatch::new(receipt.native_catalog, receipt.grok_catalog);
+        if watch.inputs_changed()? {
+            continue;
+        }
+        catalog.replace(receipt.grok_model_ids).await?;
+        if let Some(native_route) = native_route {
+            native_route.replace_catalog(receipt.native_route).await?;
+        }
+        return Ok(Some((receipt.changed, watch)));
+    }
+    Err(CatalogMaintenanceError::InputsChangedDuringSync)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileStamp {
+    length: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl FileStamp {
+    fn read(path: &Path) -> Result<Self, std::io::Error> {
+        let metadata = fs::symlink_metadata(path)?;
+        Ok(Self {
+            length: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+        })
+    }
+
+    fn read_verified(identity: &ArtifactIdentity) -> Result<Option<Self>, std::io::Error> {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_NOFOLLOW);
+        let mut file = options.open(identity.path())?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.len() != identity.byte_len() {
+            return Ok(None);
+        }
+        let mut hasher = Sha256::new();
+        let mut buffer = [0_u8; 16 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        if format!("{:x}", hasher.finalize()) != identity.sha256() {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            length: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+        }))
+    }
+}
+
+struct CatalogInputWatch {
+    native_catalog: ArtifactIdentity,
+    native_stamp: Option<FileStamp>,
+    grok_catalog: ArtifactIdentity,
+    grok_stamp: Option<FileStamp>,
+}
+
+impl CatalogInputWatch {
+    fn new(native_catalog: ArtifactIdentity, grok_catalog: ArtifactIdentity) -> Self {
+        Self {
+            native_catalog,
+            native_stamp: None,
+            grok_catalog,
+            grok_stamp: None,
+        }
+    }
+
+    fn inputs_changed(&mut self) -> Result<bool, std::io::Error> {
+        Ok(
+            Self::input_changed(&self.native_catalog, &mut self.native_stamp)?
+                || Self::input_changed(&self.grok_catalog, &mut self.grok_stamp)?,
+        )
+    }
+
+    fn input_changed(
+        identity: &ArtifactIdentity,
+        stamp: &mut Option<FileStamp>,
+    ) -> Result<bool, std::io::Error> {
+        if let Some(stamp) = stamp {
+            return Ok(FileStamp::read(identity.path())? != *stamp);
+        }
+        let Some(verified) = FileStamp::read_verified(identity)? else {
+            return Ok(true);
+        };
+        *stamp = Some(verified);
+        Ok(false)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum CatalogMaintenanceError {
+    #[error(transparent)]
+    Lifecycle(#[from] grok_codex_bridge::lifecycle::LifecycleError),
+    #[error(transparent)]
+    Catalog(#[from] CatalogError),
+    #[error(transparent)]
+    Native(#[from] NativeError),
+    #[error("failed to inspect a catalog input")]
+    Inspect(#[from] std::io::Error),
+    #[error("catalog inputs changed repeatedly during synchronization")]
+    InputsChangedDuringSync,
+}
+
+impl CatalogMaintenanceError {
+    fn class(&self) -> &'static str {
+        match self {
+            Self::Lifecycle(_) => "picker_catalog",
+            Self::Catalog(_) => "grok_catalog",
+            Self::Native(_) => "native_route",
+            Self::Inspect(_) | Self::InputsChangedDuringSync => "catalog_input",
+        }
+    }
 }
 
 async fn prepare_catalog(config: &GrokConfig) -> Result<ModelCatalog, RunError> {
@@ -913,7 +1147,14 @@ enum OperationError {
 
 #[cfg(test)]
 mod tests {
-    use super::chatgpt_login_status_is_supported;
+    use std::fs;
+    use std::io::Write;
+    use std::path::Path;
+
+    use sha2::{Digest, Sha256};
+
+    use super::{CatalogInputWatch, chatgpt_login_status_is_supported};
+    use grok_codex_bridge::ArtifactIdentity;
 
     #[test]
     fn chatgpt_login_status_accepts_the_official_stderr_channel_only() {
@@ -932,5 +1173,36 @@ mod tests {
             b"",
             b"Logged in using ChatGPT\n"
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_catalog_sync_detects_replacement_between_sync_and_watch() {
+        fn identity(path: &Path) -> ArtifactIdentity {
+            let bytes = fs::read(path).unwrap();
+            ArtifactIdentity::new(
+                path,
+                bytes.len() as u64,
+                format!("{:x}", Sha256::digest(&bytes)),
+            )
+            .unwrap()
+        }
+
+        let temporary = tempfile::tempdir().unwrap();
+        let native = temporary.path().join("models_cache.json");
+        let grok = temporary.path().join("models.json");
+        fs::write(&native, b"native-v1").unwrap();
+        fs::write(&grok, b"grok-v1").unwrap();
+
+        let mut watch = CatalogInputWatch::new(identity(&native), identity(&grok));
+        fs::write(&native, b"native-v2").unwrap();
+        assert!(watch.inputs_changed().unwrap());
+
+        let mut watch = CatalogInputWatch::new(identity(&native), identity(&grok));
+        assert!(!watch.inputs_changed().unwrap());
+        let mut replacement = tempfile::NamedTempFile::new_in(temporary.path()).unwrap();
+        replacement.write_all(b"grok-v1").unwrap();
+        replacement.persist(&grok).unwrap();
+        assert!(watch.inputs_changed().unwrap());
     }
 }

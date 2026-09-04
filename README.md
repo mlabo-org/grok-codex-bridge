@@ -120,7 +120,7 @@ The merged picker is the only documented operating route. Native GPT remains ava
 - Ordered function calls/results and mixed text/image inputs without downloading or re-encoding image data.
 - Read-only bridge-side use of the official Grok session credential, with bounded recovery delegated to the official Grok CLI. See [Model catalog and credentials](#model-catalog-and-credentials).
 - Fixed official xAI origin through rustls, redirects disabled, and typed authentication, rate-limit, status, and stream failures.
-- Catalog-driven Grok model admission with atomic metadata-only last-known-good state.
+- Resident tracking of Native `models_cache.json` and the official Grok model list, with automatic merged-picker, live-route, and atomic metadata-only last-known-good updates.
 - Loopback-only listener and capability-scoped routes; invalid capabilities return `404`.
 - Reversible install, LaunchAgent service lifecycle, diagnostics, picker activation, and exact configuration rollback.
 - Metadata-only logging that does not log request paths, capability material, credentials, or response bodies.
@@ -150,6 +150,8 @@ Build the matching native pair once, then run the migration:
 ```
 
 The command accepts only the app-bundled Codex authenticated through ChatGPT, resolves the current `models_cache.json` under the effective Codex home, and fails before picker mutation if either authoritative input is unavailable.
+
+After activation, the resident bridge checks only the `models_cache.json` metadata at startup and once per hour, validates its contents only after a change, and automatically reconciles new Native models into both the merged picker and the live route. It performs no per-request catalog check. The service also fetches the official Grok catalog at startup and every hour, admitting future `grok-` models through the same path. New model releases require neither a manual `grok` / `native` switch nor a manual `catalog refresh`. A failed synchronization preserves the last-known-good state and retries on the next hourly cycle without force-quitting ChatGPT.app merely for a catalog change.
 
 Start a fresh Codex CLI process after activation. Fully quit and relaunch Codex Desktop before testing the Desktop picker.
 
@@ -247,7 +249,7 @@ cp ./docs/bridge-config.example.toml ./bridge-config.local.toml
   --config ./bridge-config.local.toml
 ```
 
-The `refresh_on_start` field controls service startup only; the explicit `catalog refresh` command always performs its one bounded catalog request. Keep the local configuration untracked and never commit credentials or runtime-specific paths.
+With `refresh_on_start = true`, the service fetches the Grok catalog at startup and continues automatic hourly refreshes while resident. The explicit `catalog refresh` command remains a one-request diagnostic operation but is unnecessary in normal use. Keep the local configuration untracked and never commit credentials or runtime-specific paths.
 
 ## Security boundary
 

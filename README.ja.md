@@ -120,7 +120,7 @@ Grok / xAI
 - 画像をダウンロード・再エンコードせず、順序付き関数呼び出し/結果とテキスト・画像混在入力を保持。
 - 公式Grokセッションcredentialをbridge側では読み取り専用で利用し、boundedな復旧は公式Grok CLIへ委譲します。詳細は [モデルカタログと認証情報](#モデルカタログと認証情報) を参照してください。
 - rustlsで公式xAI接続先に固定し、リダイレクトを禁止。認証、レート制限、HTTP状態、stream障害を型付きで処理。
-- Grokモデルをカタログで許可し、メタデータだけのlast-known-good状態をatomicに保存。
+- Native `models_cache.json` の変更と公式Grokモデル一覧を常駐serviceが追跡し、統合picker、実行中route、メタデータだけのlast-known-good状態を自動更新。
 - ループバック専用listenerとcapability保護されたroute。不正なcapabilityには `404` を返します。
 - install、LaunchAgentサービス、診断、ピッカー有効化、設定の完全復元を可逆に管理。
 - request path、capability、認証情報、response bodyを残さないメタデータ限定ログ。
@@ -150,6 +150,8 @@ NativeとGrokのmodel slugは一意でなければなりません。catalog生�
 ```
 
 このコマンドはChatGPT認証されたChatGPT.app同梱Codexだけを受け入れ、実効Codex homeの現在の `models_cache.json` を解決します。いずれかのauthoritative inputが得られない場合は、pickerを書き換える前に停止します。
+
+有効化後は常駐bridgeが起動時と1時間ごとに `models_cache.json` のmetadataだけを確認し、変更時だけ内容を検証して、Native modelの追加を統合pickerと実行中routeへ自動反映します。requestごとのcatalog検査は行いません。公式Grok catalogもservice起動時と1時間ごとに取得し、将来の `grok-` modelを同じ経路で追加します。新モデルのたびに `grok` / `native` を切り替えたり、`catalog refresh` を手動実行したりする必要はありません。同期失敗時はlast-known-goodを保持し、次の1時間周期で再試行します。catalog更新だけを理由にChatGPT.appを強制終了しません。
 
 有効化後は新しいCodex CLIプロセスを起動します。Codex Desktopで試す場合は、完全終了してから再起動してください。
 
@@ -247,7 +249,7 @@ cp ./docs/bridge-config.example.toml ./bridge-config.local.toml
   --config ./bridge-config.local.toml
 ```
 
-`refresh_on_start` はservice起動時だけに効きます。明示的な `catalog refresh` commandは常に一度だけcatalog requestを実行します。local configは未追跡のまま保持し、認証情報やruntime固有pathをcommitしないでください。
+`refresh_on_start = true` はservice起動時のGrok catalog取得に加え、常駐中の1時間ごとの自動取得も有効にします。明示的な `catalog refresh` commandは診断用に一度だけcatalog requestを実行しますが、通常運用では不要です。local configは未追跡のまま保持し、認証情報やruntime固有pathをcommitしないでください。
 
 ## セキュリティ境界
 
