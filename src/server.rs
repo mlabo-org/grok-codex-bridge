@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 use tokio::net::TcpListener;
+use tokio::sync::RwLock;
 
 use crate::catalog::ModelCatalog;
 use crate::config::{CapabilityToken, RuntimeConfig};
@@ -129,9 +130,15 @@ pub struct BoundServer {
     bind: SocketAddr,
     listener: TcpListener,
     router: Router,
+    native_route: Option<NativeRouteHandle>,
 }
 
 impl BoundServer {
+    #[must_use]
+    pub fn native_route_handle(&self) -> Option<NativeRouteHandle> {
+        self.native_route.clone()
+    }
+
     pub async fn serve(self) -> Result<(), ServerError> {
         tracing::info!(address = %self.bind, "loopback service started");
         axum::serve(self.listener, self.router)
@@ -158,6 +165,7 @@ pub async fn bind(
         .as_ref()
         .is_some_and(|route| route.native_compatibility_fallback().is_some());
     let native = native_service_from_route(native_route).map_err(ServerError::NativeRoute)?;
+    let native_route = native.as_ref().map(|service| service.route.clone());
     let responses_disabled = responses_disabled_from_environment() || compatibility_mode;
     let responses = if responses_disabled {
         None
@@ -170,6 +178,7 @@ pub async fn bind(
         bind,
         listener,
         router,
+        native_route,
     })
 }
 
@@ -188,7 +197,10 @@ fn native_service_from_route(
         return Ok(None);
     };
     let client = NativeClient::production(route.upstream())?;
-    Ok(Some(Arc::new(NativeService { route, client })))
+    Ok(Some(Arc::new(NativeService {
+        route: NativeRouteHandle::new(route),
+        client,
+    })))
 }
 
 async fn healthz(State(state): State<ServiceState>, Path(capability): Path<String>) -> Response {
@@ -421,15 +433,17 @@ async fn route_authorized_responses(
             );
         }
     };
+    let native_route = match state.native.as_ref() {
+        Some(native) => Some(native.route.snapshot().await),
+        None => None,
+    };
     let is_grok = state.catalog.contains(&envelope.model).await;
-    let is_native = state
-        .native
+    let is_native = native_route
         .as_ref()
-        .is_some_and(|native| native.route.contains(&envelope.model));
-    let compatibility_fallback = state
-        .native
+        .is_some_and(|route| route.contains(&envelope.model));
+    let compatibility_fallback = native_route
         .as_ref()
-        .and_then(|native| native.route.native_compatibility_fallback())
+        .and_then(NativeRouteState::native_compatibility_fallback)
         .filter(|_| is_grok && !is_native);
     match (is_native, is_grok) {
         (true, false) => {
@@ -854,9 +868,40 @@ struct ResponsesService {
     credential_renewal_grace: Duration,
 }
 
+/// Shared Native routing state updated after the resident catalog synchronizer
+/// publishes a new merged picker.
+#[derive(Clone)]
+pub struct NativeRouteHandle {
+    route: Arc<RwLock<NativeRouteState>>,
+}
+
+impl NativeRouteHandle {
+    fn new(route: NativeRouteState) -> Self {
+        Self {
+            route: Arc::new(RwLock::new(route)),
+        }
+    }
+
+    pub async fn replace_catalog(&self, candidate: NativeRouteState) -> Result<(), NativeError> {
+        let mut route = self.route.write().await;
+        if route.upstream() != candidate.upstream()
+            || route.native_compatibility_fallback().is_some()
+                != candidate.native_compatibility_fallback().is_some()
+        {
+            return Err(NativeError::InvalidState);
+        }
+        *route = candidate;
+        Ok(())
+    }
+
+    async fn snapshot(&self) -> NativeRouteState {
+        self.route.read().await.clone()
+    }
+}
+
 #[derive(Clone)]
 struct NativeService {
-    route: NativeRouteState,
+    route: NativeRouteHandle,
     client: NativeClient,
 }
 
@@ -1525,7 +1570,10 @@ mod tests {
             runtime_config(temporary.path()),
             ModelCatalog::bootstrap().unwrap(),
             None,
-            Some(Arc::new(NativeService { route, client })),
+            Some(Arc::new(NativeService {
+                route: NativeRouteHandle::new(route),
+                client,
+            })),
             true,
         );
 
@@ -1612,7 +1660,10 @@ mod tests {
             runtime_config(temporary.path()),
             ModelCatalog::bootstrap().unwrap(),
             None,
-            Some(Arc::new(NativeService { route, client })),
+            Some(Arc::new(NativeService {
+                route: NativeRouteHandle::new(route),
+                client,
+            })),
             true,
         );
         let raw = br#"{ "future": {"opaque":true}, "model" : "gpt-native", "input":[] }"#;
@@ -1661,6 +1712,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn automatic_catalog_sync_updates_native_route_without_service_restart() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (client, mock, task) = start_native_mock().await;
+        let route = NativeRouteState::new(
+            crate::native::NativeUpstream::ChatgptCodex,
+            ["gpt-native".to_owned()],
+        )
+        .unwrap();
+        let route = NativeRouteHandle::new(route);
+        let app = build_router_with_services(
+            runtime_config(temporary.path()),
+            ModelCatalog::bootstrap().unwrap(),
+            None,
+            Some(Arc::new(NativeService {
+                route: route.clone(),
+                client,
+            })),
+            true,
+        );
+
+        route
+            .replace_catalog(
+                NativeRouteState::new(
+                    crate::native::NativeUpstream::ChatgptCodex,
+                    ["gpt-native".to_owned(), "gpt-6-astra".to_owned()],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let response = send_picker_with_headers(
+            app,
+            &[
+                (PICKER_CALLER_HEADER, TOKEN),
+                ("content-type", "application/json"),
+                ("authorization", "Bearer native-caller-secret"),
+            ],
+            Body::from(serde_json::to_vec(&request_body("gpt-6-astra")).unwrap()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(mock.hits.load(Ordering::SeqCst), 1);
+        let observed = mock.observed.lock().unwrap();
+        let forwarded: Value = serde_json::from_slice(&observed[0].1).unwrap();
+        assert_eq!(forwarded["model"], "gpt-6-astra");
+        drop(observed);
+
+        let compatibility = NativeRouteHandle::new(
+            NativeRouteState::new_native_compatibility(
+                crate::native::NativeUpstream::ChatgptCodex,
+                ["gpt-native".to_owned()],
+                "gpt-native".to_owned(),
+            )
+            .unwrap(),
+        );
+        compatibility
+            .replace_catalog(
+                NativeRouteState::new_native_compatibility(
+                    crate::native::NativeUpstream::ChatgptCodex,
+                    ["gpt-native".to_owned(), "gpt-6-astra".to_owned()],
+                    "gpt-6-astra".to_owned(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            compatibility
+                .snapshot()
+                .await
+                .native_compatibility_fallback(),
+            Some("gpt-6-astra")
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
     async fn native_compatibility_routes_grok_slug_to_fallback_without_mutating_saved_payload() {
         let temporary = tempfile::tempdir().unwrap();
         let (client, mock, task) = start_native_mock().await;
@@ -1674,7 +1803,10 @@ mod tests {
             runtime_config(temporary.path()),
             ModelCatalog::bootstrap().unwrap(),
             None,
-            Some(Arc::new(NativeService { route, client })),
+            Some(Arc::new(NativeService {
+                route: NativeRouteHandle::new(route),
+                client,
+            })),
             true,
         );
         let saved = request_body("grok-4.6");
@@ -1720,7 +1852,10 @@ mod tests {
             runtime_config(temporary.path()),
             ModelCatalog::bootstrap().unwrap(),
             None,
-            Some(Arc::new(NativeService { route, client })),
+            Some(Arc::new(NativeService {
+                route: NativeRouteHandle::new(route),
+                client,
+            })),
             true,
         );
         let mut request = request_body("gpt-native");
@@ -1769,7 +1904,10 @@ mod tests {
             runtime_config(temporary.path()),
             ModelCatalog::bootstrap().unwrap(),
             None,
-            Some(Arc::new(NativeService { route, client })),
+            Some(Arc::new(NativeService {
+                route: NativeRouteHandle::new(route),
+                client,
+            })),
             true,
         );
         let mut request = request_body("gpt-native");
@@ -2116,7 +2254,10 @@ mod tests {
             runtime_config(temporary.path()),
             ModelCatalog::bootstrap().unwrap(),
             None,
-            Some(Arc::new(NativeService { route, client })),
+            Some(Arc::new(NativeService {
+                route: NativeRouteHandle::new(route),
+                client,
+            })),
             true,
         );
         let mut request = request_body("gpt-native");

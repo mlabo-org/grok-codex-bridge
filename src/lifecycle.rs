@@ -99,6 +99,19 @@ pub struct PickerInstallReceipt {
     pub grok_model_count: usize,
 }
 
+/// Result of reconciling the installed merged picker with its two authoritative
+/// catalog inputs. The Native catalog remains read-only; only bridge-owned
+/// generated state is replaced.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PickerCatalogSyncReceipt {
+    pub changed: bool,
+    pub native_catalog: ArtifactIdentity,
+    pub grok_catalog: ArtifactIdentity,
+    pub native_route: NativeRouteState,
+    pub native_model_count: usize,
+    pub grok_model_ids: Vec<String>,
+}
+
 pub struct DoctorRequest {
     pub install_root: PathBuf,
     pub codex_home: PathBuf,
@@ -533,6 +546,190 @@ pub fn install_picker(
         native_model_count: generated.native_model_count(),
         grok_model_count: generated.grok_model_count(),
     })
+}
+
+/// Reconciles an already-installed picker after Codex refreshes its Native
+/// `models_cache.json` or the bridge refreshes its admitted Grok catalog.
+///
+/// This path intentionally leaves Codex configuration and both authoritative
+/// inputs untouched. It updates the generated picker, Native routing state,
+/// and their rollback identities as one recoverable operation.
+pub fn sync_installed_picker_catalog(
+    grok_catalog_path: &Path,
+) -> Result<Option<PickerCatalogSyncReceipt>, LifecycleError> {
+    validate_absolute_clean(grok_catalog_path)?;
+    let state_dir = grok_catalog_path
+        .parent()
+        .filter(|path| path.file_name().is_some_and(|name| name == "state"))
+        .ok_or(LifecycleError::InvalidManifest)?;
+    let install_root = state_dir.parent().ok_or(LifecycleError::InvalidManifest)?;
+    validate_absolute_clean(install_root)?;
+
+    let (install_manifest, _) = read_manifest(install_root)?;
+    if install_manifest.install_root != install_root
+        || install_manifest.catalog_cache_path != grok_catalog_path
+    {
+        return Err(LifecycleError::InvalidManifest);
+    }
+
+    let generated_path = state_dir.join(PICKER_CATALOG_FILE_NAME);
+    let native_route_path = state_dir.join(PICKER_NATIVE_ROUTE_FILE_NAME);
+    let state_path = state_dir.join(PICKER_STATE_FILE_NAME);
+    let Some(previous_state_bytes) = read_optional_control_file(&state_path, &[0o600])? else {
+        return Ok(None);
+    };
+    let previous_state =
+        PickerManagedState::from_json(&previous_state_bytes).map_err(LifecycleError::Picker)?;
+    if previous_state.generated_catalog().path() != generated_path
+        || previous_state.native_route().path() != native_route_path
+    {
+        return Err(LifecycleError::InvalidPickerState);
+    }
+    validate_identity(previous_state.generated_catalog())?;
+    validate_identity(previous_state.native_route())?;
+
+    let native_catalog_path = previous_state.native_catalog().path().to_path_buf();
+    let native_bytes = read_regular_file(&native_catalog_path, MAX_CONTROL_FILE_BYTES)?;
+    let (grok_catalog, grok_catalog_bytes) = CatalogCache::new(grok_catalog_path)
+        .load_with_bytes()
+        .map_err(LifecycleError::Catalog)?
+        .ok_or(LifecycleError::PickerCatalogUnavailable)?;
+    let previous_generated = read_private_control_file(&generated_path)?;
+    let previous_native_route = read_private_control_file(&native_route_path)?;
+    let current_native_route =
+        NativeRouteState::from_json(&previous_native_route).map_err(LifecycleError::Native)?;
+
+    let capability = read_private_control_file(&install_manifest.caller_token_path)?;
+    let capability = validate_capability_bytes(&capability)?;
+    let bind = install_manifest
+        .bind
+        .parse::<SocketAddr>()
+        .map_err(|_| LifecycleError::InvalidManifest)?;
+    let config_path = previous_state.managed_config().path();
+    let config_plan = prepare_picker_config(
+        config_path,
+        Some(&previous_state),
+        &generated_path,
+        bind,
+        capability,
+    )?;
+
+    let prepared = (|| {
+        let native_catalog_identity = artifact_identity(&native_catalog_path, &native_bytes)?;
+        let grok_catalog_identity = artifact_identity(grok_catalog_path, &grok_catalog_bytes)?;
+        let native_compatibility = current_native_route
+            .native_compatibility_fallback()
+            .is_some();
+        let generated = if native_compatibility {
+            generate_native_compatibility_catalog(&native_bytes).map_err(LifecycleError::Picker)?
+        } else {
+            let overlay = crate::picker::load_grok_overlay(
+                &install_manifest.launcher_path.join(LAUNCHER_OVERLAY_PATH),
+            )
+            .map_err(LifecycleError::Picker)?;
+            generate_picker_catalog(&native_bytes, &grok_catalog, &overlay)
+                .map_err(LifecycleError::Picker)?
+        };
+        let (generated, native_route) = if native_compatibility {
+            let fallback = native_compatibility_fallback(
+                &config_plan.render_base,
+                generated.native_model_slugs(),
+            )?;
+            let native_route = NativeRouteState::new_native_compatibility(
+                current_native_route.upstream(),
+                generated.native_model_slugs().iter().cloned(),
+                fallback.clone(),
+            )?;
+            let generated = generated
+                .with_hidden_grok_compatibility(&grok_catalog, &fallback)
+                .map_err(LifecycleError::Picker)?;
+            (generated, native_route)
+        } else {
+            let native_route = NativeRouteState::new(
+                current_native_route.upstream(),
+                generated.native_model_slugs().iter().cloned(),
+            )?;
+            (generated, native_route)
+        };
+        let native_route_bytes = native_route.to_json().map_err(LifecycleError::Native)?;
+        let current_config = config_plan
+            .current
+            .as_deref()
+            .ok_or(LifecycleError::InvalidPickerState)?;
+        let state = PickerManagedState::new(
+            native_catalog_identity.clone(),
+            &grok_catalog,
+            artifact_identity(&generated_path, generated.bytes())?,
+            artifact_identity(&native_route_path, &native_route_bytes)?,
+            artifact_identity(config_path, current_config)?,
+            config_plan.rollback.clone(),
+        )
+        .map_err(LifecycleError::Picker)?;
+        let state_bytes = state.to_json().map_err(LifecycleError::Picker)?;
+        Ok::<_, LifecycleError>((
+            generated,
+            native_route,
+            native_route_bytes,
+            state_bytes,
+            native_catalog_identity,
+            grok_catalog_identity,
+        ))
+    })();
+    let (
+        generated,
+        native_route,
+        native_route_bytes,
+        state_bytes,
+        native_catalog_identity,
+        grok_catalog_identity,
+    ) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            config_plan.abort()?;
+            return Err(error);
+        }
+    };
+
+    let generated_changed = generated.bytes() != previous_generated;
+    let native_route_changed = native_route_bytes != previous_native_route;
+    let state_changed = state_bytes != previous_state_bytes;
+    if generated_changed {
+        if let Err(error) = atomic_write(&generated_path, generated.bytes(), 0o600) {
+            config_plan.abort()?;
+            return Err(error);
+        }
+    }
+    if native_route_changed {
+        if let Err(error) = atomic_write(&native_route_path, &native_route_bytes, 0o600) {
+            if generated_changed {
+                restore_optional_file(&generated_path, Some(&previous_generated), 0o600)?;
+            }
+            config_plan.abort()?;
+            return Err(error);
+        }
+    }
+    if state_changed {
+        if let Err(error) = atomic_write(&state_path, &state_bytes, 0o600) {
+            if native_route_changed {
+                restore_optional_file(&native_route_path, Some(&previous_native_route), 0o600)?;
+            }
+            if generated_changed {
+                restore_optional_file(&generated_path, Some(&previous_generated), 0o600)?;
+            }
+            config_plan.abort()?;
+            return Err(error);
+        }
+    }
+
+    config_plan.finish()?;
+    Ok(Some(PickerCatalogSyncReceipt {
+        changed: generated_changed || native_route_changed,
+        native_catalog: native_catalog_identity,
+        grok_catalog: grok_catalog_identity,
+        native_route,
+        native_model_count: generated.native_model_count(),
+        grok_model_ids: grok_catalog.model_ids().to_vec(),
+    }))
 }
 
 pub fn uninstall_picker(install_root: &Path, codex_home: &Path) -> Result<bool, LifecycleError> {
@@ -3068,6 +3265,63 @@ mod tests {
                     .exists()
             );
         }
+    }
+
+    #[test]
+    fn automatic_catalog_sync_absorbs_future_native_and_grok_models() {
+        let fixture = Fixture::new();
+        let original = b"model = \"gpt-native\"\n\n[features]\nfuture = true\n";
+        let (_receipt, native_catalog) = install_test_picker(&fixture, original);
+        let grok_catalog = fixture.install_root.join("state/models.json");
+
+        let mut native: serde_json::Value =
+            serde_json::from_slice(&fs::read(&native_catalog).unwrap()).unwrap();
+        let mut astra = native["models"][0].clone();
+        astra["slug"] = serde_json::Value::String("gpt-6-astra".to_owned());
+        astra["display_name"] = serde_json::Value::String("GPT-6 Astra".to_owned());
+        native["models"].as_array_mut().unwrap().push(astra);
+        fs::write(&native_catalog, serde_json::to_vec_pretty(&native).unwrap()).unwrap();
+        fs::set_permissions(&native_catalog, fs::Permissions::from_mode(0o600)).unwrap();
+        CatalogCache::new(&grok_catalog)
+            .persist(
+                &CatalogSnapshot::new(["grok-4.7", "grok-4.6"], Some("\"v47\"".to_owned()))
+                    .unwrap(),
+            )
+            .unwrap();
+
+        let synced = sync_installed_picker_catalog(&grok_catalog)
+            .unwrap()
+            .unwrap();
+        assert!(synced.changed);
+        assert_eq!(synced.native_catalog.path(), native_catalog);
+        assert_eq!(synced.grok_catalog.path(), grok_catalog);
+        assert_eq!(synced.native_model_count, 2);
+        assert_eq!(synced.grok_model_ids, ["grok-4.7", "grok-4.6"]);
+        assert!(synced.native_route.contains("gpt-native"));
+        assert!(synced.native_route.contains("gpt-6-astra"));
+
+        let generated: serde_json::Value = serde_json::from_slice(
+            &fs::read(fixture.install_root.join("state/picker-models.json")).unwrap(),
+        )
+        .unwrap();
+        let slugs = generated["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|model| model["slug"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(slugs.contains(&"gpt-6-astra"));
+        assert!(slugs.contains(&"grok-4.7"));
+
+        let unchanged = sync_installed_picker_catalog(&grok_catalog)
+            .unwrap()
+            .unwrap();
+        assert!(!unchanged.changed);
+        assert!(uninstall_picker(&fixture.install_root, &fixture.codex_home).unwrap());
+        assert_eq!(
+            fs::read(fixture.codex_home.join("config.toml")).unwrap(),
+            original
+        );
     }
 
     #[test]

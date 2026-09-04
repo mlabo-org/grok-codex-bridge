@@ -146,6 +146,14 @@ impl CatalogCache {
     }
 
     pub fn load(&self) -> Result<Option<CatalogSnapshot>, CatalogError> {
+        self.load_with_bytes()
+            .map(|loaded| loaded.map(|(snapshot, _)| snapshot))
+    }
+
+    /// Loads one validated snapshot together with the exact cache bytes used
+    /// to construct it. Lifecycle synchronization uses the bytes to bind its
+    /// change detector to the same source revision it published.
+    pub fn load_with_bytes(&self) -> Result<Option<(CatalogSnapshot, Vec<u8>)>, CatalogError> {
         let Some(mut file) = open_cache_for_read(&self.path)? else {
             return Ok(None);
         };
@@ -157,7 +165,7 @@ impl CatalogCache {
         let snapshot: CatalogSnapshot = serde_json::from_slice(&bytes)
             .map_err(|error| CatalogError::MalformedCache(error.to_string()))?;
         snapshot.validate()?;
-        Ok(Some(snapshot))
+        Ok(Some((snapshot, bytes)))
     }
 
     pub fn persist(&self, snapshot: &CatalogSnapshot) -> Result<(), CatalogError> {
