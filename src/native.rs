@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use axum::http::header::{CONNECTION, CONTENT_LENGTH, HOST, TRANSFER_ENCODING};
 use axum::http::{HeaderMap, HeaderName};
@@ -16,6 +17,13 @@ const ROUTE_STATE_VERSION: u32 = 1;
 const MAX_ROUTE_STATE_BYTES: u64 = 1024 * 1024;
 const CHATGPT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex/";
 const OPENAI_API_BASE_URL: &str = "https://api.openai.com/v1/";
+pub(crate) const NATIVE_SEND_RETRY_LIMIT: usize = 3;
+pub(crate) const NATIVE_RETRY_WALL_CLOCK: Duration = Duration::from_secs(60);
+pub(crate) const NATIVE_RETRY_BACKOFF: [Duration; NATIVE_SEND_RETRY_LIMIT] = [
+    Duration::from_millis(100),
+    Duration::from_millis(200),
+    Duration::from_millis(400),
+];
 
 /// The two first-party Responses origins selected by Codex 0.148 according to
 /// its active authentication mode. Lifecycle input must capture which one was
@@ -218,7 +226,19 @@ impl NativeClient {
         &self,
         suffix: NativeApiPath,
         incoming_headers: &HeaderMap,
-        body: reqwest::Body,
+        body: Vec<u8>,
+    ) -> Result<reqwest::Response, NativeError> {
+        let mut attempts = 0;
+        self.post_with_started(suffix, incoming_headers, body, Instant::now(), &mut attempts).await
+    }
+
+    pub(crate) async fn post_with_started(
+        &self,
+        suffix: NativeApiPath,
+        incoming_headers: &HeaderMap,
+        body: Vec<u8>,
+        started: Instant,
+        attempts: &mut usize,
     ) -> Result<reqwest::Response, NativeError> {
         let url = self
             .base_url
@@ -230,14 +250,99 @@ impl NativeClient {
                 headers.append(name.clone(), value.clone());
             }
         }
-        self.client
-            .post(url)
-            .headers(headers)
-            .body(body)
-            .send()
-            .await
-            .map_err(NativeError::Transport)
+        loop {
+            let attempt = *attempts;
+            *attempts += 1;
+            let result = self
+                .client
+                .post(url.clone())
+                .headers(headers.clone())
+                .body(body.clone())
+                .send()
+                .await;
+            match result {
+                Ok(response) if is_transient_status(response.status()) && attempt < NATIVE_SEND_RETRY_LIMIT => {
+                    let backoff = retry_after_or_default(response.headers(), NATIVE_RETRY_BACKOFF[attempt]);
+                    tracing::debug!(route = suffix.as_str(), status = response.status().as_u16(), attempt = attempt + 1, elapsed_ms = started.elapsed().as_millis() as u64, "Native upstream returned a transient status; retrying");
+                    if started.elapsed().saturating_add(backoff) > NATIVE_RETRY_WALL_CLOCK {
+                        tracing::warn!(route = suffix.as_str(), status = response.status().as_u16(), error_class = "upstream_http_status", attempt = attempt + 1, elapsed_ms = started.elapsed().as_millis() as u64, "Native upstream remained unavailable after bounded recovery");
+                        return Ok(response);
+                    }
+                    tokio::time::sleep(backoff).await;
+                }
+                Ok(response) => {
+                    if is_transient_status(response.status()) {
+                        tracing::warn!(route = suffix.as_str(), status = response.status().as_u16(), error_class = "upstream_http_status", attempt = attempt + 1, elapsed_ms = started.elapsed().as_millis() as u64, "Native upstream remained unavailable after bounded recovery");
+                    }
+                    return Ok(response);
+                }
+                Err(error) => {
+                    let error_class = native_transport_error_class(&error);
+                    // With a replayable in-memory body, reqwest reports a peer
+                    // closing before response headers as either connect,
+                    // timeout, or request cancellation.
+                    let retry = error.is_connect() || error.is_timeout() || error.is_request();
+                    let Some(backoff) = NATIVE_RETRY_BACKOFF.get(attempt) else {
+                        tracing::warn!(
+                            route = suffix.as_str(),
+                            error_class,
+                            attempt = attempt + 1,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "Native upstream send failed; retry limit reached"
+                        );
+                        return Err(NativeError::Transport(error));
+                    };
+                    if !retry || started.elapsed().saturating_add(*backoff) > NATIVE_RETRY_WALL_CLOCK {
+                        tracing::warn!(
+                            route = suffix.as_str(),
+                            error_class,
+                            attempt = attempt + 1,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "Native upstream send failed; not retrying"
+                        );
+                        return Err(NativeError::Transport(error));
+                    }
+                    tracing::debug!(
+                        route = suffix.as_str(),
+                        error_class,
+                        attempt = attempt + 1,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "Native upstream send failed; retrying"
+                    );
+                    tokio::time::sleep(*backoff).await;
+                }
+            }
+        }
     }
+
+    pub(crate) async fn post_stream(
+        &self,
+        suffix: NativeApiPath,
+        incoming_headers: &HeaderMap,
+        body: reqwest::Body,
+    ) -> Result<reqwest::Response, NativeError> {
+        let url = self.base_url.join(suffix.relative_path()).map_err(|_| NativeError::UnsupportedUpstream)?;
+        let mut headers = HeaderMap::new();
+        for (name, value) in incoming_headers {
+            if !is_hop_by_hop_request_header(name) && name.as_str() != PICKER_CALLER_HEADER {
+                headers.append(name.clone(), value.clone());
+            }
+        }
+        self.client.post(url).headers(headers).body(body).send().await.map_err(NativeError::Transport)
+    }
+}
+
+fn is_transient_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 429 | 502..=504)
+}
+
+fn retry_after_or_default(headers: &HeaderMap, default: Duration) -> Duration {
+    headers
+        .get(axum::http::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(default)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -258,6 +363,22 @@ impl NativeApiPath {
             Self::ImagesEdits => "images/edits",
             Self::AlphaSearch => "alpha/search",
         }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        self.relative_path()
+    }
+}
+
+fn native_transport_error_class(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_request() {
+        "request"
+    } else {
+        "transport"
     }
 }
 
@@ -325,6 +446,10 @@ pub enum NativeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
 
     #[test]
     fn route_state_requires_exact_sorted_unique_native_models() {
@@ -383,5 +508,77 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn native_send_retries_connect_failures_and_reuses_the_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let server_hits = Arc::clone(&hits);
+        let server = tokio::spawn(async move {
+            for attempt in 0..=NATIVE_SEND_RETRY_LIMIT {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                server_hits.fetch_add(1, Ordering::SeqCst);
+                if attempt == NATIVE_SEND_RETRY_LIMIT {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        let client = NativeClient::for_test(
+            Url::parse(&format!("http://{address}/backend-api/codex/")).unwrap(),
+        )
+        .unwrap();
+        let response = client
+            .post(NativeApiPath::Responses, &HeaderMap::new(), b"same-body".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(hits.load(Ordering::SeqCst), NATIVE_SEND_RETRY_LIMIT + 1);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_send_caps_continuous_connect_failures() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let client = NativeClient::for_test(
+            Url::parse(&format!("http://{address}/backend-api/codex/")).unwrap(),
+        )
+        .unwrap();
+        let started = Instant::now();
+        let error = client
+            .post(NativeApiPath::Responses, &HeaderMap::new(), b"same-body".to_vec())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, NativeError::Transport(_)));
+        assert!(started.elapsed() <= Duration::from_secs(8));
+    }
+
+    #[tokio::test]
+    async fn native_send_retries_transient_http_status_and_preserves_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let server_hits = Arc::clone(&hits);
+        let server = tokio::spawn(async move {
+            for attempt in 0..=NATIVE_SEND_RETRY_LIMIT {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                server_hits.fetch_add(1, Ordering::SeqCst);
+                let status = if attempt < NATIVE_SEND_RETRY_LIMIT { "503 Service Unavailable" } else { "200 OK" };
+                stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+            }
+        });
+        let client = NativeClient::for_test(Url::parse(&format!("http://{address}/backend-api/codex/")).unwrap()).unwrap();
+        let response = client.post(NativeApiPath::Responses, &HeaderMap::new(), b"same-body".to_vec()).await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(hits.load(Ordering::SeqCst), NATIVE_SEND_RETRY_LIMIT + 1);
+        server.await.unwrap();
     }
 }

@@ -24,7 +24,8 @@ use crate::credential::{CredentialError, CredentialStore};
 use crate::grok::{GrokClient, GrokError, ResponsesTransportRequest};
 use crate::lifecycle::PICKER_CALLER_HEADER;
 use crate::native::{
-    NativeApiPath, NativeClient, NativeError, NativeRouteState, is_hop_by_hop_response_header,
+    NativeApiPath, NativeClient, NativeError, NativeRouteState, NATIVE_RETRY_BACKOFF,
+    NATIVE_RETRY_WALL_CLOCK, NATIVE_SEND_RETRY_LIMIT, is_hop_by_hop_response_header,
 };
 use crate::protocol::{
     NormalizedResponsesRequest, TextStreamEventKind, ValidatedTextStreamEvent,
@@ -36,6 +37,12 @@ const DISABLE_ENVIRONMENT_VARIABLE: &str = "GROK_CODEX_BRIDGE_DISABLE";
 const X_GROK_UPSTREAM_STATUS: &str = "x-grok-upstream-status";
 const CREDENTIAL_RENEWAL_GRACE: Duration = Duration::from_secs(60);
 const EARLY_STREAM_RETRY_LIMIT: usize = 3;
+const EARLY_STREAM_RETRY_BACKOFF: [Duration; EARLY_STREAM_RETRY_LIMIT] = [
+    Duration::from_millis(100),
+    Duration::from_millis(200),
+    Duration::from_millis(400),
+];
+const EARLY_STREAM_RETRY_WALL_CLOCK: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 struct ServiceState {
@@ -388,8 +395,7 @@ async fn route_picker_native_api(
         );
     };
     let (parts, body) = request.into_parts();
-    let body = reqwest::Body::wrap_stream(body.into_data_stream());
-    native_response(native, path, &parts.headers, body).await
+    native_stream_response(native, path, &parts.headers, reqwest::Body::wrap_stream(body.into_data_stream())).await
 }
 
 async fn route_authorized_responses(
@@ -471,7 +477,7 @@ async fn route_authorized_responses(
                     );
                 }
             };
-            return native_response(native, path, &parts.headers, body.into()).await;
+            return native_response(native, path, &parts.headers, body.to_vec()).await;
         }
         (true, true) => {
             return route_error(
@@ -516,7 +522,7 @@ async fn route_authorized_responses(
                     );
                 }
             };
-            return native_response(native, path, &parts.headers, body.into()).await;
+            return native_response(native, path, &parts.headers, body.to_vec()).await;
         }
         (false, true) => {}
     }
@@ -626,6 +632,7 @@ async fn route_authorized_responses(
         Err(error) => return upstream_error(error),
     };
     let mut early_retries = 0;
+    let retry_started = std::time::Instant::now();
     let (prelude, upstream) = 'attempt: loop {
         let upstream = match service
             .client
@@ -640,9 +647,13 @@ async fn route_authorized_responses(
             .await
         {
             Ok(stream) => stream,
-            Err(GrokError::Transport(_)) if early_retries < EARLY_STREAM_RETRY_LIMIT => {
+            Err(error) if grok_error_is_transient(&error) && early_retries < EARLY_STREAM_RETRY_LIMIT => {
+                let Some(delay) = grok_retry_delay(&error, early_retries, retry_started) else {
+                    return upstream_error(error);
+                };
                 early_retries += 1;
                 log_early_stream_retry(early_retries);
+                tokio::time::sleep(delay).await;
                 continue 'attempt;
             }
             Err(error) => return upstream_error(error),
@@ -662,8 +673,12 @@ async fn route_authorized_responses(
                     if matches!(error, GrokError::Stream(_))
                         && early_retries < EARLY_STREAM_RETRY_LIMIT =>
                 {
+                    let Some(delay) = grok_retry_delay(&error, early_retries, retry_started) else {
+                        return upstream_error(error);
+                    };
                     early_retries += 1;
                     log_early_stream_retry(early_retries);
+                    tokio::time::sleep(delay).await;
                     continue 'attempt;
                 }
                 Some(Err(error)) => return upstream_error(error),
@@ -708,12 +723,37 @@ async fn route_authorized_responses(
 }
 
 fn log_early_stream_retry(retry: usize) {
-    tracing::warn!(
+    tracing::debug!(
         route = "responses",
         error_class = "upstream_stream_transport",
         retry,
         "retrying upstream stream before downstream output"
     );
+}
+
+fn grok_error_is_transient(error: &GrokError) -> bool {
+    matches!(
+        error,
+        GrokError::Transport(_)
+            | GrokError::RateLimited { .. }
+            | GrokError::UpstreamStatus(502..=504)
+    )
+}
+
+fn grok_retry_delay(
+    error: &GrokError,
+    retry_index: usize,
+    started: std::time::Instant,
+) -> Option<Duration> {
+    let default = EARLY_STREAM_RETRY_BACKOFF[retry_index];
+    let requested = match error {
+        GrokError::RateLimited {
+            retry_after_seconds: Some(seconds),
+        } => Duration::from_secs(*seconds),
+        _ => default,
+    };
+    (started.elapsed().saturating_add(requested) <= EARLY_STREAM_RETRY_WALL_CLOCK)
+        .then_some(requested)
 }
 
 fn event_commits_downstream(event: &ValidatedTextStreamEvent) -> bool {
@@ -740,33 +780,93 @@ async fn native_response(
     service: Arc<NativeService>,
     path: NativeApiPath,
     headers: &HeaderMap,
-    body: reqwest::Body,
+    body: Vec<u8>,
 ) -> Response {
-    let upstream = match service.client.post(path, headers, body).await {
-        Ok(response) => response,
-        Err(_) => {
-            return route_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "native_transport",
-                "server_error",
-                "native_upstream_unavailable",
-                "Native Codex upstream is unavailable",
-            );
+    let started = std::time::Instant::now();
+    let mut body_retries = 0usize;
+    let mut attempts = 0usize;
+    let (status, response_headers, upstream_stream, first) = loop {
+        let upstream = match service.client.post_with_started(path, headers, body.clone(), started, &mut attempts).await {
+            Ok(response) => response,
+            Err(_) => {
+                return route_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "native_transport",
+                    "server_error",
+                    "native_upstream_unavailable",
+                    "Native Codex upstream is unavailable",
+                );
+            }
+        };
+        let status = upstream.status();
+        let response_headers = upstream.headers().clone();
+        let mut stream = upstream.bytes_stream();
+        if !status.is_success() {
+            let stream = stream.map(|chunk| chunk.map_err(io::Error::other));
+            let mut response = Body::from_stream(stream).into_response();
+            *response.status_mut() = status;
+            for (name, value) in &response_headers {
+                if !is_hop_by_hop_response_header(name) {
+                    response.headers_mut().append(name.clone(), value.clone());
+                }
+            }
+            return response;
+        }
+        match stream.next().await {
+            Some(Ok(first)) => break (status, response_headers, stream, first),
+            Some(Err(error)) if attempts <= NATIVE_SEND_RETRY_LIMIT
+                && started.elapsed().saturating_add(NATIVE_RETRY_BACKOFF[body_retries]) <= NATIVE_RETRY_WALL_CLOCK => {
+                body_retries += 1;
+                tracing::debug!(route = path.as_str(), error_class = "upstream_body_transport", attempt = body_retries, elapsed_ms = started.elapsed().as_millis() as u64, "Native upstream body failed before downstream output; retrying");
+                tokio::time::sleep(NATIVE_RETRY_BACKOFF[body_retries - 1]).await;
+                let _ = error;
+                continue;
+            }
+            None => break (status, response_headers, stream, Bytes::new()),
+            Some(Err(_)) => {
+                tracing::warn!(route = path.as_str(), error_class = "upstream_body_transport", attempt = body_retries + 1, elapsed_ms = started.elapsed().as_millis() as u64, "Native upstream remained unavailable before downstream output");
+                return route_error(
+                    StatusCode::BAD_GATEWAY,
+                    "native_body_transport",
+                    "server_error",
+                    "native_upstream_unavailable",
+                    "Native Codex upstream response could not be read",
+                );
+            }
         }
     };
-    let status = upstream.status();
-    let headers = upstream.headers().clone();
-    let stream = upstream
-        .bytes_stream()
-        .map(|chunk| chunk.map_err(io::Error::other));
+    let stream = stream::once(async move { Ok::<Bytes, io::Error>(first) })
+        .chain(upstream_stream.map(|chunk| chunk.map_err(io::Error::other)));
     let mut response = Body::from_stream(stream).into_response();
     *response.status_mut() = status;
-    for (name, value) in &headers {
+    for (name, value) in &response_headers {
         if !is_hop_by_hop_response_header(name) {
             response.headers_mut().append(name.clone(), value.clone());
         }
     }
     response
+}
+
+async fn native_stream_response(
+    service: Arc<NativeService>,
+    path: NativeApiPath,
+    headers: &HeaderMap,
+    body: reqwest::Body,
+) -> Response {
+    match service.client.post_stream(path, headers, body).await {
+        Ok(upstream) => {
+            let status = upstream.status();
+            let headers = upstream.headers().clone();
+            let stream = upstream.bytes_stream().map(|chunk| chunk.map_err(io::Error::other));
+            let mut response = Body::from_stream(stream).into_response();
+            *response.status_mut() = status;
+            for (name, value) in &headers {
+                if !is_hop_by_hop_response_header(name) { response.headers_mut().append(name.clone(), value.clone()); }
+            }
+            response
+        }
+        Err(_) => route_error(StatusCode::SERVICE_UNAVAILABLE, "native_transport", "server_error", "native_upstream_unavailable", "Native Codex upstream is unavailable"),
+    }
 }
 
 fn decode_request_copy<'a>(headers: &HeaderMap, raw: &'a [u8]) -> Result<Cow<'a, [u8]>, ()> {
@@ -1139,6 +1239,7 @@ mod tests {
     use futures_util::StreamExt;
     use serde_json::{Value, json};
     use tokio::net::TcpStream;
+    use tokio::io::AsyncWriteExt;
     use tokio::task::JoinHandle;
     use tower::ServiceExt;
     use url::Url;
@@ -1524,6 +1625,172 @@ mod tests {
         )
         .unwrap();
         (client, state, task)
+    }
+
+    #[derive(Clone, Copy)]
+    enum RawNativeReply {
+        TransportDisconnect,
+        HeadersThenBodyDisconnect,
+        BodyThenDisconnect,
+        Success,
+    }
+
+    async fn start_raw_native_mock(
+        replies: Vec<RawNativeReply>,
+        success_body: &'static [u8],
+    ) -> (NativeClient, Arc<AtomicUsize>, JoinHandle<()>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let server_hits = Arc::clone(&hits);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            for reply in replies {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                server_hits.fetch_add(1, Ordering::SeqCst);
+                match reply {
+                    RawNativeReply::TransportDisconnect => {}
+                    RawNativeReply::HeadersThenBodyDisconnect => {
+                        stream
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 64\r\nConnection: close\r\n\r\n",
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    RawNativeReply::BodyThenDisconnect => {
+                        stream
+                            .write_all(
+                                format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 64\r\nConnection: close\r\n\r\n{}",
+                                    std::str::from_utf8(success_body).unwrap()
+                                )
+                                .as_bytes(),
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    RawNativeReply::Success => {
+                        stream
+                            .write_all(
+                                format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                    success_body.len(),
+                                    std::str::from_utf8(success_body).unwrap()
+                                )
+                                .as_bytes(),
+                            )
+                            .await
+                            .unwrap();
+                    }
+                }
+                let _ = stream.shutdown().await;
+            }
+        });
+        let client = NativeClient::for_test(
+            Url::parse(&format!("http://{address}/backend-api/codex/")).unwrap(),
+        )
+        .unwrap();
+        (client, hits, task)
+    }
+
+    fn native_response_test_app(client: NativeClient, temporary: &FsPath) -> Router {
+        let route = NativeRouteState::new(
+            crate::native::NativeUpstream::ChatgptCodex,
+            ["gpt-native".to_owned()],
+        )
+        .unwrap();
+        build_router_with_services(
+            runtime_config(temporary),
+            ModelCatalog::bootstrap().unwrap(),
+            None,
+            Some(Arc::new(NativeService {
+                route: NativeRouteHandle::new(route),
+                client,
+            })),
+            true,
+        )
+    }
+
+    #[tokio::test]
+    async fn native_response_retries_headers_before_body_disconnect_then_streams_sse() {
+        let temporary = tempfile::tempdir().unwrap();
+        let success = b"event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n";
+        let (client, hits, task) = start_raw_native_mock(
+            vec![
+                RawNativeReply::HeadersThenBodyDisconnect,
+                RawNativeReply::Success,
+            ],
+            success,
+        )
+        .await;
+        let app = native_response_test_app(client, temporary.path());
+
+        let response = send(
+            app,
+            TOKEN,
+            Body::from(serde_json::to_vec(&request_body("gpt-native")).unwrap()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response_body = to_bytes(response.into_body(), 4096).await.unwrap();
+        assert_eq!(response_body.as_ref(), success);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_response_mixed_transport_failures_share_one_four_attempt_budget() {
+        let temporary = tempfile::tempdir().unwrap();
+        let success = b"event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n";
+        let (client, hits, task) = start_raw_native_mock(
+            vec![
+                RawNativeReply::TransportDisconnect,
+                RawNativeReply::HeadersThenBodyDisconnect,
+                RawNativeReply::TransportDisconnect,
+                RawNativeReply::Success,
+            ],
+            success,
+        )
+        .await;
+        let app = native_response_test_app(client, temporary.path());
+
+        let response = send(
+            app,
+            TOKEN,
+            Body::from(serde_json::to_vec(&request_body("gpt-native")).unwrap()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response_body = to_bytes(response.into_body(), 4096).await.unwrap();
+        assert_eq!(response_body.as_ref(), success);
+        assert_eq!(hits.load(Ordering::SeqCst), 4);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_response_does_not_retry_after_first_body_bytes_reach_downstream() {
+        let temporary = tempfile::tempdir().unwrap();
+        let partial = b"event: response.created\ndata: {\"type\":\"response.created\"}\n\n";
+        let (client, hits, task) = start_raw_native_mock(
+            vec![RawNativeReply::BodyThenDisconnect],
+            partial,
+        )
+        .await;
+        let app = native_response_test_app(client, temporary.path());
+
+        let response = send(
+            app,
+            TOKEN,
+            Body::from(serde_json::to_vec(&request_body("gpt-native")).unwrap()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut stream = response.into_body().into_data_stream();
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first.as_ref(), partial);
+        assert!(stream.next().await.unwrap().is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        task.await.unwrap();
     }
 
     struct NativeApiMockState {
@@ -2817,7 +3084,14 @@ mod tests {
                 serde_json::from_slice::<Value>(&body).unwrap()["error"]["code"],
                 expected_code
             );
-            assert_eq!(mock.hits.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                mock.hits.load(Ordering::SeqCst),
+                if matches!(reply, MockReply::RateLimited) {
+                    EARLY_STREAM_RETRY_LIMIT + 1
+                } else {
+                    1
+                }
+            );
             task.abort();
         }
     }
