@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::io::{self, Cursor, Read};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -17,7 +18,7 @@ use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 
-use crate::catalog::ModelCatalog;
+use crate::catalog::{CatalogError, ModelCatalog};
 use crate::config::{CapabilityToken, RuntimeConfig};
 use crate::credential::{CredentialError, CredentialStore};
 use crate::grok::{GrokClient, GrokError, ResponsesTransportRequest};
@@ -421,7 +422,7 @@ async fn route_authorized_responses(
             );
         }
     };
-    let envelope: RouteEnvelope = match serde_json::from_slice(&decoded) {
+    let envelope: RoutedRequest = match serde_json::from_slice(&decoded) {
         Ok(envelope) => envelope,
         Err(_) => {
             return route_error(
@@ -433,14 +434,19 @@ async fn route_authorized_responses(
             );
         }
     };
+    drop(decoded);
+    let value = envelope.into_value();
+    let model = value["model"].as_str().expect("routing model was decoded as a string");
+    let catalog_read = state.catalog.routing_read().await;
     let native_route = match state.native.as_ref() {
         Some(native) => Some(native.route.snapshot().await),
         None => None,
     };
-    let is_grok = state.catalog.contains(&envelope.model).await;
+    let is_grok = catalog_read.contains(model);
+    drop(catalog_read);
     let is_native = native_route
         .as_ref()
-        .is_some_and(|route| route.contains(&envelope.model));
+        .is_some_and(|route| route.contains(model));
     let compatibility_fallback = native_route
         .as_ref()
         .and_then(NativeRouteState::native_compatibility_fallback)
@@ -453,7 +459,7 @@ async fn route_authorized_responses(
                     .as_ref()
                     .expect("Native classifier requires a Native service"),
             );
-            let body = match native_request_body(path, &parts.headers, body, &decoded, None) {
+            let body = match native_request_body(path, &parts.headers, body, value, None) {
                 Ok(body) => body,
                 Err(()) => {
                     return route_error(
@@ -496,7 +502,7 @@ async fn route_authorized_responses(
                 path,
                 &parts.headers,
                 body,
-                &decoded,
+                value,
                 Some(fallback_model),
             ) {
                 Ok(body) => body,
@@ -534,18 +540,6 @@ async fn route_authorized_responses(
         );
     }
 
-    let value: Value = match serde_json::from_slice(&decoded) {
-        Ok(value) => value,
-        Err(_) => {
-            return route_error(
-                StatusCode::BAD_REQUEST,
-                "request_json",
-                "invalid_request_error",
-                "invalid_json",
-                "Responses request body must be valid JSON",
-            );
-        }
-    };
     let normalized = match NormalizedResponsesRequest::parse(value) {
         Ok(normalized) => normalized,
         Err(error) => {
@@ -621,19 +615,27 @@ async fn route_authorized_responses(
         }
     };
 
+    let prepared = match (ResponsesTransportRequest {
+        body: &normalized,
+        conversation_id: routing.conversation_id(),
+        request_id: routing.request_id(),
+        agent_id: routing.agent_id(),
+        turn_index: routing.turn_index(),
+    }).prepare() {
+        Ok(prepared) => prepared,
+        Err(error) => return upstream_error(error),
+    };
     let mut early_retries = 0;
     let (prelude, upstream) = 'attempt: loop {
         let upstream = match service
             .client
-            .post_responses(
+            .post_prepared_responses(
                 Arc::clone(&credential),
-                ResponsesTransportRequest {
-                    body: &normalized,
-                    conversation_id: routing.conversation_id(),
-                    request_id: routing.request_id(),
-                    agent_id: routing.agent_id(),
-                    turn_index: routing.turn_index(),
-                },
+                &prepared,
+                routing.conversation_id(),
+                routing.request_id(),
+                routing.agent_id(),
+                routing.turn_index(),
             )
             .await
         {
@@ -767,12 +769,12 @@ async fn native_response(
     response
 }
 
-fn decode_request_copy(headers: &HeaderMap, raw: &[u8]) -> Result<Vec<u8>, ()> {
+fn decode_request_copy<'a>(headers: &HeaderMap, raw: &'a [u8]) -> Result<Cow<'a, [u8]>, ()> {
     let Some(encoding) = headers.get(CONTENT_ENCODING) else {
-        return Ok(raw.to_vec());
+        return Ok(Cow::Borrowed(raw));
     };
     match encoding.to_str().map_err(|_| ())?.trim() {
-        "identity" => Ok(raw.to_vec()),
+        "identity" => Ok(Cow::Borrowed(raw)),
         "zstd" => {
             let decoder = zstd::stream::read::Decoder::new(Cursor::new(raw)).map_err(|_| ())?;
             let mut decoded = Vec::new();
@@ -783,7 +785,7 @@ fn decode_request_copy(headers: &HeaderMap, raw: &[u8]) -> Result<Vec<u8>, ()> {
             if decoded.len() > MAX_RESPONSES_BODY_BYTES {
                 return Err(());
             }
-            Ok(decoded)
+            Ok(Cow::Owned(decoded))
         }
         _ => Err(()),
     }
@@ -793,13 +795,12 @@ fn native_request_body(
     path: NativeApiPath,
     headers: &HeaderMap,
     original: Bytes,
-    decoded: &[u8],
+    mut request: Value,
     model_override: Option<&str>,
 ) -> Result<Bytes, ()> {
     if path != NativeApiPath::Responses {
         return Ok(original);
     }
-    let mut request: Value = serde_json::from_slice(decoded).map_err(|_| ())?;
     let model_changed = model_override.is_some_and(|model| {
         let changed = request.get("model").and_then(Value::as_str) != Some(model);
         request["model"] = Value::String(model.to_owned());
@@ -824,8 +825,17 @@ fn native_request_body(
 }
 
 #[derive(Deserialize)]
-struct RouteEnvelope {
+struct RoutedRequest {
     model: String,
+    #[serde(flatten)]
+    fields: serde_json::Map<String, Value>,
+}
+
+impl RoutedRequest {
+    fn into_value(mut self) -> Value {
+        self.fields.insert("model".into(), Value::String(self.model));
+        Value::Object(self.fields)
+    }
 }
 
 fn stream_error_class(error: &GrokError) -> &'static str {
@@ -882,21 +892,38 @@ impl NativeRouteHandle {
         }
     }
 
-    pub async fn replace_catalog(&self, candidate: NativeRouteState) -> Result<(), NativeError> {
+    pub async fn replace_catalog(
+        &self,
+        catalog: &ModelCatalog,
+        grok_models: Vec<String>,
+        candidate: NativeRouteState,
+    ) -> Result<(), RoutingUpdateError> {
+        // Readers take this same lock before snapshotting Native state, so
+        // no request or /models response observes half of a publication.
+        let catalog_update = catalog.prepare_update(grok_models).await?;
         let mut route = self.route.write().await;
         if route.upstream() != candidate.upstream()
             || route.native_compatibility_fallback().is_some()
                 != candidate.native_compatibility_fallback().is_some()
         {
-            return Err(NativeError::InvalidState);
+            return Err(NativeError::InvalidState.into());
         }
         *route = candidate;
+        catalog_update.commit();
         Ok(())
     }
 
     async fn snapshot(&self) -> NativeRouteState {
         self.route.read().await.clone()
     }
+}
+
+#[derive(Debug, Error)]
+pub enum RoutingUpdateError {
+    #[error(transparent)]
+    Catalog(#[from] CatalogError),
+    #[error(transparent)]
+    Native(#[from] NativeError),
 }
 
 #[derive(Clone)]
@@ -1721,9 +1748,10 @@ mod tests {
         )
         .unwrap();
         let route = NativeRouteHandle::new(route);
+        let catalog = ModelCatalog::bootstrap().unwrap();
         let app = build_router_with_services(
             runtime_config(temporary.path()),
-            ModelCatalog::bootstrap().unwrap(),
+            catalog.clone(),
             None,
             Some(Arc::new(NativeService {
                 route: route.clone(),
@@ -1734,6 +1762,8 @@ mod tests {
 
         route
             .replace_catalog(
+                &catalog,
+                vec!["grok-4.6".into(), "grok-4.5".into()],
                 NativeRouteState::new(
                     crate::native::NativeUpstream::ChatgptCodex,
                     ["gpt-native".to_owned(), "gpt-6-astra".to_owned()],
@@ -1770,6 +1800,8 @@ mod tests {
         );
         compatibility
             .replace_catalog(
+                &catalog,
+                vec!["grok-4.6".into(), "grok-4.5".into()],
                 NativeRouteState::new_native_compatibility(
                     crate::native::NativeUpstream::ChatgptCodex,
                     ["gpt-native".to_owned(), "gpt-6-astra".to_owned()],
@@ -1787,6 +1819,58 @@ mod tests {
             Some("gpt-6-astra")
         );
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn routing_publication_keeps_both_catalogs_on_the_same_generation() {
+        use crate::native::NativeUpstream;
+        let catalog = ModelCatalog::from_ids(["grok-shared"]).unwrap();
+        let route = NativeRouteHandle::new(
+            NativeRouteState::new(NativeUpstream::ChatgptCodex, ["gpt-native".into()]).unwrap(),
+        );
+        let writer_catalog = catalog.clone();
+        let writer_route = route.clone();
+        let writer = tokio::spawn(async move {
+            for turn in 0..100 {
+                let (grok, native) = if turn % 2 == 0 {
+                    ("grok-other", "grok-shared")
+                } else {
+                    ("grok-shared", "gpt-native")
+                };
+                writer_route.replace_catalog(
+                    &writer_catalog,
+                    vec![grok.into()],
+                    NativeRouteState::new(NativeUpstream::ChatgptCodex, [native.into()]).unwrap(),
+                ).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        });
+        for _ in 0..100 {
+            let grok = catalog.routing_read().await;
+            let native = route.snapshot().await;
+            assert_ne!(grok.contains("grok-shared"), native.contains("grok-shared"));
+            drop(grok);
+            tokio::task::yield_now().await;
+        }
+        writer.await.unwrap();
+        let invalid_mode = NativeRouteState::new_native_compatibility(
+            NativeUpstream::ChatgptCodex, ["gpt-native".into()], "gpt-native".into(),
+        ).unwrap();
+        assert!(route.replace_catalog(&catalog, vec!["grok-unpublished".into()], invalid_mode).await.is_err());
+        let grok = catalog.routing_read().await;
+        assert!(grok.contains("grok-shared"));
+        assert!(!grok.contains("grok-unpublished"));
+        assert!(route.snapshot().await.native_compatibility_fallback().is_none());
+    }
+
+    #[test]
+    fn routed_request_preserves_json_fields_and_rejects_duplicate_models() {
+        let raw = r#"{"model":"grok-4.6","input":[{"role":"user","content":"hello"}],"tools":[],"store":false}"#;
+        let parsed: RoutedRequest = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.into_value(), serde_json::from_str::<Value>(raw).unwrap());
+        assert!(serde_json::from_str::<RoutedRequest>(r#"{"model":"grok-4.6","model":"gpt-native"}"#).is_err());
+        let headers = HeaderMap::new();
+        assert!(matches!(decode_request_copy(&headers, raw.as_bytes()).unwrap(), Cow::Borrowed(_)));
     }
 
     #[tokio::test]

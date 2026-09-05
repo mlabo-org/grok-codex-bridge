@@ -10,7 +10,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use serde::{Deserialize, Serialize};
 use tempfile::Builder;
 use thiserror::Error;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 pub const OFFICIAL_MODELS_ORIGIN: &str = "https://cli-chat-proxy.grok.com/v1/models";
 
@@ -43,9 +43,29 @@ impl ModelCatalog {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        let candidate = validate_models(models)?;
-        *self.models.write().await = candidate;
+        self.prepare_update(models).await?.commit();
         Ok(())
+    }
+
+    /// Hold this guard while reading the associated Native route. Publishers
+    /// acquire the catalog first and publish both halves before releasing it.
+    pub(crate) async fn routing_read(&self) -> CatalogRead<'_> {
+        CatalogRead(self.models.read().await)
+    }
+
+    pub(crate) async fn prepare_update<I, S>(
+        &self,
+        models: I,
+    ) -> Result<CatalogUpdate<'_>, CatalogError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let candidate = validate_models(models)?;
+        Ok(CatalogUpdate {
+            current: self.models.write().await,
+            candidate,
+        })
     }
 
     pub(crate) async fn response(&self) -> ModelList {
@@ -53,14 +73,6 @@ impl ModelCatalog {
             object: "list",
             data: self.models.read().await.clone(),
         }
-    }
-
-    pub(crate) async fn contains(&self, model: &str) -> bool {
-        self.models
-            .read()
-            .await
-            .iter()
-            .any(|candidate| candidate.id == model)
     }
 
     #[cfg(test)]
@@ -71,6 +83,25 @@ impl ModelCatalog {
             .iter()
             .map(|model| model.id.clone())
             .collect()
+    }
+}
+
+pub(crate) struct CatalogRead<'a>(RwLockReadGuard<'a, Vec<ModelObject>>);
+
+impl CatalogRead<'_> {
+    pub(crate) fn contains(&self, model: &str) -> bool {
+        self.0.iter().any(|candidate| candidate.id == model)
+    }
+}
+
+pub(crate) struct CatalogUpdate<'a> {
+    current: RwLockWriteGuard<'a, Vec<ModelObject>>,
+    candidate: Vec<ModelObject>,
+}
+
+impl CatalogUpdate<'_> {
+    pub(crate) fn commit(mut self) {
+        *self.current = self.candidate;
     }
 }
 

@@ -263,6 +263,12 @@ cp ./docs/bridge-config.example.toml ./bridge-config.local.toml
 
 ## 開発
 
+今回のmaterialize処理は、CargoとSwiftの中間出力を専用の一時ディレクトリへ置き、終了時に削除します。既存の `target/` や環境変数 `CARGO_TARGET_DIR` に依存せず、検証済みの本体とランチャーを `dist/` へ配置します。
+
+Grokモデル一覧の取得後は、その場でピッカーと実行経路を同期します。要求の振り分けではNativeとGrokの一覧を同じ公開状態から読み、同期に失敗した場合は以前の実行経路を維持します。設定復元時には、Desktop側で管理設定が書き直されていても、管理外のコメントや書式を保持します。
+
+同じサービスへの同時要求で認証が期限切れになった場合は、進行中の認証更新を共有し、公式helperの重複起動を避けます。Nativeへの退避更新の最終診断は `doctor --native-compatibility` を使い、Grok認証情報のパス解決・読込を行いません。通常の `doctor` は従来どおりGrok認証も検査します。
+
 ソースtestを実行します。
 
 ```sh

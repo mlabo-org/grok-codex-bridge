@@ -117,6 +117,7 @@ pub struct DoctorRequest {
     pub codex_home: PathBuf,
     pub launch_agent_path: PathBuf,
     pub credential_path: PathBuf,
+    pub native_compatibility: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -652,16 +653,18 @@ pub fn sync_installed_picker_catalog(
             (generated, native_route)
         };
         let native_route_bytes = native_route.to_json().map_err(LifecycleError::Native)?;
-        let current_config = config_plan
-            .current
-            .as_deref()
-            .ok_or(LifecycleError::InvalidPickerState)?;
+        let config_contents = render_picker_config(
+            &config_plan.render_base,
+            &generated_path,
+            bind,
+            capability,
+        )?;
         let state = PickerManagedState::new(
             native_catalog_identity.clone(),
             &grok_catalog,
             artifact_identity(&generated_path, generated.bytes())?,
             artifact_identity(&native_route_path, &native_route_bytes)?,
-            artifact_identity(config_path, current_config)?,
+            artifact_identity(config_path, config_contents.as_bytes())?,
             config_plan.rollback.clone(),
         )
         .map_err(LifecycleError::Picker)?;
@@ -670,6 +673,7 @@ pub fn sync_installed_picker_catalog(
             generated,
             native_route,
             native_route_bytes,
+            config_contents,
             state_bytes,
             native_catalog_identity,
             grok_catalog_identity,
@@ -679,6 +683,7 @@ pub fn sync_installed_picker_catalog(
         generated,
         native_route,
         native_route_bytes,
+        config_contents,
         state_bytes,
         native_catalog_identity,
         grok_catalog_identity,
@@ -692,6 +697,10 @@ pub fn sync_installed_picker_catalog(
 
     let generated_changed = generated.bytes() != previous_generated;
     let native_route_changed = native_route_bytes != previous_native_route;
+    let config_changed = config_plan
+        .current
+        .as_deref()
+        .is_none_or(|current| current != config_contents.as_bytes());
     let state_changed = state_bytes != previous_state_bytes;
     if generated_changed {
         if let Err(error) = atomic_write(&generated_path, generated.bytes(), 0o600) {
@@ -708,8 +717,27 @@ pub fn sync_installed_picker_catalog(
             return Err(error);
         }
     }
+    if config_changed {
+        if let Err(error) = atomic_write(&config_path, config_contents.as_bytes(), 0o600) {
+            if native_route_changed {
+                restore_optional_file(&native_route_path, Some(&previous_native_route), 0o600)?;
+            }
+            if generated_changed {
+                restore_optional_file(&generated_path, Some(&previous_generated), 0o600)?;
+            }
+            config_plan.abort()?;
+            return Err(error);
+        }
+    }
     if state_changed {
         if let Err(error) = atomic_write(&state_path, &state_bytes, 0o600) {
+            if config_changed {
+                restore_optional_file(
+                    &config_path,
+                    config_plan.current.as_deref(),
+                    config_plan.previous_mode,
+                )?;
+            }
             if native_route_changed {
                 restore_optional_file(&native_route_path, Some(&previous_native_route), 0o600)?;
             }
@@ -926,7 +954,9 @@ pub fn doctor(request: &DoctorRequest) -> Result<DoctorReport, LifecycleError> {
     validate_absolute_clean(&request.install_root)?;
     validate_absolute_clean(&request.codex_home)?;
     validate_absolute_clean(&request.launch_agent_path)?;
-    validate_absolute_clean(&request.credential_path)?;
+    if !request.native_compatibility {
+        validate_absolute_clean(&request.credential_path)?;
+    }
 
     let mut checks = Vec::new();
     let manifest_result = read_manifest(&request.install_root).and_then(|(manifest, raw)| {
@@ -1026,26 +1056,28 @@ pub fn doctor(request: &DoctorRequest) -> Result<DoctorReport, LifecycleError> {
         if manifest_has_secret { Err(()) } else { Ok(()) },
     );
 
-    let credential = CredentialStore::new(request.credential_path.clone())
-        .ok()
-        .map_or(
-            AuthStatus {
-                availability: AuthAvailability::Unavailable,
-                message: "Grok session credential is unavailable or invalid",
+    if !request.native_compatibility {
+        let credential = CredentialStore::new(request.credential_path.clone())
+            .ok()
+            .map_or(
+                AuthStatus {
+                    availability: AuthAvailability::Unavailable,
+                    message: "Grok session credential is unavailable or invalid",
+                },
+                |store| auth_status(&store),
+            );
+        check(
+            &mut checks,
+            "grok_credential",
+            "Grok credential is available and valid",
+            "Grok credential is unavailable, unsafe, expired, or invalid",
+            if credential.availability == AuthAvailability::Available {
+                Ok(())
+            } else {
+                Err(())
             },
-            |store| auth_status(&store),
         );
-    check(
-        &mut checks,
-        "grok_credential",
-        "Grok credential is available and valid",
-        "Grok credential is unavailable, unsafe, expired, or invalid",
-        if credential.availability == AuthAvailability::Available {
-            Ok(())
-        } else {
-            Err(())
-        },
-    );
+    }
 
     Ok(DoctorReport { checks })
 }
@@ -1259,16 +1291,20 @@ fn remove_rewritten_picker_config(
         return Err(LifecycleError::InvalidPickerState);
     }
 
-    table.remove("model_provider");
-    table.remove("model_catalog_json");
-    let providers = table
-        .get_mut("model_providers")
-        .and_then(toml::Value::as_table_mut)
-        .expect("validated picker provider table must remain a TOML table");
-    providers.remove(PICKER_PROVIDER_ID);
-    toml::to_string(&parsed)
-        .map_err(LifecycleError::SerializeConfig)
-        .map(Vec::from)
+    // Parse above validates ownership and this syntax-aware editor removes
+    // only the exact keys/table. Its document spans preserve unrelated
+    // comments, whitespace, quoted keys, inline tables, and multiline values.
+    let mut document = source
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|_| LifecycleError::InvalidPickerConfig)?;
+    document.remove("model_provider");
+    document.remove("model_catalog_json");
+    if let Some(providers) = document.get_mut("model_providers") {
+        if let Some(table) = providers.as_table_like_mut() {
+            table.remove(PICKER_PROVIDER_ID);
+        }
+    }
+    Ok(document.to_string().into_bytes())
 }
 
 fn picker_config_value(
@@ -2645,6 +2681,7 @@ mod tests {
                 codex_home: self.codex_home.clone(),
                 launch_agent_path: self.launch_agent.clone(),
                 credential_path: self.credential.clone(),
+                native_compatibility: false,
             }
         }
     }
@@ -2981,7 +3018,7 @@ mod tests {
         let desktop_value: toml::Value =
             toml::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
         let desktop_rewrite = format!(
-            "{}\n[marketplace]\nlast_refresh = \"desktop-current\"\n",
+            "# desktop comment\n{}\n[user_notes]\nmultiline = \"\"\"\n[model_providers.grok_codex_picker_backup]\n\"\"\"\n\n[other.model_providers_grok_codex_picker]\nkeep = true\n\n[marketplace]\nlast_refresh = \"desktop-current\"\n",
             toml::to_string(&desktop_value).unwrap()
         );
         assert!(!desktop_rewrite.contains(PICKER_BEGIN));
@@ -3014,6 +3051,16 @@ mod tests {
             recovered["marketplace"]["last_refresh"].as_str(),
             Some("desktop-current")
         );
+        assert!(fs::read_to_string(&config)
+            .unwrap()
+            .starts_with("# desktop comment\nmodel = \"gpt-native\"\n"));
+        let recovered_bytes = fs::read_to_string(&config).unwrap();
+        assert!(recovered_bytes.contains("[other.model_providers_grok_codex_picker]"));
+        assert!(recovered_bytes.contains("[model_providers.grok_codex_picker_backup]"));
+        assert_eq!(
+            recovered["user_notes"]["multiline"].as_str(),
+            Some("[model_providers.grok_codex_picker_backup]\n")
+        );
         assert!(recovered.get("model_provider").is_none());
         assert!(recovered.get("model_catalog_json").is_none());
         assert!(
@@ -3040,7 +3087,7 @@ mod tests {
         let desktop_value: toml::Value =
             toml::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
         let desktop_rewrite = format!(
-            "{}\n[app]\nlast_opened = \"desktop-current\"\n",
+            "# desktop comment\n{}\n[app]\nlast_opened = \"desktop-current\"\n",
             toml::to_string(&desktop_value).unwrap()
         );
         assert!(!desktop_rewrite.contains(PICKER_BEGIN));
@@ -3060,6 +3107,9 @@ mod tests {
             recovered["app"]["last_opened"].as_str(),
             Some("desktop-current")
         );
+        assert!(fs::read_to_string(&config)
+            .unwrap()
+            .starts_with("# desktop comment\nmodel = \"gpt-native\"\n"));
         assert!(recovered.get("model_provider").is_none());
         assert!(recovered.get("model_catalog_json").is_none());
         assert!(
@@ -3402,6 +3452,85 @@ mod tests {
                 .status,
             DoctorCheckStatus::Failed
         );
+    }
+
+    #[test]
+    fn native_compatibility_doctor_skips_missing_credential() {
+        let fixture = Fixture::new();
+        install(&fixture.install_request()).unwrap();
+        let mut request = fixture.doctor_request();
+        request.native_compatibility = true;
+        request.credential_path = PathBuf::from("unsafe relative credential path");
+
+        let report = doctor(&request).unwrap();
+
+        assert!(report.is_healthy());
+        assert!(report.checks.iter().all(|check| check.id != "grok_credential"));
+    }
+
+    #[test]
+    fn grok_doctor_still_fails_when_credential_is_missing() {
+        let fixture = Fixture::new();
+        install(&fixture.install_request()).unwrap();
+        let mut request = fixture.doctor_request();
+        request.credential_path = fixture.home.join("missing-grok-credential");
+
+        let report = doctor(&request).unwrap();
+
+        assert!(!report.is_healthy());
+        assert!(report.checks.iter().any(|check| {
+            check.id == "grok_credential" && check.status == DoctorCheckStatus::Failed
+        }));
+    }
+
+    #[test]
+    fn picker_sync_repairs_config_only_and_reports_change() {
+        let fixture = Fixture::new();
+        let (_receipt, _native_catalog) = install_test_picker(
+            &fixture,
+            b"# user comment\nmodel = \"gpt-native\"\n",
+        );
+        let config = fixture.codex_home.join("config.toml");
+        let rewritten = fs::read_to_string(&config)
+            .unwrap()
+            .replace(PICKER_BEGIN, "# picker removed")
+            .replace(PICKER_END, "# picker removed");
+        fs::write(&config, rewritten).unwrap();
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let synced = sync_installed_picker_catalog(&fixture.install_root.join("state/models.json"))
+            .unwrap()
+            .unwrap();
+
+        assert!(synced.changed);
+        let restored = fs::read_to_string(config).unwrap();
+        assert!(restored.contains(PICKER_BEGIN));
+        assert!(restored.contains("# user comment"));
+    }
+
+    #[test]
+    fn rewritten_picker_config_removes_exact_inline_provider_only() {
+        let source = concat!(
+            "# keep\n",
+            "model_provider = \"grok_codex_picker\"\n",
+            "model_catalog_json = \"/tmp/picker-models.json\"\n",
+            "[model_providers]\n",
+            "grok_codex_picker = { name = \"Grok Codex Picker Bridge\", base_url = \"http://127.0.0.1:4545/_grok/cap/v1\", wire_api = \"responses\", requires_openai_auth = true, supports_websockets = false }\n",
+            "other = { keep = true }\n",
+            "\n[other.model_providers_grok_codex_picker_backup]\nkeep = true\n",
+        );
+        let restored = remove_rewritten_picker_config(
+            source.as_bytes(),
+            Path::new("/tmp/picker-models.json"),
+            "127.0.0.1:4545".parse().unwrap(),
+            "cap",
+        )
+        .unwrap();
+        let restored = String::from_utf8(restored).unwrap();
+
+        assert!(!restored.contains("grok_codex_picker ="));
+        assert!(restored.contains("other = { keep = true }"));
+        assert!(restored.contains("[other.model_providers_grok_codex_picker_backup]"));
     }
 
     #[test]

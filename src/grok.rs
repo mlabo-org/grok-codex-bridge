@@ -95,8 +95,31 @@ impl GrokClient {
         credential: Arc<SessionCredential>,
         request: ResponsesTransportRequest<'_>,
     ) -> Result<ResponsesByteStream, GrokError> {
-        let model = request.body.model();
-        let body = request.body.to_xai_value();
+        let conversation_id = request.conversation_id;
+        let request_id = request.request_id;
+        let agent_id = request.agent_id;
+        let turn_index = request.turn_index;
+        let prepared = request.prepare()?;
+        self.post_prepared_responses(
+            credential,
+            &prepared,
+            conversation_id,
+            request_id,
+            agent_id,
+            turn_index,
+        )
+        .await
+    }
+
+    pub async fn post_prepared_responses(
+        &self,
+        credential: Arc<SessionCredential>,
+        request: &PreparedResponsesRequest,
+        conversation_id: Uuid,
+        request_id: Uuid,
+        agent_id: Uuid,
+        turn_index: usize,
+    ) -> Result<ResponsesByteStream, GrokError> {
         let url = self
             .base_url
             .join("responses")
@@ -104,13 +127,14 @@ impl GrokClient {
         let builder = self
             .authenticated(self.client.post(url), &credential)
             .header(ACCEPT, "text/event-stream")
-            .header("x-grok-conv-id", request.conversation_id.to_string())
-            .header("x-grok-req-id", request.request_id.to_string())
-            .header("x-grok-session-id", request.conversation_id.to_string())
-            .header("x-grok-turn-idx", request.turn_index.to_string())
-            .header("x-grok-agent-id", request.agent_id.to_string())
-            .header("x-grok-model-override", model)
-            .json(&body);
+            .header("x-grok-conv-id", conversation_id.to_string())
+            .header("x-grok-req-id", request_id.to_string())
+            .header("x-grok-session-id", conversation_id.to_string())
+            .header("x-grok-turn-idx", turn_index.to_string())
+            .header("x-grok-agent-id", agent_id.to_string())
+            .header("x-grok-model-override", &request.model)
+            .header(CONTENT_TYPE, "application/json")
+            .body(request.body.clone());
         let response = builder.send().await.map_err(GrokError::Transport)?;
         ensure_success(&response)?;
         let content_type = response
@@ -132,7 +156,7 @@ impl GrokClient {
         Ok(ResponsesByteStream {
             inner: Box::pin(stream),
             _credential: credential,
-            namespace_projection: request.body.namespace_projection(),
+            namespace_projection: request.namespace_projection.clone(),
         })
     }
 
@@ -159,6 +183,25 @@ pub struct ResponsesTransportRequest<'a> {
     pub request_id: Uuid,
     pub agent_id: Uuid,
     pub turn_index: usize,
+}
+
+pub struct PreparedResponsesRequest {
+    body: Bytes,
+    model: String,
+    namespace_projection: NamespaceToolProjection,
+}
+
+impl<'a> ResponsesTransportRequest<'a> {
+    pub fn prepare(self) -> Result<PreparedResponsesRequest, GrokError> {
+        let model = self.body.model().to_owned();
+        let body = serde_json::to_vec(&self.body.to_xai_value())
+            .map_err(|_| GrokError::RequestSerialization)?;
+        Ok(PreparedResponsesRequest {
+            body: Bytes::from(body),
+            model,
+            namespace_projection: self.body.namespace_projection(),
+        })
+    }
 }
 
 pub struct ResponsesByteStream {
@@ -458,6 +501,8 @@ pub enum GrokError {
     Protocol(#[from] ProtocolError),
     #[error("xAI Responses stream failed")]
     Stream(#[source] reqwest::Error),
+    #[error("failed to serialize the xAI Responses request")]
+    RequestSerialization,
 }
 
 impl GrokError {
@@ -508,6 +553,38 @@ mod tests {
             axum::serve(listener, router).await.unwrap();
         });
         (Url::parse(&format!("http://{address}/v1/")).unwrap(), task)
+    }
+
+    #[test]
+    fn prepared_responses_request_serializes_projection_once() {
+        let body = NormalizedResponsesRequest::parse(json!({
+            "model": "grok-4.7",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hello"}]
+            }],
+            "tools": [],
+            "tool_choice": "auto",
+            "parallel_tool_calls": false,
+            "store": false,
+            "stream": true,
+            "include": []
+        }))
+        .unwrap();
+        let expected = body.to_xai_value();
+        let prepared = ResponsesTransportRequest {
+            body: &body,
+            conversation_id: Uuid::new_v4(),
+            request_id: Uuid::new_v4(),
+            agent_id: Uuid::new_v4(),
+            turn_index: 1,
+        }
+        .prepare()
+        .unwrap();
+
+        assert_eq!(serde_json::from_slice::<Value>(&prepared.body).unwrap(), expected);
+        assert_eq!(prepared.model, "grok-4.7");
     }
 
     #[tokio::test]

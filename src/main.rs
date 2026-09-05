@@ -24,7 +24,7 @@ use grok_codex_bridge::lifecycle::{
 };
 use grok_codex_bridge::native::NativeError;
 use grok_codex_bridge::picker_activation::{PickerActivationRequest, activate_picker};
-use grok_codex_bridge::server::NativeRouteHandle;
+use grok_codex_bridge::server::{NativeRouteHandle, RoutingUpdateError};
 use grok_codex_bridge::{
     ArtifactIdentity, CatalogCache, CatalogCommand, CatalogError, CatalogSnapshot, Cli, Command,
     CredentialStore, GrokClient, GrokConfig, ModelCatalog, NativeUpstream, RuntimeConfig, bind,
@@ -457,9 +457,13 @@ fn install_command(arguments: InstallArgs) -> Result<ExitCode, OperationError> {
 
 fn doctor_command(arguments: DoctorArgs) -> Result<ExitCode, OperationError> {
     let paths = resolve_lifecycle_paths(&arguments.paths)?;
-    let credential_path = match arguments.credential_file {
-        Some(path) => require_absolute(path, "credential file")?,
-        None => resolve_credential_path()?,
+    let credential_path = if arguments.native_compatibility {
+        PathBuf::new()
+    } else {
+        match arguments.credential_file {
+            Some(path) => require_absolute(path, "credential file")?,
+            None => resolve_credential_path()?,
+        }
     };
     let spec = recommended_launch_agent(&paths.install_root)?;
     let report = doctor(&DoctorRequest {
@@ -467,6 +471,7 @@ fn doctor_command(arguments: DoctorArgs) -> Result<ExitCode, OperationError> {
         codex_home: paths.codex_home,
         launch_agent_path: paths.launch_agent,
         credential_path,
+        native_compatibility: arguments.native_compatibility,
     })?;
     let service = service_status(&spec)?;
 
@@ -720,7 +725,7 @@ async fn maintain_catalogs(
     native_route: Option<NativeRouteHandle>,
 ) {
     if grok.refresh_on_start() {
-        match refresh_catalog(&grok, &catalog).await {
+        match refresh_catalog(&grok).await {
             Ok(count) => tracing::info!(models = count, "Grok model catalog refreshed"),
             Err(error) => tracing::warn!(
                 error_class = error.class(),
@@ -758,50 +763,50 @@ async fn maintain_catalogs(
     grok_refresh.tick().await;
 
     loop {
-        tokio::select! {
-            _ = native_poll.tick() => {
-                let inputs_changed = match watch.as_mut() {
-                    Some(watch) => watch.inputs_changed().unwrap_or(true),
-                    None => true,
-                };
-                if inputs_changed && Instant::now() >= sync_retry_after {
-                    match sync_runtime_picker(&grok, &catalog, native_route.as_ref()).await {
-                        Ok(Some((changed, next_watch))) => {
-                            watch = Some(next_watch);
-                            sync_retry_after = Instant::now();
-                            if changed || sync_failure_reported {
-                                tracing::info!("merged picker catalog synchronized");
-                            }
-                            sync_failure_reported = false;
-                        }
-                        Ok(None) => {
-                            watch = None;
-                            sync_retry_after = Instant::now() + CATALOG_SYNC_RETRY_INTERVAL;
-                        }
-                        Err(error) => {
-                            if !sync_failure_reported {
-                                tracing::warn!(
-                                    error_class = error.class(),
-                                    "merged picker catalog synchronization deferred"
-                                );
-                            }
-                            sync_failure_reported = true;
-                            sync_retry_after = Instant::now() + CATALOG_SYNC_RETRY_INTERVAL;
-                        }
-                    }
+        let refresh_grok = tokio::select! {
+            _ = native_poll.tick() => false,
+            _ = grok_refresh.tick(), if grok.refresh_on_start() => true,
+        };
+        if refresh_grok {
+            match refresh_catalog(&grok).await {
+                Ok(count) => {
+                    tracing::info!(models = count, "Grok model catalog refreshed");
+                    sync_retry_after = Instant::now();
+                    watch = None;
                 }
+                Err(error) => tracing::warn!(
+                    error_class = error.class(),
+                    "Grok model catalog refresh skipped"
+                ),
             }
-            _ = grok_refresh.tick(), if grok.refresh_on_start() => {
-                match refresh_catalog(&grok, &catalog).await {
-                    Ok(count) => {
-                        tracing::info!(models = count, "Grok model catalog refreshed");
-                        sync_retry_after = Instant::now();
-                        watch = None;
+        }
+        let inputs_changed = match watch.as_mut() {
+            Some(watch) => watch.inputs_changed().unwrap_or(true),
+            None => true,
+        };
+        if inputs_changed && Instant::now() >= sync_retry_after {
+            match sync_runtime_picker(&grok, &catalog, native_route.as_ref()).await {
+                Ok(Some((changed, next_watch))) => {
+                    watch = Some(next_watch);
+                    sync_retry_after = Instant::now();
+                    if changed || sync_failure_reported {
+                        tracing::info!("merged picker catalog synchronized");
                     }
-                    Err(error) => tracing::warn!(
-                        error_class = error.class(),
-                        "Grok model catalog refresh skipped"
-                    ),
+                    sync_failure_reported = false;
+                }
+                Ok(None) => {
+                    watch = None;
+                    sync_retry_after = Instant::now() + CATALOG_SYNC_RETRY_INTERVAL;
+                }
+                Err(error) => {
+                    if !sync_failure_reported {
+                        tracing::warn!(
+                            error_class = error.class(),
+                            "merged picker catalog synchronization deferred"
+                        );
+                    }
+                    sync_failure_reported = true;
+                    sync_retry_after = Instant::now() + CATALOG_SYNC_RETRY_INTERVAL;
                 }
             }
         }
@@ -813,6 +818,15 @@ async fn sync_runtime_picker(
     catalog: &ModelCatalog,
     native_route: Option<&NativeRouteHandle>,
 ) -> Result<Option<(bool, CatalogInputWatch)>, CatalogMaintenanceError> {
+    // An isolated provider has no managed picker/Native route to publish.
+    // A merged picker must validate and publish its disk state before either
+    // live allowlist advances.
+    let Some(native_route) = native_route else {
+        if let Some(snapshot) = CatalogCache::new(grok.catalog_cache_file()).load()? {
+            catalog.replace(snapshot.model_ids().iter().cloned()).await?;
+        }
+        return Ok(None);
+    };
     for _ in 0..CATALOG_SYNC_MAX_ATTEMPTS {
         let Some(receipt) = sync_installed_picker_catalog(grok.catalog_cache_file())? else {
             return Ok(None);
@@ -821,10 +835,9 @@ async fn sync_runtime_picker(
         if watch.inputs_changed()? {
             continue;
         }
-        catalog.replace(receipt.grok_model_ids).await?;
-        if let Some(native_route) = native_route {
-            native_route.replace_catalog(receipt.native_route).await?;
-        }
+        native_route
+            .replace_catalog(catalog, receipt.grok_model_ids, receipt.native_route)
+            .await?;
         return Ok(Some((receipt.changed, watch)));
     }
     Err(CatalogMaintenanceError::InputsChangedDuringSync)
@@ -933,6 +946,8 @@ enum CatalogMaintenanceError {
     Catalog(#[from] CatalogError),
     #[error(transparent)]
     Native(#[from] NativeError),
+    #[error(transparent)]
+    Routing(#[from] RoutingUpdateError),
     #[error("failed to inspect a catalog input")]
     Inspect(#[from] std::io::Error),
     #[error("catalog inputs changed repeatedly during synchronization")]
@@ -944,7 +959,7 @@ impl CatalogMaintenanceError {
         match self {
             Self::Lifecycle(_) => "picker_catalog",
             Self::Catalog(_) => "grok_catalog",
-            Self::Native(_) => "native_route",
+            Self::Native(_) | Self::Routing(_) => "native_route",
             Self::Inspect(_) | Self::InputsChangedDuringSync => "catalog_input",
         }
     }
@@ -978,13 +993,11 @@ async fn prepare_catalog(config: &GrokConfig) -> Result<ModelCatalog, RunError> 
 
 async fn refresh_command(path: &std::path::Path) -> Result<usize, RefreshError> {
     let config = RuntimeConfig::load(path).map_err(RefreshError::Config)?;
-    let catalog = ModelCatalog::bootstrap().map_err(RefreshError::Catalog)?;
-    refresh_catalog(config.grok(), &catalog).await
+    refresh_catalog(config.grok()).await
 }
 
 async fn refresh_catalog(
     config: &GrokConfig,
-    catalog: &ModelCatalog,
 ) -> Result<usize, RefreshError> {
     let credential_store = CredentialStore::from_environment().map_err(RefreshError::Credential)?;
     let credential = credential_store.load().map_err(RefreshError::Credential)?;
@@ -997,10 +1010,6 @@ async fn refresh_catalog(
         CatalogSnapshot::new(fetched.models, fetched.etag).map_err(RefreshError::Catalog)?;
     CatalogCache::new(config.catalog_cache_file())
         .persist(&snapshot)
-        .map_err(RefreshError::Catalog)?;
-    catalog
-        .replace(snapshot.model_ids().iter().cloned())
-        .await
         .map_err(RefreshError::Catalog)?;
     Ok(snapshot.model_ids().len())
 }
