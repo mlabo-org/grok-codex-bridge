@@ -36,7 +36,7 @@ dist/aarch64-apple-darwin/
     └── Contents/Resources/grok-codex-bridge-overlay.md
 ```
 
-`target/` is only a build cache. `dist/` is only local materialized output. Neither is authoritative source or a distribution payload.
+The materialization script uses a private temporary directory for Cargo and Swift intermediates and removes it on exit. Cargo's output directory and the executable copy source are resolved together, independently of `CARGO_TARGET_DIR`. A pre-existing repository `target/` is neither read nor removed. `dist/` contains only the verified local materialized output; it is not authoritative source or a distribution payload.
 
 The normal runtime never invokes Cargo, `rustc`, `swiftc`, a build-on-first-use path, an interpreted fallback, or a binary from `target/`. Missing or stale materialized output fails closed and instructs the user to run the materialization script.
 
@@ -66,6 +66,8 @@ Installation copies the paired runtime and its resource into the per-user instal
 The lifecycle manifest and user LaunchAgent record the bridge-owned paths. The installed launcher bundle must be a regular, non-symlink app bundle with a valid executable, Info.plist, and non-empty UTF-8 overlay snapshot. The installed bridge and launcher are replaced as a pair by `scripts/replace-installed-bridge.sh`; replacement stages both, stops the service, swaps both, verifies the new version and launcher signature, restarts the service, and attempts a bounded rollback if the operation fails. Direct and Grok-mode replacements run the new binary's `auth ensure` before service shutdown. A coordinator invocation explicitly targeting Native compatibility skips Grok credential access while preserving pair validation and rollback.
 
 Source build/materialization and installed-runtime replacement are update operations. They are not normal mode switches and should be initiated from a Native GPT task or Terminal when the current Grok task depends on the bridge service.
+
+The Native compatibility replacement also passes `--native-compatibility` to its final `doctor` invocation. This checks the runtime and service without resolving or reading Grok credentials, so a missing or expired Grok login cannot reject an otherwise valid Native escape update.
 
 Updating from the repository therefore requires the source checkout containing the new materialized pair and replacement script. This is a deliberate source-install/update boundary. It does not make the repository a dependency of the already installed normal switching path.
 

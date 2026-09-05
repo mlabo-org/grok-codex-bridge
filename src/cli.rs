@@ -118,6 +118,9 @@ pub struct DoctorArgs {
     /// Grok credential file to inspect read-only.
     #[arg(long, value_name = "FILE")]
     pub credential_file: Option<PathBuf>,
+    /// Validate Native compatibility without reading the Grok credential.
+    #[arg(long)]
+    pub native_compatibility: bool,
 }
 
 #[derive(Debug, Clone, Args)]

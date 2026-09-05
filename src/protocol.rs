@@ -468,6 +468,7 @@ fn project_input_for_xai(input: &[InputItem]) -> Vec<Value> {
         .collect::<HashSet<_>>();
     let mut open_call_ids = HashSet::new();
     let mut open_batch_start = None;
+    let mut deferred_assistant_messages = Vec::new();
     let mut projected = Vec::with_capacity(input.len());
 
     for item in input {
@@ -487,10 +488,7 @@ fn project_input_for_xai(input: &[InputItem]) -> Vec<Value> {
                 ..
             }) if !open_call_ids.is_empty() => {
                 if let Some(value) = item.to_grok_value() {
-                    let insertion_index = open_batch_start
-                        .expect("an open call batch always records its projected start");
-                    projected.insert(insertion_index, value);
-                    open_batch_start = Some(insertion_index + 1);
+                    deferred_assistant_messages.push(value);
                 }
                 continue;
             }
@@ -511,8 +509,22 @@ fn project_input_for_xai(input: &[InputItem]) -> Vec<Value> {
             _ => {}
         }
         if open_call_ids.is_empty() {
-            open_batch_start = None;
+            if let Some(batch_start) = open_batch_start.take()
+                && !deferred_assistant_messages.is_empty()
+            {
+                let mut batch = projected.split_off(batch_start);
+                projected.append(&mut deferred_assistant_messages);
+                projected.append(&mut batch);
+            }
         }
+    }
+
+    if let Some(batch_start) = open_batch_start
+        && !deferred_assistant_messages.is_empty()
+    {
+        let mut batch = projected.split_off(batch_start);
+        projected.append(&mut deferred_assistant_messages);
+        projected.append(&mut batch);
     }
 
     projected
@@ -4435,6 +4447,11 @@ mod tests {
                 "content": [{"type": "output_text", "text": "Checking the active runtime."}]
             },
             {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "I will inspect the result next."}]
+            },
+            {
                 "type": "function_call",
                 "name": "read_file",
                 "call_id": "call-3",
@@ -4455,6 +4472,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 "message",
+                "message",
                 "function_call",
                 "function_call",
                 "function_call",
@@ -4464,12 +4482,13 @@ mod tests {
             ]
         );
         assert_eq!(input[0]["content"], "Checking the active runtime.");
-        assert_eq!(input[1]["call_id"], "call-1");
-        assert_eq!(input[2]["call_id"], "call-2");
-        assert_eq!(input[3]["call_id"], "call-3");
-        assert_eq!(input[4]["call_id"], "call-1");
-        assert_eq!(input[5]["call_id"], "call-2");
-        assert_eq!(input[6]["call_id"], "call-3");
+        assert_eq!(input[1]["content"], "I will inspect the result next.");
+        assert_eq!(input[2]["call_id"], "call-1");
+        assert_eq!(input[3]["call_id"], "call-2");
+        assert_eq!(input[4]["call_id"], "call-3");
+        assert_eq!(input[5]["call_id"], "call-1");
+        assert_eq!(input[6]["call_id"], "call-2");
+        assert_eq!(input[7]["call_id"], "call-3");
     }
 
     #[test]

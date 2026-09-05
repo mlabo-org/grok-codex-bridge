@@ -5,7 +5,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration as StdDuration, Instant, SystemTime};
 
@@ -26,6 +26,7 @@ pub struct CredentialStore {
     path: PathBuf,
     official_cli: PathBuf,
     cached: Mutex<Option<CachedCredential>>,
+    renewal: RenewalGate,
 }
 
 impl CredentialStore {
@@ -51,6 +52,7 @@ impl CredentialStore {
             path,
             official_cli,
             cached: Mutex::new(None),
+            renewal: RenewalGate::default(),
         })
     }
 
@@ -102,22 +104,74 @@ impl CredentialStore {
         grace_period: StdDuration,
     ) -> Result<Arc<SessionCredential>, CredentialError> {
         let deadline = Instant::now() + grace_period;
-        let mut refresh_attempted = false;
+        let initial_error = match self.load() {
+            Ok(credential) => return Ok(credential),
+            Err(error) if error.allows_official_login() => error,
+            Err(error) => return Err(error),
+        };
+        if deadline.saturating_duration_since(Instant::now()).is_zero() {
+            return Err(initial_error);
+        }
+
+        let mut gate = self
+            .renewal
+            .state
+            .lock()
+            .map_err(|_| CredentialError::CacheUnavailable)?;
+        if gate.in_flight {
+            let generation = gate.generation;
+            while gate.in_flight && gate.generation == generation {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(initial_error);
+                }
+                let (next_gate, timeout) = self
+                    .renewal
+                    .completed
+                    .wait_timeout(gate, remaining)
+                    .map_err(|_| CredentialError::CacheUnavailable)?;
+                gate = next_gate;
+                if timeout.timed_out() {
+                    return Err(initial_error);
+                }
+            }
+            drop(gate);
+            return match self.load() {
+                Ok(credential) => Ok(credential),
+                Err(error) if !error.allows_official_login() => Err(error),
+                Err(_) => Err(initial_error),
+            };
+        }
+
+        gate.in_flight = true;
+        drop(gate);
+
+        let result = self.renew_credential_until(initial_error, deadline);
+        let mut gate = self
+            .renewal
+            .state
+            .lock()
+            .map_err(|_| CredentialError::CacheUnavailable)?;
+        gate.in_flight = false;
+        gate.generation = gate.generation.wrapping_add(1);
+        self.renewal.completed.notify_all();
+        drop(gate);
+        result
+    }
+
+    fn renew_credential_until(
+        &self,
+        initial_error: CredentialError,
+        deadline: Instant,
+    ) -> Result<Arc<SessionCredential>, CredentialError> {
+        let _ = run_official_refresh(&self.official_cli);
         loop {
             match self.load() {
                 Ok(credential) => return Ok(credential),
                 Err(error) => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
-                    if !error.allows_official_login() {
-                        return Err(error);
-                    }
-                    if remaining.is_zero() {
-                        return Err(error);
-                    }
-                    if !refresh_attempted {
-                        refresh_attempted = true;
-                        let _ = run_official_refresh(&self.official_cli);
-                        continue;
+                    if !error.allows_official_login() || remaining.is_zero() {
+                        return Err(initial_error);
                     }
                     thread::sleep(RENEWAL_POLL_INTERVAL.min(remaining));
                 }
@@ -441,6 +495,18 @@ struct CachedCredential {
     credential: Arc<SessionCredential>,
 }
 
+#[derive(Default)]
+struct RenewalGate {
+    state: Mutex<RenewalState>,
+    completed: Condvar,
+}
+
+#[derive(Default)]
+struct RenewalState {
+    in_flight: bool,
+    generation: u64,
+}
+
 #[cfg(test)]
 pub(crate) fn test_session_credential(token: &str, user_id: &str) -> SessionCredential {
     SessionCredential {
@@ -508,6 +574,7 @@ impl CredentialError {
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Arc, Barrier};
 
     use super::*;
 
@@ -644,6 +711,90 @@ mod tests {
                 .load_with_renewal_grace(StdDuration::from_secs(1)),
             Err(CredentialError::ExpiredSessionCredential)
         ));
+    }
+
+    #[test]
+    fn concurrent_renewal_waiters_share_one_successful_helper_run() {
+        let temporary = tempfile::tempdir().unwrap();
+        let auth_home = temporary.path();
+        let path = auth_home.join("auth.json");
+        let helper = auth_home.join("bin/grok");
+        let count = auth_home.join("refresh-count");
+        fs::create_dir(auth_home.join("bin")).unwrap();
+        write_auth(&path, &record("expired", "2020-01-01T00:00:00Z"), 0o600);
+        write_helper(
+            &helper,
+            &format!(
+                "sleep 0.1\ncount=0\nif [ -f '{}' ]; then count=$(cat '{}'); fi\ncount=$((count + 1))\nprintf '%s' \"$count\" > '{}'\nprintf '%s' '{}' > '{}.tmp'\nchmod 600 '{}.tmp'\nmv '{}.tmp' '{}'",
+                count.display(),
+                count.display(),
+                count.display(),
+                record("renewed", "2099-01-01T00:00:00Z"),
+                path.display(),
+                path.display(),
+                path.display(),
+                path.display(),
+            ),
+        );
+
+        let store = Arc::new(CredentialStore::new(path).unwrap());
+        let barrier = Arc::new(Barrier::new(4));
+        let mut workers = Vec::new();
+        for _ in 0..4 {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            workers.push(thread::spawn(move || {
+                barrier.wait();
+                // Use the provider's renewal budget: an unrelated parallel
+                // filesystem/helper test must not consume a one-second mock
+                // deadline before this helper can publish its replacement.
+                store.load_with_renewal_grace(StdDuration::from_secs(60))
+            }));
+        }
+        let results = workers.into_iter().map(|worker| worker.join().unwrap()).collect::<Vec<_>>();
+        for result in results {
+            assert_eq!(result.unwrap().token(), "renewed");
+        }
+        assert_eq!(fs::read_to_string(count).unwrap(), "1");
+    }
+
+    #[test]
+    fn concurrent_renewal_waiters_share_one_failed_helper_run() {
+        let temporary = tempfile::tempdir().unwrap();
+        let auth_home = temporary.path();
+        let path = auth_home.join("auth.json");
+        let helper = auth_home.join("bin/grok");
+        let count = auth_home.join("refresh-count");
+        fs::create_dir(auth_home.join("bin")).unwrap();
+        write_auth(&path, &record("expired", "2020-01-01T00:00:00Z"), 0o600);
+        write_helper(
+            &helper,
+            &format!(
+                "sleep 0.1\ncount=0\nif [ -f '{}' ]; then count=$(cat '{}'); fi\ncount=$((count + 1))\nprintf '%s' \"$count\" > '{}'\nexit 7",
+                count.display(),
+                count.display(),
+                count.display(),
+            ),
+        );
+
+        let store = Arc::new(CredentialStore::new(path).unwrap());
+        let barrier = Arc::new(Barrier::new(4));
+        let mut workers = Vec::new();
+        for _ in 0..4 {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            workers.push(thread::spawn(move || {
+                barrier.wait();
+                store.load_with_renewal_grace(StdDuration::from_secs(1))
+            }));
+        }
+        for worker in workers {
+            assert!(matches!(
+                worker.join().unwrap(),
+                Err(CredentialError::ExpiredSessionCredential)
+            ));
+        }
+        assert_eq!(fs::read_to_string(count).unwrap(), "1");
     }
 
     #[test]

@@ -59,6 +59,8 @@ The repository entry points install or update the locally materialized runtime p
 
 `grok-codex.sh` never compiles automatically. If either materialized component is missing or stale, it stops and asks you to run `./scripts/materialize-macos.sh` first. Source installation and updates therefore depend on the checkout; after installation, normal `mode grok` / `mode native` switching uses only the installed runtime tree and does not depend on the checkout.
 
+Materialization keeps Cargo and Swift intermediates in a temporary directory and removes them on exit. It copies the verified pair to `dist/` without relying on an existing `target/` directory or the ambient `CARGO_TARGET_DIR` setting.
+
 After installation, normal switching is repository-independent and runs the installed native executable directly:
 
 ```sh
@@ -153,6 +155,8 @@ The command accepts only the app-bundled Codex authenticated through ChatGPT, re
 
 After activation, the resident bridge checks only the `models_cache.json` metadata at startup and once per hour, validates its contents only after a change, and automatically reconciles new Native models into both the merged picker and the live route. It performs no per-request catalog check. The service also fetches the official Grok catalog at startup and every hour, admitting future `grok-` models through the same path. New model releases require neither a manual `grok` / `native` switch nor a manual `catalog refresh`. A failed synchronization preserves the last-known-good state and retries on the next hourly cycle without force-quitting ChatGPT.app merely for a catalog change.
 
+Each successful Grok fetch triggers picker synchronization immediately. Requests read Native and Grok routing from the same publication, and a failed picker update leaves the previous live routing intact. Configuration recovery preserves unrelated comments and formatting, including after Desktop has rewritten the managed settings.
+
 Start a fresh Codex CLI process after activation. Fully quit and relaunch Codex Desktop before testing the Desktop picker.
 
 ![Codex Desktop model picker with Native GPT models plus grok-4.5 and grok-4.6](docs/images/desktop-merged-picker.png)
@@ -226,6 +230,8 @@ The selected file is opened read-only without following symlinks. `GROK_AUTH_PAT
 The bridge uses `expires_at` when the official session record provides it. If that field is absent, it uses `create_time + 30 days` as its parser fallback; this is not a promise about the official Grok session lifetime. `auth status` reports credential availability without revealing the credential or its expiry timestamp.
 
 When a Responses provider request encounters recoverable missing, incomplete, or expired credential state, the bridge invokes the official `bin/grok models` command once with stdin, stdout, and stderr disconnected and a 7-second timeout. It then rereads the authoritative file for up to 60 seconds. This non-interactive path does not open a browser; if it cannot refresh, the request fails with an authentication error.
+
+Concurrent requests in the same service share an ongoing renewal instead of launching duplicate helpers. Native compatibility updates use `doctor --native-compatibility` for the final runtime check, which does not resolve or read Grok credentials. Normal `doctor` retains its Grok credential check.
 
 For explicit lifecycle work, `auth ensure` first performs the same read-only check and silent refresh. A valid or silently renewed credential exits immediately. If recoverable missing, incomplete, or expired state remains, it launches the official desktop OAuth flow once with process output suppressed, waits up to five minutes for browser completion, and rereads the authoritative file. The official CLI owns the browser and credential update; malformed, ambiguous, or unsafe files fail closed without launching login.
 

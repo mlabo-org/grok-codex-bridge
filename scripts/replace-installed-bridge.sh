@@ -180,7 +180,11 @@ if ! wait_for_service_state "$installed_binary" "service loaded"; then
     fail "new bridge service did not reach loaded state before the bounded deadline"
 fi
 service_state="service loaded"
-"$installed_binary" doctor
+if [ "$native_compatibility" -eq 1 ]; then
+    "$installed_binary" doctor --native-compatibility
+else
+    "$installed_binary" doctor
+fi
 
 printf '%s\n' "bridge replaced: $installed_binary"
 printf '%s\n' "launcher replaced: $installed_launcher"

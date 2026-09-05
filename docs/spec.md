@@ -51,6 +51,8 @@ source checkout
 
 `scripts/materialize-macos.sh`はRust executableとSwift launcher appを生成し、署名検証まで行う。通常runtimeはmaterialized成果物を直接実行する。build-on-first-use、`cargo run`、arbitrary Cargo cache探索、interpreted fallbackは禁止する。
 
+RustとSwiftの中間出力は処理専用の一時directoryへ置き、終了時に削除する。Cargoにはこの出力先を明示し、同じ場所から成果物を取り出す。環境の `CARGO_TARGET_DIR` やrepo内の古い `target/` を成果物の取り出し元にしない。両成果物の検証を終えてから `dist/` へ配置する。
+
 `grok-codex-bridge install`は、materialized Rust binary、launcher app、runtime config、bootstrap catalog、caller capability、manifestをinstall rootへ原子的に配置し、Codexのisolated `grok-bridge.config.toml`とLaunchAgentを可逆的に用意する。既存のprofileとLaunchAgentは非上書きbackupへ保存する。
 
 source更新は通常の環境切り替えとは別の明示操作である。更新時は新しいRust binaryとSwift launcherを検証し、Desktop停止要求より前にserviceを停止して原子的に交換し、serviceが `loaded` へ収束したことを確認する。失敗時は旧binary、旧launcher、service状態を復元し、Desktop停止へ進まない。Grok modeを公開または維持する交換はservice停止前にnew binaryの`auth ensure`を完了する。Native compatibilityを明示した退避交換はGrok credentialをread、refresh、loginせず、pair検証とrollbackだけを同じ交換経路で行う。
@@ -74,6 +76,8 @@ pickerはNative catalogのコピーへ、Grok catalogから許可されたmodel 
 
 再生成時はgenerated catalog、Native route state、managed-state identityを一つのrecoverable operationとして更新し、実行中serviceのNative allowlistとGrok allowlistも同じ結果へ切り替える。入力が不正、部分書込み中、またはmanaged stateと競合する場合はlast-known-goodを維持し、次の1時間周期で再試行する。catalog同期だけを理由にChatGPT.appを強制終了または自動再起動しない。
 
+Grok一覧の取得成功後は、次のNative監視周期を待たずに同じ同期処理を実行する。取得した候補だけで実行中Grok allowlistを先行更新しない。要求の振り分けはNative/Grok両一覧を同じ公開状態から読み、同期が失敗した場合は以前の振り分けを維持する。同期結果の `changed` はcatalog・routeだけでなく、設定とmanaged stateの変更も含む。
+
 Codex configのmanaged blockは `model_provider = "grok_codex_picker"`、generated catalog path、loopback provider、caller headerを所有する。provider identityはNative modeでも削除・改名・置換しない。これにより保存済みprovider/model値をそのまま認識できる。
 
 Native compatibility catalogでは、Grok slugを非選択の `visibility = "hide"` metadataとして残し、Native fallback modelへrouteする。これはpicker表示用のデータ変換であり、task DB、SQLite、rollout、session履歴の書き換えではない。
@@ -83,6 +87,8 @@ Native compatibility catalogでは、Grok slugを非選択の `visibility = "hid
 bridgeは `POST /v1/responses` と、Native補助APIの必要なResponses経路をloopbackで提供する。Grok requestではvalidなtext、画像、function call/output、tool call ID、`call_id`、必要なtool schemaを保持する。provider固有で再利用不能なforeign artifactだけをitem単位で除外し、非objectなど構造不正なinput itemは削除せず`invalid_request_error`で拒否する。GrokからNativeへ戻す混在履歴では、Grok reasoningと、それに付随するprovider固有の`web_search_call`実行記録をNative upstreamへ送らず、tool call/outputを結ぶ`call_id`は保持する。Codex履歴で完了済みparallel tool batchの途中にassistant messageがある場合は、message本文、call順、output順、`call_id`を保持したままxAI projection内だけでそのmessageをbatch直前へ移動し、Codexの保存履歴は変更しない。
 
 Codex側へはResponses-compatible SSEを返す。text、reasoning summary、function call、terminal/usageを投影する。既知eventはそのevent種別に必要なresponse ID、item ID、payloadを検証し、欠損を空文字やindex既定値で有効化しない。unknown補助eventは内容を捏造せずpassthroughする。downstreamへresponse内容を確定する前に限り、upstream transport確立またはbody streamのtransport failureを最大3回再試行する。一度でも有用なresponse内容を送信した後はrequestを再実行しない。終了markerが欠けた場合もoutput itemを捏造せず、必要な `response.completed` だけを合成する。
+
+要求JSONは振り分けとprovider変換で解析結果を共有する。Native向けの変更が不要な場合は元のHTTP bodyを維持する。Grok向け送信本文は一度投影・serializeし、早期再試行では同じbytesを再利用する。parallel tool batchの並べ替えではassistant messageをまとめて前置し、messageごとの中間挿入を行わない。
 
 Native routeではxAI headerを送らず、caller capability headerもNative upstreamへ転送しない。画像生成、画像編集、search等のNative-owned requestはGrok catalogへ誤分類しない。
 
@@ -99,6 +105,8 @@ Codexの既存 `config.toml` はmarker-delimited managed blockだけを更新し
 Grok credentialは公式のauthoritative fileをread-onlyで検査する。token、refresh token、authorization header、完全なcapability URLをrepo、config、log、SQLite、snapshot、環境ダンプへ複製しない。memory cacheを使う場合もzeroize可能な型を用い、diskへ再保存しない。
 
 Responses requestでcredentialのmissing、incomplete、hard expiryを検出した場合だけ、公式 `bin/grok models` を切断stdio・7秒timeoutで一度起動し、最大60秒read-only再読込する。明示 `auth ensure` は必要時だけ公式OAuth経路へ委譲する。malformedまたはunsafe credentialは自動loginせずfail closedする。`auth status`、`doctor`、`catalog refresh`は認証更新helperを起動しない。
+
+同じservice内の同時Responses requestは進行中の認証更新を共有し、成功・失敗どちらでも待機中の各requestからhelperを重複起動しない。待機は各requestの期限内で終了する。Native compatibilityへのruntime交換では、最終診断にも `doctor --native-compatibility` を使い、Grok credential pathの解決・検査・読込を省く。この診断でもruntime成果物とserviceの検査は省略しない。
 
 Native modeのrouting判断とNative compatibilityを明示したsource runtime交換はGrok credentialの内容に依存しない。Grok modeへの移行またはGrok modeを公開・維持する更新でcredentialが必要な場合だけ、明示的なauth境界を通る。
 
@@ -128,7 +136,7 @@ loopback caller capabilityを要求し、capability tokenはprivate permission�
 
 - `run --config FILE`: installed serviceのloopback providerを起動
 - `install`: materialized binary、Swift launcher、config、profile、LaunchAgentを可逆導入
-- `doctor`: manifest、binary、capability、runtime config、profile、backup、LaunchAgent、credential、serviceを検査
+- `doctor`: manifest、binary、capability、runtime config、profile、backup、LaunchAgent、credential、serviceを検査。明示 `--native-compatibility` 時だけGrok credential検査を行わない
 - `auth status` / `auth ensure`: credentialの状態確認と明示的な公式認証委譲
 - `catalog refresh --config FILE`: credential更新を起動せず、last-known-good catalogを更新
 - `service install` / `service uninstall` / `service status`: LaunchAgentを収束確認付きで操作
