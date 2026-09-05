@@ -84,9 +84,11 @@ Native compatibility catalogでは、Grok slugを非選択の `visibility = "hid
 
 ## 7. Responsesとtool境界
 
-bridgeは `POST /v1/responses` と、Native補助APIの必要なResponses経路をloopbackで提供する。Grok requestではvalidなtext、画像、function call/output、tool call ID、`call_id`、必要なtool schemaを保持する。provider固有で再利用不能なforeign artifactだけをitem単位で除外し、非objectなど構造不正なinput itemは削除せず`invalid_request_error`で拒否する。GrokからNativeへ戻す混在履歴では、Grok reasoningと、それに付随するprovider固有の`web_search_call`実行記録をNative upstreamへ送らず、tool call/outputを結ぶ`call_id`は保持する。Codex履歴で完了済みparallel tool batchの途中にassistant messageがある場合は、message本文、call順、output順、`call_id`を保持したままxAI projection内だけでそのmessageをbatch直前へ移動し、Codexの保存履歴は変更しない。
+bridgeは `POST /v1/responses` と、Native補助APIの必要なResponses経路をloopbackで提供する。Grok requestではvalidなtext、画像、function call/output、tool call ID、`call_id`、必要なtool schemaを保持する。function/tool-search outputの`call_id`が空・欠損、または先行する対応callが存在しない場合は`invalid_request_error`で拒否し、結果だけを削除して正常な履歴として送らない。provider固有で再利用不能なforeign artifactだけをitem単位で除外し、非objectなど構造不正なinput itemは削除せず`invalid_request_error`で拒否する。GrokからNativeへ戻す混在履歴では、Grok reasoningと、それに付随するprovider固有の`web_search_call`実行記録をNative upstreamへ送らず、tool call/outputを結ぶ`call_id`は保持する。Codex履歴で完了済みparallel tool batchの途中にassistant messageがある場合は、message本文、call順、output順、`call_id`を保持したままxAI projection内だけでそのmessageをbatch直前へ移動し、Codexの保存履歴は変更しない。
 
-Codex側へはResponses-compatible SSEを返す。text、reasoning summary、function call、terminal/usageを投影する。既知eventはそのevent種別に必要なresponse ID、item ID、payloadを検証し、欠損を空文字やindex既定値で有効化しない。unknown補助eventは内容を捏造せずpassthroughする。Grok upstreamはdownstreamへresponse内容を確定する前のtransport確立またはbody streamのtransport failureに限り最大3回再試行する。一方、Native upstreamはdownstream output前の接続またはtimeout failureだけを最大3回、1秒、2秒、4秒のbackoffと60秒のretry wall-clock bound内で再試行する。Retry-Afterが枠内に収まる場合はその待ち時間を尊重する。Nativeのresponse output開始後にbody streamが失敗してもrequestを再実行しない。終了markerが欠けた場合もoutput itemを捏造せず、必要な `response.completed` だけを合成する。
+Codex側へはResponses-compatible SSEを返す。text、reasoning summary、function call、terminal/usageを投影する。既知eventはそのevent種別に必要なresponse ID、item ID、payloadを検証し、欠損を空文字やindex既定値で有効化しない。unknown補助eventは内容を捏造せずpassthroughする。Grok upstreamはdownstreamへresponse内容を確定する前のtransport確立またはbody streamのtransport failureに限り最大3回再試行する。一方、Native Responsesとcompactでは、output前の接続・timeout・response header前の切断、初期body streamのtransport failure、およびHTTP 429・502・503・504を、送信と初期body待ちで共有する最大3回の再試行枠で扱う。backoffは1秒、2秒、4秒とし、最初の送信から60秒の共通期限を送信処理と成功応答の初期body待ち自体にも適用する。期限後は新たな送信を開始しない。Retry-Afterが残り期限内に収まる場合はその待ち時間を尊重する。Nativeのresponse output開始後にrequestを再実行せず、正常に続くstreamをこの初期応答期限で打ち切らない。終了markerが欠けた場合もoutput itemを捏造せず、必要な `response.completed` だけを合成する。
+
+Native compatibilityでは、保存済みGrok slugをNative fallbackへ変換する処理をResponsesとcompactの両方に適用する。compactへResponses専用の履歴sanitizerを追加しない。model変更がないcompact要求は元のbody bytesを保持し、変更時も元のContent-Encodingを維持する。
 
 要求JSONは振り分けとprovider変換で解析結果を共有する。Native向けの変更が不要な場合は元のHTTP bodyを維持する。Grok向け送信本文は一度投影・serializeし、早期再試行では同じbytesを再利用する。parallel tool batchの並べ替えではassistant messageをまとめて前置し、messageごとの中間挿入を行わない。
 
@@ -122,7 +124,7 @@ full uninstallは日常の `mode native` と別の明示的な破壊境界であ
 
 uninstallはGrok credential、ChatGPT credential、Codex task/session、SQLite、rollout、projects、MCP、Skills、Browser設定、`AGENTS.md`、Native catalogを変更しない。保存済みtaskにGrok provider/model参照が残る場合、それを自動変換・削除せず、Grok環境が存在しないことによる参照不能を明示的なデータ移行なしに解消したとは扱わない。
 
-manifest、backup、picker state、managed config identityが読めない、改変されている、または対象がsymlinkの場合は削除せず停止する。rollback不能な状態で部分削除を進めない。
+manifest、backup、picker state、managed config identityが読めない、改変されている、または対象がsymlinkの場合は削除せず停止する。rollback不能な状態で部分削除を進めない。picker artifactの削除途中で失敗した場合は、事前に保持したbridge所有artifact、managed config、必要なexact backupを復元して再試行可能な状態へ戻す。補償復元自体も失敗した場合は、元の削除失敗と復元失敗の両方を報告する。
 
 ## 12. Securityとlogging
 

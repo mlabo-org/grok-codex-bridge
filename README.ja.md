@@ -99,7 +99,7 @@ grok-codex-bridge（Rust製ネイティブ実行ファイル）
 Grok / xAI
 ```
 
-ブリッジ自身はツールを実行しません。validな関数定義、順序付きツール呼び出しと結果、テキスト、画像URLとdata URI、reasoning summary、必要なResponses制御値を保持し、実行責任はCodexに残します。xAIがrequest全体を拒否するfunction schemaはGrokへの投影からのみ省略し、Codex側のcatalog、tool_search履歴、Native GPT経路は元のtoolを保持します。function / tool_search argument 内の integer-valued JSON number（例: `8.0`）は JSON integer へ直し、実際の小数は変更しません。Grokへ転送するのは replayable な message / function / tool-search 履歴であり、完了済み Native `custom_tool_call` と foreign reasoning は除外します。Codexが完了済みparallel tool batchの途中へassistant commentaryを記録した場合、xAI向け投影ではcommentary本文、call順、result順、すべての`call_id`を保持したままcommentaryをbatch直前へ移動し、Codexの保存履歴自体は書き換えません。GPT/Grok切替時はproviderで再生できない`web_search_call`の実行履歴、item ID、reasoning stateを除外し、tool call/outputを結ぶ`call_id`を保持します。Grokの接続確立または初期body streamのtransport failureは最大3回再試行します。Nativeのresponse output前に起きた接続またはtimeout failureは、1秒、2秒、4秒のbackoffと60秒のretry wall-clock bound内で最大3回再試行します。上流のRetry-Afterが枠内に収まる場合はその待ち時間を尊重します。有用な内容を送信した後はrequestを再実行しません。Grokが有用なCodex向けeventのあとterminal markerなしで接続を閉じた場合、bridgeは出力itemを捏造せず、Codexが要求する`response.completed`だけを合成します。`response.failed`または`response.incomplete`を既に受け取っている場合は合成しません。
+ブリッジ自身はツールを実行しません。validな関数定義、順序付きツール呼び出しと結果、テキスト、画像URLとdata URI、reasoning summary、必要なResponses制御値を保持し、実行責任はCodexに残します。xAIがrequest全体を拒否するfunction schemaはGrokへの投影からのみ省略し、Codex側のcatalog、tool_search履歴、Native GPT経路は元のtoolを保持します。function / tool_search argument 内の integer-valued JSON number（例: `8.0`）は JSON integer へ直し、実際の小数は変更しません。Grokへ転送するのは replayable な message / function / tool-search 履歴であり、完了済み Native `custom_tool_call` と foreign reasoning は除外します。Codexが完了済みparallel tool batchの途中へassistant commentaryを記録した場合、xAI向け投影ではcommentary本文、call順、result順、すべての`call_id`を保持したままcommentaryをbatch直前へ移動し、Codexの保存履歴自体は書き換えません。GPT/Grok切替時はproviderで再生できない`web_search_call`の実行履歴、item ID、reasoning stateを除外し、tool call/outputを結ぶ`call_id`を保持します。Grokの接続確立または初期body streamのtransport failureは最大3回再試行します。NativeのResponsesとcompactでは、接続失敗、timeout、response header前の切断、初期body streamの失敗、およびHTTP 429・502・503・504を対象に、共有する最大3回の枠で再試行します。待機時間は1秒、2秒、4秒です。最初の送信から60秒の共通期限を、送信と成功応答の最初の本文を待つ処理自体にも適用し、期限後の新しい送信を防ぎます。上流のRetry-Afterが残り期限内に収まる場合はその待ち時間を尊重します。出力開始後はrequestを再実行せず、正常に続くNative streamをこの初期応答期限で打ち切りません。Grokが有用なCodex向けeventのあとterminal markerなしで接続を閉じた場合、bridgeは出力itemを捏造せず、Codexが要求する`response.completed`だけを合成します。`response.failed`または`response.incomplete`を既に受け取っている場合は合成しません。
 
 ## 現在の状態
 
@@ -138,7 +138,7 @@ Intel Mac、Linux、Windows向けのビルド済み成果物は現在提供し�
 
 ## クイックスタート：統合ピッカー
 
-主要経路では、Native GPTと許可済みGrokモデルを同じCodexモデルピッカーで選べる統合カタログを公開します。Native GPTの `responses` と `responses/compact` は取得済みのCodex公式上流に固定します。`images/generations`、`images/edits`、`alpha/search` はNative専用の透過endpointであり、Grok protocol変換には入れません。Grok通信だけをブリッジ経由でxAIへ送ります。Grokには権威ある `responses/compact` 契約がないため、許可済みGrokモデルではこのrouteをfail closedにします。
+主要経路では、Native GPTと許可済みGrokモデルを同じCodexモデルピッカーで選べる統合カタログを公開します。Native GPTの `responses` と `responses/compact` は取得済みのCodex公式上流に固定します。`images/generations`、`images/edits`、`alpha/search` はNative専用の透過endpointであり、Grok protocol変換には入れません。Grok通信だけをブリッジ経由でxAIへ送ります。Grok modeではxAIの権威ある `responses/compact` 契約がないため、許可済みGrokモデルの圧縮要求を拒否します。Native互換モードでは、保存済みGrokモデル名を `responses` と `responses/compact` の両方でNative fallbackへ変換し、保存済みタスク自体は変更しません。
 
 NativeとGrokのmodel slugは一意でなければなりません。catalog生成時とruntime routing時のどちらでも重複slugはfail closedし、Native行の上書きやalias生成は行いません。
 

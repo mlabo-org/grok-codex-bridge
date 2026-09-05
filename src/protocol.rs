@@ -1492,24 +1492,6 @@ fn parse_input(
     let mut reasoning_ids = HashSet::new();
     let mut parsed = Vec::with_capacity(values.len());
     for value in values {
-        // A failed client-side tool search can leave an empty output item in
-        // the replay (and, in older Codex builds, an output whose call_id no
-        // longer has a matching call).  Such an item is not replayable by any
-        // provider.  Drop only that item; preserve all valid text and tool
-        // history so the next turn remains useful.
-        let Some(raw_object) = value.as_object() else {
-            return Err(ProtocolError::InvalidRequestField("input"));
-        };
-        let raw_type = raw_object.get("type").and_then(Value::as_str);
-        if matches!(
-            raw_type,
-            Some("function_call_output" | "tool_search_output")
-        ) {
-            let call_id = raw_object.get("call_id").and_then(Value::as_str);
-            if call_id.is_none_or(str::is_empty) || !calls.contains(call_id.unwrap()) {
-                continue;
-            }
-        }
         let item = match InputItem::parse(value, namespace_projection) {
             Ok(item) => item,
             // Unknown history items are Codex-owned and have no xAI
@@ -4260,7 +4242,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_tool_search_replay_keeps_text_and_omits_empty_output() {
+    fn failed_tool_search_replay_rejects_empty_output_call_id() {
         let mut request = request_fixture();
         request["input"] = json!([
             {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}],"history_metadata":{"opaque":true}},
@@ -4268,14 +4250,103 @@ mod tests {
             {"type":"function_call_output","call_id":"","output":"tool parser error"},
             {"type":"message","role":"assistant","content":[{"type":"output_text","text":"still continue"}]}
         ]);
-        let normalized = NormalizedResponsesRequest::parse(request).unwrap();
-        let projected = normalized.to_xai_value();
-        let input = projected["input"].as_array().unwrap();
-        assert!(input.iter().any(|item| item["type"] == "message"));
-        assert!(
-            input
-                .iter()
-                .all(|item| item.get("call_id") != Some(&json!("")))
+        assert_eq!(
+            NormalizedResponsesRequest::parse(request).unwrap_err(),
+            ProtocolError::InvalidRequestField("call_id")
+        );
+    }
+
+    #[test]
+    fn unmatched_normal_function_output_is_rejected_instead_of_dropped() {
+        let mut request = request_fixture();
+        request["input"] = json!([
+            {
+                "type": "function_call",
+                "name": "search",
+                "call_id": "call_1",
+                "arguments": "{\"query\":\"rust\"}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_typo",
+                "output": "search result"
+            }
+        ]);
+        assert_eq!(
+            NormalizedResponsesRequest::parse(request).unwrap_err(),
+            ProtocolError::UnmatchedFunctionOutput
+        );
+    }
+
+    #[test]
+    fn malformed_tool_outputs_reject_empty_missing_and_unmatched_call_ids() {
+        let mut normal_empty = request_fixture();
+        normal_empty["input"] = json!([
+            {
+                "type": "function_call",
+                "name": "search",
+                "call_id": "call_1",
+                "arguments": "{\"query\":\"rust\"}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "",
+                "output": "search result"
+            }
+        ]);
+        assert_eq!(
+            NormalizedResponsesRequest::parse(normal_empty).unwrap_err(),
+            ProtocolError::InvalidRequestField("call_id")
+        );
+
+        let mut normal_missing = request_fixture();
+        normal_missing["input"] = json!([{
+            "type": "function_call_output",
+            "output": "search result"
+        }]);
+        assert_eq!(
+            NormalizedResponsesRequest::parse(normal_missing).unwrap_err(),
+            ProtocolError::MissingRequestField("call_id")
+        );
+
+        let mut search_output = request_fixture();
+        search_output["input"] = json!([
+            {
+                "type": "tool_search_call",
+                "call_id": "search_1",
+                "execution": "client",
+                "arguments": {"query": "rust"}
+            },
+            {
+                "type": "tool_search_output",
+                "call_id": "search_typo",
+                "status": "completed",
+                "execution": "client",
+                "tools": []
+            }
+        ]);
+        assert_eq!(
+            NormalizedResponsesRequest::parse(search_output).unwrap_err(),
+            ProtocolError::UnmatchedFunctionOutput
+        );
+
+        let mut search_then_normal = request_fixture();
+        search_then_normal["input"] = json!([
+            {
+                "type": "tool_search_call",
+                "call_id": "search_1",
+                "execution": "client",
+                "arguments": {"query": "rust"}
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_typo",
+                "output": "ordinary function result"
+            }
+        ]);
+        assert_eq!(
+            NormalizedResponsesRequest::parse(search_then_normal).unwrap_err(),
+            ProtocolError::UnmatchedFunctionOutput
         );
     }
 
@@ -4836,20 +4907,19 @@ mod tests {
     }
 
     #[test]
-    fn function_request_drops_unreplayable_call_result_integrity() {
+    fn function_request_rejects_unmatched_and_deduplicates_duplicate_results() {
         let mut duplicate_call = function_request_fixture();
         duplicate_call["input"][2]["call_id"] = json!("call_read_1");
-        assert!(NormalizedResponsesRequest::parse(duplicate_call).is_ok());
+        assert_eq!(
+            NormalizedResponsesRequest::parse(duplicate_call).unwrap_err(),
+            ProtocolError::UnmatchedFunctionOutput
+        );
 
         let mut unmatched = function_request_fixture();
         unmatched["input"][3]["call_id"] = json!("call_missing");
-        let unmatched = NormalizedResponsesRequest::parse(unmatched).unwrap();
-        assert!(
-            unmatched.to_xai_value()["input"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|item| item.get("call_id") != Some(&json!("call_missing")))
+        assert_eq!(
+            NormalizedResponsesRequest::parse(unmatched).unwrap_err(),
+            ProtocolError::UnmatchedFunctionOutput
         );
 
         let mut duplicate_output = function_request_fixture();
