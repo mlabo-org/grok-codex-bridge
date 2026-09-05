@@ -20,9 +20,9 @@ const OPENAI_API_BASE_URL: &str = "https://api.openai.com/v1/";
 pub(crate) const NATIVE_SEND_RETRY_LIMIT: usize = 3;
 pub(crate) const NATIVE_RETRY_WALL_CLOCK: Duration = Duration::from_secs(60);
 pub(crate) const NATIVE_RETRY_BACKOFF: [Duration; NATIVE_SEND_RETRY_LIMIT] = [
-    Duration::from_millis(100),
-    Duration::from_millis(200),
-    Duration::from_millis(400),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
 ];
 
 /// The two first-party Responses origins selected by Codex 0.148 according to
@@ -229,7 +229,14 @@ impl NativeClient {
         body: Vec<u8>,
     ) -> Result<reqwest::Response, NativeError> {
         let mut attempts = 0;
-        self.post_with_started(suffix, incoming_headers, body, Instant::now(), &mut attempts).await
+        self.post_with_started(
+            suffix,
+            incoming_headers,
+            body,
+            Instant::now(),
+            &mut attempts,
+        )
+        .await
     }
 
     pub(crate) async fn post_with_started(
@@ -253,26 +260,59 @@ impl NativeClient {
         loop {
             let attempt = *attempts;
             *attempts += 1;
-            let result = self
-                .client
-                .post(url.clone())
-                .headers(headers.clone())
-                .body(body.clone())
-                .send()
-                .await;
+            let Some(remaining) = NATIVE_RETRY_WALL_CLOCK.checked_sub(started.elapsed()) else {
+                return Err(NativeError::DeadlineExceeded);
+            };
+            let result = tokio::time::timeout(
+                remaining,
+                self.client
+                    .post(url.clone())
+                    .headers(headers.clone())
+                    .body(body.clone())
+                    .send(),
+            )
+            .await;
+            let result = match result {
+                Ok(result) => result,
+                Err(_) => return Err(NativeError::DeadlineExceeded),
+            };
             match result {
-                Ok(response) if is_transient_status(response.status()) && attempt < NATIVE_SEND_RETRY_LIMIT => {
-                    let backoff = retry_after_or_default(response.headers(), NATIVE_RETRY_BACKOFF[attempt]);
-                    tracing::debug!(route = suffix.as_str(), status = response.status().as_u16(), attempt = attempt + 1, elapsed_ms = started.elapsed().as_millis() as u64, "Native upstream returned a transient status; retrying");
+                Ok(response)
+                    if is_transient_status(response.status())
+                        && attempt < NATIVE_SEND_RETRY_LIMIT =>
+                {
+                    let backoff =
+                        retry_after_or_default(response.headers(), NATIVE_RETRY_BACKOFF[attempt]);
+                    tracing::debug!(
+                        route = suffix.as_str(),
+                        status = response.status().as_u16(),
+                        attempt = attempt + 1,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "Native upstream returned a transient status; retrying"
+                    );
                     if started.elapsed().saturating_add(backoff) > NATIVE_RETRY_WALL_CLOCK {
-                        tracing::warn!(route = suffix.as_str(), status = response.status().as_u16(), error_class = "upstream_http_status", attempt = attempt + 1, elapsed_ms = started.elapsed().as_millis() as u64, "Native upstream remained unavailable after bounded recovery");
+                        tracing::warn!(
+                            route = suffix.as_str(),
+                            status = response.status().as_u16(),
+                            error_class = "upstream_http_status",
+                            attempt = attempt + 1,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "Native upstream remained unavailable after bounded recovery"
+                        );
                         return Ok(response);
                     }
                     tokio::time::sleep(backoff).await;
                 }
                 Ok(response) => {
                     if is_transient_status(response.status()) {
-                        tracing::warn!(route = suffix.as_str(), status = response.status().as_u16(), error_class = "upstream_http_status", attempt = attempt + 1, elapsed_ms = started.elapsed().as_millis() as u64, "Native upstream remained unavailable after bounded recovery");
+                        tracing::warn!(
+                            route = suffix.as_str(),
+                            status = response.status().as_u16(),
+                            error_class = "upstream_http_status",
+                            attempt = attempt + 1,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "Native upstream remained unavailable after bounded recovery"
+                        );
                     }
                     return Ok(response);
                 }
@@ -292,7 +332,9 @@ impl NativeClient {
                         );
                         return Err(NativeError::Transport(error));
                     };
-                    if !retry || started.elapsed().saturating_add(*backoff) > NATIVE_RETRY_WALL_CLOCK {
+                    if !retry
+                        || started.elapsed().saturating_add(*backoff) > NATIVE_RETRY_WALL_CLOCK
+                    {
                         tracing::warn!(
                             route = suffix.as_str(),
                             error_class,
@@ -321,14 +363,23 @@ impl NativeClient {
         incoming_headers: &HeaderMap,
         body: reqwest::Body,
     ) -> Result<reqwest::Response, NativeError> {
-        let url = self.base_url.join(suffix.relative_path()).map_err(|_| NativeError::UnsupportedUpstream)?;
+        let url = self
+            .base_url
+            .join(suffix.relative_path())
+            .map_err(|_| NativeError::UnsupportedUpstream)?;
         let mut headers = HeaderMap::new();
         for (name, value) in incoming_headers {
             if !is_hop_by_hop_request_header(name) && name.as_str() != PICKER_CALLER_HEADER {
                 headers.append(name.clone(), value.clone());
             }
         }
-        self.client.post(url).headers(headers).body(body).send().await.map_err(NativeError::Transport)
+        self.client
+            .post(url)
+            .headers(headers)
+            .body(body)
+            .send()
+            .await
+            .map_err(NativeError::Transport)
     }
 }
 
@@ -438,6 +489,8 @@ pub enum NativeError {
     ConstructClient(#[source] reqwest::Error),
     #[error("Native upstream request failed")]
     Transport(#[source] reqwest::Error),
+    #[error("Native upstream retry deadline exceeded")]
+    DeadlineExceeded,
     #[cfg(not(unix))]
     #[error("Native route-state permissions are unsupported on this platform")]
     UnsupportedPlatform,
@@ -448,7 +501,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     #[test]
@@ -520,6 +573,7 @@ mod tests {
             for attempt in 0..=NATIVE_SEND_RETRY_LIMIT {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 server_hits.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(read_request_body(&mut stream).await, b"same-body");
                 if attempt == NATIVE_SEND_RETRY_LIMIT {
                     stream
                         .write_all(
@@ -535,7 +589,11 @@ mod tests {
         )
         .unwrap();
         let response = client
-            .post(NativeApiPath::Responses, &HeaderMap::new(), b"same-body".to_vec())
+            .post(
+                NativeApiPath::Responses,
+                &HeaderMap::new(),
+                b"same-body".to_vec(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), 200);
@@ -554,11 +612,58 @@ mod tests {
         .unwrap();
         let started = Instant::now();
         let error = client
-            .post(NativeApiPath::Responses, &HeaderMap::new(), b"same-body".to_vec())
+            .post(
+                NativeApiPath::Responses,
+                &HeaderMap::new(),
+                b"same-body".to_vec(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(error, NativeError::Transport(_)));
         assert!(started.elapsed() <= Duration::from_secs(8));
+    }
+
+    #[tokio::test]
+    async fn native_send_does_not_start_new_attempt_after_retry_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accepted = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_ok()
+        });
+        let client = NativeClient::for_test(
+            Url::parse(&format!("http://{address}/backend-api/codex/")).unwrap(),
+        )
+        .unwrap();
+        let mut attempts = NATIVE_SEND_RETRY_LIMIT;
+        let started = Instant::now() - NATIVE_RETRY_WALL_CLOCK;
+        let error = client
+            .post_with_started(
+                NativeApiPath::Responses,
+                &HeaderMap::new(),
+                b"same-body".to_vec(),
+                started,
+                &mut attempts,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, NativeError::DeadlineExceeded));
+        assert!(!accepted.await.unwrap());
+    }
+
+    #[test]
+    fn native_retry_policy_uses_three_retries_and_one_two_four_second_backoff() {
+        assert_eq!(NATIVE_SEND_RETRY_LIMIT, 3);
+        assert_eq!(
+            NATIVE_RETRY_BACKOFF,
+            [
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+            ]
+        );
+        assert_eq!(NATIVE_RETRY_WALL_CLOCK, Duration::from_secs(60));
     }
 
     #[tokio::test]
@@ -571,14 +676,59 @@ mod tests {
             for attempt in 0..=NATIVE_SEND_RETRY_LIMIT {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 server_hits.fetch_add(1, Ordering::SeqCst);
-                let status = if attempt < NATIVE_SEND_RETRY_LIMIT { "503 Service Unavailable" } else { "200 OK" };
-                stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+                assert_eq!(read_request_body(&mut stream).await, b"same-body");
+                let status = if attempt < NATIVE_SEND_RETRY_LIMIT {
+                    "503 Service Unavailable"
+                } else {
+                    "200 OK"
+                };
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
             }
         });
-        let client = NativeClient::for_test(Url::parse(&format!("http://{address}/backend-api/codex/")).unwrap()).unwrap();
-        let response = client.post(NativeApiPath::Responses, &HeaderMap::new(), b"same-body".to_vec()).await.unwrap();
+        let client = NativeClient::for_test(
+            Url::parse(&format!("http://{address}/backend-api/codex/")).unwrap(),
+        )
+        .unwrap();
+        let response = client
+            .post(
+                NativeApiPath::Responses,
+                &HeaderMap::new(),
+                b"same-body".to_vec(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), 200);
         assert_eq!(hits.load(Ordering::SeqCst), NATIVE_SEND_RETRY_LIMIT + 1);
         server.await.unwrap();
+    }
+
+    async fn read_request_body(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).await.unwrap();
+            head.push(byte[0]);
+        }
+        let content_length = std::str::from_utf8(&head)
+            .unwrap()
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap();
+        let mut body = vec![0; content_length];
+        stream.read_exact(&mut body).await.unwrap();
+        body
     }
 }

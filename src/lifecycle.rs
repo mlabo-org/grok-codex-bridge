@@ -751,7 +751,7 @@ pub fn sync_installed_picker_catalog(
 
     config_plan.finish()?;
     Ok(Some(PickerCatalogSyncReceipt {
-        changed: generated_changed || native_route_changed,
+        changed: generated_changed || native_route_changed || config_changed || state_changed,
         native_catalog: native_catalog_identity,
         grok_catalog: grok_catalog_identity,
         native_route,
@@ -784,6 +784,16 @@ fn uninstall_picker_if_present(
     install_root: &Path,
     codex_home: &Path,
 ) -> Result<bool, LifecycleError> {
+    uninstall_picker_if_present_with_remover(install_root, codex_home, &mut |path| {
+        fs::remove_file(path).map_err(LifecycleError::RemoveInstallRoot)
+    })
+}
+
+fn uninstall_picker_if_present_with_remover(
+    install_root: &Path,
+    codex_home: &Path,
+    remove_file: &mut dyn FnMut(&Path) -> Result<(), LifecycleError>,
+) -> Result<bool, LifecycleError> {
     let state_path = install_root.join("state").join(PICKER_STATE_FILE_NAME);
     let Some(bytes) = read_optional_control_file(&state_path, &[0o600])? else {
         return Ok(false);
@@ -791,10 +801,51 @@ fn uninstall_picker_if_present(
     let state = PickerManagedState::from_json(&bytes).map_err(LifecycleError::Picker)?;
     let config_path = codex_home.join("config.toml");
     validate_picker_uninstall_inputs(install_root, &config_path, &state)?;
+    let config_metadata = fs::symlink_metadata(&config_path).map_err(LifecycleError::InspectExternalTarget)?;
+    let config_mode = file_mode(&config_metadata)?;
+    let previous_config = read_control_file_with_modes(&config_path, &[config_mode], MAX_CONTROL_FILE_BYTES)?;
+    let previous_generated = read_private_control_file(state.generated_catalog().path())?;
+    let previous_native_route = read_private_control_file(state.native_route().path())?;
+    let previous_state = read_private_control_file(&state_path)?;
+    let previous_config_backup = match state.config_rollback() {
+        ConfigRollbackOwnership::RestoreExactBackup { backup, .. } => {
+            Some((backup.path().to_path_buf(), read_private_control_file(backup.path())?))
+        }
+        ConfigRollbackOwnership::RemoveCreated => None,
+    };
+
     rollback_picker_config(install_root, &config_path, &state)?;
-    fs::remove_file(state.generated_catalog().path()).map_err(LifecycleError::RemoveInstallRoot)?;
-    fs::remove_file(state.native_route().path()).map_err(LifecycleError::RemoveInstallRoot)?;
-    fs::remove_file(&state_path).map_err(LifecycleError::RemoveInstallRoot)?;
+    let mut removed: Vec<(&Path, Vec<u8>)> = Vec::new();
+    for path in [state.generated_catalog().path(), state.native_route().path(), &state_path] {
+        if let Err(error) = remove_file(path) {
+            let mut restore_errors = Vec::new();
+            for (restore_path, bytes) in removed.into_iter().rev() {
+                if let Err(restore_error) = atomic_write(restore_path, &bytes, 0o600) {
+                    restore_errors.push(restore_error.to_string());
+                }
+            }
+            if let Err(restore_error) = atomic_write(&config_path, &previous_config, config_mode) {
+                restore_errors.push(restore_error.to_string());
+            }
+            if let Some((backup_path, backup_bytes)) = &previous_config_backup {
+                if let Err(restore_error) = atomic_write(backup_path, backup_bytes, 0o600) {
+                    restore_errors.push(restore_error.to_string());
+                }
+            }
+            if !restore_errors.is_empty() {
+                return Err(LifecycleError::PickerUninstallRollbackFailed {
+                    removal: error.to_string(),
+                    restore: restore_errors.join("; "),
+                });
+            }
+            return Err(error);
+        }
+        removed.push((path, match path {
+            p if p == state.generated_catalog().path() => previous_generated.clone(),
+            p if p == state.native_route().path() => previous_native_route.clone(),
+            _ => previous_state.clone(),
+        }));
+    }
     sync_parent(&state_path)?;
     Ok(true)
 }
@@ -1386,10 +1437,13 @@ fn render_picker_config(
         let begin = source
             .find(PICKER_BEGIN)
             .ok_or(LifecycleError::PickerConfigConflict)?;
-        let end = source
+        let mut end = source
             .find(PICKER_END)
             .ok_or(LifecycleError::PickerConfigConflict)?
             + PICKER_END.len();
+        if source[end..].starts_with('\n') {
+            end += 1;
+        }
         return Ok(format!("{}{}{}", &source[..begin], block, &source[end..]));
     }
     let mut insertion = source.len();
@@ -2515,6 +2569,8 @@ pub enum LifecycleError {
     InstallRollbackFailed,
     #[error("uninstall rollback could not restore the installed state")]
     UninstallRollbackFailed,
+    #[error("picker uninstall failed ({removal}); rollback also failed ({restore})")]
+    PickerUninstallRollbackFailed { removal: String, restore: String },
     #[error("failed to remove an external backup")]
     RemoveBackup(#[source] std::io::Error),
     #[error("failed to remove the manifest-proven install root")]
@@ -3506,6 +3562,54 @@ mod tests {
         let restored = fs::read_to_string(config).unwrap();
         assert!(restored.contains(PICKER_BEGIN));
         assert!(restored.contains("# user comment"));
+    }
+
+    #[test]
+    fn picker_sync_reports_managed_state_only_change() {
+        let fixture = Fixture::new();
+        let (receipt, _) = install_test_picker(&fixture, b"model = \"gpt-native\"\n");
+        CatalogCache::new(fixture.install_root.join("state/models.json"))
+            .persist(&CatalogSnapshot::new(["grok-4.6"], Some("\"v2\"".to_owned())).unwrap())
+            .unwrap();
+
+        let synced = sync_installed_picker_catalog(&fixture.install_root.join("state/models.json"))
+            .unwrap()
+            .unwrap();
+
+        assert!(synced.changed);
+    }
+
+    #[test]
+    fn picker_uninstall_restores_owned_files_after_intermediate_remove_failure() {
+        let fixture = Fixture::new();
+        let (receipt, _) = install_test_picker(&fixture, b"model = \"gpt-native\"\n");
+        let state_path = receipt.managed_state_path.clone();
+        let generated_before = fs::read(&receipt.generated_catalog_path).unwrap();
+        let route_before = fs::read(&receipt.native_route_path).unwrap();
+        let state_before = fs::read(&state_path).unwrap();
+        let config_before = fs::read(receipt.config_path.as_path()).unwrap();
+        let mut removals = 0;
+
+        let result = uninstall_picker_if_present_with_remover(
+            &fixture.install_root,
+            &fixture.codex_home,
+            &mut |path| {
+                removals += 1;
+                if removals == 2 {
+                    return Err(LifecycleError::RemoveInstallRoot(
+                        std::io::Error::other("injected removal failure"),
+                    ));
+                }
+                fs::remove_file(path).map_err(LifecycleError::RemoveInstallRoot)
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(fs::read(&receipt.generated_catalog_path).unwrap(), generated_before);
+        assert_eq!(fs::read(&receipt.native_route_path).unwrap(), route_before);
+        assert_eq!(fs::read(&state_path).unwrap(), state_before);
+        assert_eq!(fs::read(receipt.config_path.as_path()).unwrap(), config_before);
+
+        assert!(uninstall_picker(&fixture.install_root, &fixture.codex_home).unwrap());
     }
 
     #[test]
