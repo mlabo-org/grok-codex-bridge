@@ -207,9 +207,28 @@ Grokを選択したCodexセッションはローカルのループバックservi
 
 `native` はuninstallを実行しません。pickerにはNativeモデルだけを選択可能として表示し、保存済みタスクの解決に必要なGrok行は非表示metadataとして保持します。provider定義とloopback resolverを維持し、Grok推論clientを構築せず、Grok slugのrequestだけを現在のroot Nativeモデルへ実行時変換します。元のrequest、保存済みタスク、SQLite、rolloutは変更しません。
 
-完全uninstallは日常の環境切替ではありません。resolverを完全削除する場合、残存するpicker provider/model参照を純正Codex形式へ永久移行しなければ旧タスクが開けなくなるため、別の明示的な不可逆操作として扱います。
+### 橋を完全撤去して標準環境へ戻す
 
-可逆なNative-only運用には `native` を使います。これは意図的にuninstallではありません。導入済みprovider定義、resolver、互換metadataを残すため、後から `grok` へ戻してもtask履歴を書き換えずにGrok routingを復元できます。bridgeをMacから削除するときだけ完全な `uninstall` を使います。この操作は導入済みruntimeとbridge所有のCodex設定/service stateを削除・復元しますが、過去のtask recordを変換しません。taskにbridgeのprovider/model参照が残っている状態で先にuninstallすると、そのtaskを開けなくなる可能性があります。別途計画した明示的なdata migrationが完了するまで、導入済みruntimeを残してください。
+過去の橋経由タスクが利用できなくなることを受け入れ、標準のChatGPT OAuth接続へ戻す場合は、`native` 互換モードではなく次の撤去スクリプトを使います。macOS標準のRubyと、導入済みの橋・ChatGPT.appを使用します。再ビルドは不要です。
+
+```sh
+/usr/bin/ruby scripts/uninstall-native.rb --check
+/usr/bin/ruby scripts/uninstall-native.rb --execute
+```
+
+スクリプトは導入済みCLIの所有範囲検査と `uninstall` を使用し、橋のruntime、専用profile、LaunchAgent、管理対象のpicker設定を撤去・復元します。撤去後、橋の待受がないこと、既定接続先が組み込みOpenAIであること、橋のprovider・catalog・URL設定がないことを確認し、公式App Serverの一時タスクでChatGPT OAuthによる短い実推論を1回行います。推論はアカウントのCodex利用枠を使います。ソース、認証情報、会話本文、履歴DBは変更・削除しません。旧接続先の別名やモデル互換設定も残しません。
+
+Codex内から撤去する場合、実行中の会話が橋への接続を失うため、次の操作でTerminalへ処理を引き渡します。導入済み `codex-remote-restart` が必要です。
+
+```sh
+/usr/bin/ruby scripts/uninstall-native.rb --handoff
+```
+
+`--handoff` は引渡しメッセージを表示するため15秒待ってから、撤去・検証・再起動を別プロセスで実行します。結果は `~/Library/Logs/grok-codex-uninstall.log` に出力します。再起動の引渡しと画面の復帰は別の状態です。通常のTerminalから `--execute` を使った場合は、完了後にCodexを完全終了して開き直してください。`--execute --restart` でも導入済み再起動ツールへ引き渡せます。
+
+保存済みprovider/model参照は変換しません。過去の橋経由タスクが必要な場合は、この撤去を実行せず、互換モードを使用してください。
+
+可逆なNative-only運用には `native` を使います。これは意図的にuninstallではありません。導入済みprovider定義、resolver、互換metadataを残すため、後から `grok` へ戻してもtask履歴を書き換えずにGrok routingを復元できます。完全撤去は、旧タスクが利用できなくなることを受け入れる場合、または別途明示されたdata migrationが完了した場合に限ります。
 
 source更新はmode切替とは別のlifecycle境界です。新しいnative componentのbuild/materializeとinstallは、Native GPT taskまたはTerminalから実行し、導入済みreplacement経路にserviceの停止・再起動を任せます。通常のmode切替でbinaryを再buildすることはありません。更新後はCodex Desktopを一度再起動し、新しいpicker catalogを読み込ませてください。
 

@@ -211,9 +211,28 @@ The same migration entry point owns both migration directions:
 
 `native` does not uninstall the bridge. The picker exposes only Native models for selection while retaining hidden Grok metadata required to resolve saved tasks. It keeps the provider definition and loopback resolver, does not construct the Grok inference client, and rewrites only Grok-slug request copies to the current root Native model. The original request, saved tasks, SQLite state, and rollouts are not modified.
 
-Full uninstall is not a routine environment switch. Removing the resolver permanently requires a separate, explicit irreversible migration of remaining picker provider/model references into Native Codex form; otherwise those tasks become unopenable.
+### Remove the bridge and restore standard ChatGPT OAuth
 
-Use `native` for a reversible Native-only operating mode. It is deliberately not an uninstall: the installed provider definition, resolver, and compatibility metadata remain available so a later `grok` transition can restore Grok routing without rewriting task history. Use full `uninstall` only when removing the bridge from the machine. That operation removes the installed runtime and rolls back bridge-owned Codex configuration/service state; it does not convert historical task records. If those records still contain bridge provider/model references, uninstalling first can make them impossible to open. Preserve the installed runtime until any separately planned, explicit data migration has completed.
+If losing access to saved bridge-provider tasks is acceptable, use the complete-removal script instead of the `native` compatibility mode. It uses macOS system Ruby, the installed bridge CLI and ChatGPT.app; no rebuild is needed.
+
+```sh
+/usr/bin/ruby scripts/uninstall-native.rb --check
+/usr/bin/ruby scripts/uninstall-native.rb --execute
+```
+
+The script delegates ownership checks and removal to the installed CLI. It removes/restores the bridge runtime, isolated profile, LaunchAgent and managed picker settings. It then verifies that the bridge listener is gone, the actual default provider is built-in OpenAI, and no bridge provider/catalog/URL remains, followed by one short ChatGPT OAuth inference through an official App Server ephemeral thread. This consumes Codex account usage. Source, credentials, conversation content and history databases are retained. No legacy-provider aliases or model compatibility entries are installed.
+
+When running from Codex itself, the current conversation loses its old bridge connection. Hand removal off to Terminal using the following command, which requires the installed `codex-remote-restart` tool:
+
+```sh
+/usr/bin/ruby scripts/uninstall-native.rb --handoff
+```
+
+The detached process waits 15 seconds for the handoff message, then removes, verifies and requests restart. Results are written to `~/Library/Logs/grok-codex-uninstall.log`; restart handoff and a verified reopened UI are separate states. After ordinary Terminal execution with `--execute`, fully quit and reopen Codex, or use `--execute --restart` to invoke the installed restart tool.
+
+Saved provider/model references are not migrated. If access to old bridge-provider tasks is required, retain the compatibility mode instead of running this removal.
+
+Use `native` for a reversible Native-only operating mode. It is deliberately not an uninstall: the installed provider definition, resolver, and compatibility metadata remain available so a later `grok` transition can restore Grok routing without rewriting task history. Complete removal requires accepting that old tasks may become unusable, or completing a separately authorized data migration first.
 
 Updating source is a different lifecycle boundary from switching mode. Build/materialize and install the new native components from a Native GPT task or Terminal, then allow the installed replacement path to stop and restart the service. Normal mode switching never rebuilds binaries. After an update, relaunch Codex Desktop once so it reads the newly published picker catalog.
 
