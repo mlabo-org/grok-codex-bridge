@@ -42,7 +42,7 @@
 - mode切替は通常約15〜20秒かかる。ChatGPT.appをforce quitせず、launcherによるgraceful quit、bounded app-server停止、service/picker収束、automatic relaunchを待つ。macOSの通常のquit確認dialogを意図的に発生させる操作を追加しない。
 - lifecycleを個別操作する明示要求では、materializedまたはinstalled binaryが公開する`install`、`service install|uninstall|status`、`picker install|uninstall`、`doctor`、`auth status|ensure`、`mode grok|native`、`uninstall`だけを使用する。Codex本体binary、Codex config、Grok auth、LaunchAgent plistを直接編集せず、`launchctl`を直接呼ばない。
 - `--native-catalog`など絶対pathを要求するruntime引数は実行環境で解決する。README、handoff、commitへ個人固有の絶対path、credential、token、capability、session IDを記録しない。repo内file参照は相対pathで記述する。
-- full uninstallはNative modeとは別の明示的な破壊境界である。保存済みtaskがbridge provider/modelを参照している間は、明示されたdata migrationなしにfull uninstallを実行しない。許可されたfull uninstallではbinaryのpreflightを通し、picker rollback、service停止、manifest-owned install removalを一つの所有経路に任せ、manifest外を削除または復元しない。
+- full uninstallはNative modeとは別の明示的な破壊境界である。`scripts/uninstall-native.rb` はbinaryのpreflight、picker rollback、service停止、manifest-owned install removalを既存の所有経路に任せた後、公式App Serverの設定更新APIで旧provider名をOpenAIへの直接接続として定義する。既定providerは組み込みOpenAIのまま、橋の待受・catalog・認証headerは残さず、manifest外の削除・復元や保存済みtaskの書換は行わない。保存済みGrok modelの推論互換性は保証せず、GPT選択が必要なことを明示する。
 - build、install、activation、mode switching、full uninstall、commit、push、releaseは別actionである。あるactionの明示要求から隣接actionの権限を推測しない。
 
 ## Security And Stop Conditions

@@ -213,14 +213,14 @@ The same migration entry point owns both migration directions:
 
 ### Remove the bridge and restore standard ChatGPT OAuth
 
-If losing access to saved bridge-provider tasks is acceptable, use the complete-removal script instead of the `native` compatibility mode. It uses macOS system Ruby, the installed bridge CLI and ChatGPT.app; no rebuild is needed.
+To remove the bridge and restore standard ChatGPT OAuth while keeping saved provider IDs resolvable, use the complete-removal script. It uses macOS system Ruby, the installed bridge CLI and ChatGPT.app; no rebuild is needed.
 
 ```sh
 /usr/bin/ruby scripts/uninstall-native.rb --check
 /usr/bin/ruby scripts/uninstall-native.rb --execute
 ```
 
-The script delegates ownership checks and removal to the installed CLI. It removes/restores the bridge runtime, isolated profile, LaunchAgent and managed picker settings. It then verifies that the bridge listener is gone, the actual default provider is built-in OpenAI, and no bridge provider/catalog/URL remains, followed by one short ChatGPT OAuth inference through an official App Server ephemeral thread. This consumes Codex account usage. Source, credentials, conversation content and history databases are retained. No legacy-provider aliases or model compatibility entries are installed.
+The script delegates ownership checks and removal to the installed CLI. It removes/restores the bridge runtime, isolated profile, LaunchAgent and managed picker settings, then uses the official App Server configuration API to define `grok_codex_picker` and `grok_bridge` as direct OpenAI connections. This prevents missing-provider errors when reopening saved tasks, without restoring the bridge service. New tasks retain the built-in OpenAI default. It verifies the direct definitions and absence of the bridge listener/catalog/URL, followed by one short ChatGPT OAuth inference through an official App Server ephemeral thread. This consumes Codex account usage. Source, credentials, conversation content, history databases and unrelated settings are retained.
 
 When running from Codex itself, the current conversation loses its old bridge connection. Hand removal off to Terminal using the following command, which requires the installed `codex-remote-restart` tool:
 
@@ -230,9 +230,9 @@ When running from Codex itself, the current conversation loses its old bridge co
 
 The detached process waits 15 seconds for the handoff message, then removes, verifies and requests restart. Results are written to `~/Library/Logs/grok-codex-uninstall.log`; restart handoff and a verified reopened UI are separate states. After ordinary Terminal execution with `--execute`, fully quit and reopen Codex, or use `--execute --restart` to invoke the installed restart tool.
 
-Saved provider/model references are not migrated. If access to old bridge-provider tasks is required, retain the compatibility mode instead of running this removal.
+Saved provider/model references are not migrated. Tasks saved with a GPT model can resolve their old provider ID directly to OpenAI. If the saved model is Grok, select a GPT model after reopening the task; the provider alias does not translate Grok models or guarantee compatibility of every historical conversation.
 
-Use `native` for a reversible Native-only operating mode. It is deliberately not an uninstall: the installed provider definition, resolver, and compatibility metadata remain available so a later `grok` transition can restore Grok routing without rewriting task history. Complete removal requires accepting that old tasks may become unusable, or completing a separately authorized data migration first.
+Use `native` for a reversible Native-only operating mode. It is deliberately not an uninstall: the installed provider definition, resolver, and compatibility metadata remain available so a later `grok` transition can restore Grok routing without rewriting task history. Complete removal retains only direct OpenAI definitions for saved provider IDs, with no Grok model translation.
 
 Updating source is a different lifecycle boundary from switching mode. Build/materialize and install the new native components from a Native GPT task or Terminal, then allow the installed replacement path to stop and restart the service. Normal mode switching never rebuilds binaries. After an update, relaunch Codex Desktop once so it reads the newly published picker catalog.
 
