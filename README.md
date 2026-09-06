@@ -2,11 +2,32 @@
 
 [日本語](README.ja.md)
 
+## Development frozen — experimental source
+
+**Development of this project is frozen. Treat this repository as the source and results of an experiment, not as a recommended environment for practical Codex work.**
+
+Practical task execution cannot be separated from compaction and reliable continuation afterward. Model selection and ordinary inference alone are insufficient to establish usability. The author considers it unacceptable to continue implementation while leaving the compaction compatibility problem unresolved, and has therefore frozen development.
+
+**The author has already fully removed the bridge from their own environment and now uses Codex with direct OpenAI access, without this bridge.** Grok is no longer available in that environment's Codex picker. This is full removal, not the bridge's `mode native` compatibility mode.
+
+The source and the build, installation, and switching instructions below are retained to document the experiment and allow others to study or reproduce it. Their presence does not indicate ongoing development, recommended installation, or verified compatibility with current Codex compaction. See the known issue below for the established behavior and unresolved boundaries.
+
 **A native Rust Responses-to-Responses bridge that lets Grok run inside the Codex harness without replacing Native GPT.**
 
 `grok-codex-bridge` is a standalone, loopback-only provider bridge for macOS on Apple Silicon. Codex continues to own the agent loop, tools, permissions, MCP servers, Skills, and session state. This project owns only the local provider boundary, tolerant provider projection for Responses transport, Codex-consumed SSE extraction, the bridge-side Grok credential boundary, and the upstream connection to xAI. Credential recovery is delegated to the official Grok CLI; see [Model catalog and credentials](#model-catalog-and-credentials).
 
 It is not a Codex plugin, a general-purpose LLM router, or an agent harness.
+
+## Known issue: compaction compatibility
+
+**The merged GPT/Grok picker does not guarantee compaction compatibility or reliable continuation after switching providers in the same task.** Both GPT and Grok requests pass through the bridge under the custom `grok_codex_picker` provider. Successful model selection and ordinary responses do not establish that Codex uses the same compaction path as a direct OpenAI connection.
+
+- **Current implementation:** Native GPT `responses/compact` requests are forwarded to the captured first-party Codex upstream. In Grok mode, dedicated compact requests for Grok models are explicitly rejected. This does not prove that every form of Codex compaction fails: Codex may select a different compaction path depending on its version and provider configuration.
+- **Grok has a public compaction API:** [xAI documents `/v1/responses/compact`](https://docs.x.ai/developers/advanced-api-usage/context-compaction). Its availability does not establish support through this bridge's official-CLI authentication and upstream route. The documentation also states that its opaque `encrypted_content` is meaningful only when returned to xAI. An OpenAI-compatible response shape is not evidence that GPT and Grok can consume each other's compressed state; this bridge does not provide a verified conversion or handoff for that state.
+- **New Codex compaction remains unverified:** Compatibility with the experimental compaction approach reported alongside GPT-6 has not been established for this bridge. This is not a claim that all GPT-6 requests or all previous compaction fail, nor a conclusion that coexistence is fundamentally impossible. [OpenAI's Codex explanation](https://openai.com/index/unrolling-the-codex-agent-loop/) describes compaction as cooperation between harness-managed history and an upstream compaction service; forwarding ordinary inference requests alone is insufficient evidence of compatibility.
+- **Operational impact:** The maintainer reports that earlier use rarely showed noticeable information loss. However, investigation and attempted workarounds did not establish a satisfactory way to retain the desired new compaction behavior with the merged picker. The maintainer therefore fully removed the bridge from their own environment and chose direct OpenAI use, giving up Grok in the Codex picker. This is an operational decision under unresolved compatibility, not a reproducible demonstration of universal compaction failure.
+
+For long-running work that depends on Codex compaction, use direct OpenAI access until the required compaction and post-compaction continuation paths are demonstrated through the bridge. `mode native` is a reversible bridge compatibility mode, **not** full bridge removal or proof of direct OpenAI operation. A separately authorized full uninstall is a distinct operation. This limitation is unresolved; this notice does not change runtime behavior.
 
 ## One-command environment switching
 
@@ -140,7 +161,7 @@ Prebuilt Intel macOS, Linux, and Windows artifacts are not currently provided.
 
 ## Quick start: merged picker
 
-The primary route publishes a merged model catalog so Native GPT and admitted Grok models can be selected in one Codex model picker. Native GPT `responses` and `responses/compact` stay on the captured first-party Codex upstream. `images/generations`, `images/edits`, and `alpha/search` are Native-only passthrough endpoints with no Grok protocol conversion. Grok traffic is sent to xAI through the bridge. Grok mode has no authoritative xAI `responses/compact` contract, so compact requests for admitted Grok models fail closed in that mode. Native compatibility mode rewrites a saved Grok model slug to the Native fallback for both `responses` and `responses/compact`, without modifying saved task data.
+The primary route publishes a merged model catalog so Native GPT and admitted Grok models can be selected in one Codex model picker. Native GPT `responses` and `responses/compact` stay on the captured first-party Codex upstream. `images/generations`, `images/edits`, and `alpha/search` are Native-only passthrough endpoints with no Grok protocol conversion. Grok traffic is sent to xAI through the bridge. The current bridge rejects dedicated compact requests for admitted Grok models in Grok mode; support through its authenticated upstream route has not been established. See [Known issue: compaction compatibility](#known-issue-compaction-compatibility) for the public xAI API and cross-provider limitations. Native compatibility mode rewrites a saved Grok model slug to the Native fallback for both `responses` and `responses/compact`, without modifying saved task data.
 
 Native and Grok model slugs must remain unique. Catalog generation and runtime routing both fail closed on a duplicate slug; the bridge never overwrites a Native row or invents an alias.
 

@@ -2,11 +2,32 @@
 
 [English](README.md)
 
+## 開発凍結 — 実験結果としてのソース公開
+
+**本プロジェクトの開発は凍結しています。このリポジトリは実験のソースと成果として扱ってください。実用的なCodex環境として導入を推奨するものではありません。**
+
+実用的なタスク操作は、コンパクションと圧縮後の確実な継続から切り離して考えられません。モデル選択や通常の推論が動くだけでは、実用性を確立したことにはなりません。作者は、コンパクションの互換性問題を未解決のまま実装を進めることには問題があると判断し、開発を凍結しました。
+
+**作者自身の環境では、すでにブリッジを完全撤去し、橋を介さずOpenAIへ直接接続するCodex環境へ移行しています。** その環境のCodexピッカーではGrokを利用できません。ブリッジの `mode native` 互換モードではなく、完全撤去済みです。
+
+以下のソース説明、ビルド・導入・切り替え手順は、実験の記録と、他の方が内容を調査・再現するために残しています。手順が記載されていても、開発の継続、導入の推奨、現行Codexの圧縮機能との互換性確認を意味しません。確認済みの動作と未解決の範囲は、以下の既知の問題を参照してください。
+
 **Native GPTを置き換えず、Codexハーネスの中でGrokを動かすための、Rust製ネイティブResponses-to-Responsesブリッジです。**
 
 `grok-codex-bridge` はApple Silicon搭載macOS向けの、スタンドアロンかつループバック専用のプロバイダーブリッジです。エージェントループ、ツール、権限、MCPサーバー、Skills、セッション状態は引き続きCodexが担当します。本プロジェクトが担当するのは、ローカルのプロバイダー境界、Responses transportの許容的なprovider projection、Codexが消費するSSE抽出、bridge側のGrok credential境界、xAIへの上流接続です。credential復旧は公式Grok CLIへ委譲します。詳細は [モデルカタログと認証情報](#モデルカタログと認証情報) を参照してください。
 
 Codexプラグイン、汎用LLMルーター、エージェントハーネスではありません。
+
+## 既知の問題：コンパクションの互換性
+
+**GPT/Grok統合ピッカーは、コンパクションの互換性や、同じタスクで接続先を切り替えた後の正常な継続を保証しません。** GPTもGrokも、カスタムprovider `grok_codex_picker` の下でブリッジを通ります。モデルを選択して通常の応答を得られても、OpenAIへの直接接続と同じ圧縮経路がCodexで使われることの証明にはなりません。
+
+- **現行実装：** Native GPTの `responses/compact` 要求は取得済みのCodex公式上流へ転送します。Grokモードでは、Grokモデルへの専用圧縮要求を明示的に拒否します。ただし、Codexが選ぶ圧縮経路はバージョンやprovider設定に依存し得るため、これだけであらゆる圧縮が失敗するとは言えません。
+- **Grokにも公開圧縮APIがあります：** [xAIは `/v1/responses/compact` を公開しています](https://docs.x.ai/developers/advanced-api-usage/context-compaction)。その存在だけでは、このブリッジが使用する公式CLIの認証・上流接続経路での対応は確認できません。また、公式文書は圧縮データ `encrypted_content` がxAIへ戻した場合にだけ意味を持つと説明しています。外側の応答形式がOpenAI互換でも、GPTとGrokが互いの圧縮状態を利用できる証拠にはならず、このブリッジにもその状態を変換・引き継ぐ検証済みの仕組みはありません。
+- **Codexの新しい圧縮方式への対応は未確認です：** GPT-6とともに試験公開されたと報告されている圧縮方式について、このブリッジでの互換性は確立していません。GPT-6の全要求や従来の圧縮がすべて失敗するという意味でも、共存が原理的に不可能と結論したものでもありません。[OpenAIによるCodexの解説](https://openai.com/index/unrolling-the-codex-agent-loop/)では、ハーネスによる履歴管理と上流の圧縮サービスが連携する構成が説明されており、通常の推論要求を転送できるだけでは互換性の証明になりません。
+- **運用上の影響：** 開発者の従来の利用では、圧縮による情報欠落を実感することはほとんどありませんでした。しかし、調査と回避策の試行では、統合ピッカーと求める新しい圧縮動作を両立する十分な方法を確認できませんでした。そのため開発者自身の環境では橋を完全撤去し、CodexのピッカーからGrokを使うことを断念してOpenAIへの直接接続を選択しています。これは互換性が未解決の中での運用判断であり、あらゆる圧縮が失敗することを再現・立証したものではありません。
+
+Codexの圧縮に依存する長時間の作業では、必要な圧縮経路と圧縮後の継続がブリッジ経由で実証されるまで、OpenAIへの直接接続を使用してください。`mode native` は可逆的なブリッジ互換モードであり、**橋の完全撤去やOpenAIへの直接接続の証明ではありません。** 別途明示的に許可された完全アンインストールは独立した操作です。この制約は未解決であり、この記載によって稼働動作は変わりません。
 
 ## ワンコマンド環境切り替え
 
@@ -138,7 +159,7 @@ Intel Mac、Linux、Windows向けのビルド済み成果物は現在提供し�
 
 ## クイックスタート：統合ピッカー
 
-主要経路では、Native GPTと許可済みGrokモデルを同じCodexモデルピッカーで選べる統合カタログを公開します。Native GPTの `responses` と `responses/compact` は取得済みのCodex公式上流に固定します。`images/generations`、`images/edits`、`alpha/search` はNative専用の透過endpointであり、Grok protocol変換には入れません。Grok通信だけをブリッジ経由でxAIへ送ります。Grok modeではxAIの権威ある `responses/compact` 契約がないため、許可済みGrokモデルの圧縮要求を拒否します。Native互換モードでは、保存済みGrokモデル名を `responses` と `responses/compact` の両方でNative fallbackへ変換し、保存済みタスク自体は変更しません。
+主要経路では、Native GPTと許可済みGrokモデルを同じCodexモデルピッカーで選べる統合カタログを公開します。Native GPTの `responses` と `responses/compact` は取得済みのCodex公式上流に固定します。`images/generations`、`images/edits`、`alpha/search` はNative専用の透過endpointであり、Grok protocol変換には入れません。GPTもGrokもブリッジを通り、Grok通信はxAIへ転送します。現行ブリッジのGrokモードでは、認証済み上流経路での対応が確認できていないため、許可済みGrokモデルへの専用圧縮要求を拒否します。公開xAI APIと接続先をまたぐ制約については[既知の問題：コンパクションの互換性](#既知の問題コンパクションの互換性)を参照してください。Native互換モードでは、保存済みGrokモデル名を `responses` と `responses/compact` の両方でNative fallbackへ変換し、保存済みタスク自体は変更しません。
 
 NativeとGrokのmodel slugは一意でなければなりません。catalog生成時とruntime routing時のどちらでも重複slugはfail closedし、Native行の上書きやalias生成は行いません。
 
