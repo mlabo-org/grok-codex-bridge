@@ -209,14 +209,14 @@ Grokを選択したCodexセッションはローカルのループバックservi
 
 ### 橋を完全撤去して標準環境へ戻す
 
-過去の橋経由タスクが利用できなくなることを受け入れ、標準のChatGPT OAuth接続へ戻す場合は、`native` 互換モードではなく次の撤去スクリプトを使います。macOS標準のRubyと、導入済みの橋・ChatGPT.appを使用します。再ビルドは不要です。
+過去タスクの接続先名を解決できる状態を保ちながら、橋を撤去して標準のChatGPT OAuth接続へ戻す場合は、次の撤去スクリプトを使います。macOS標準のRubyと、導入済みの橋・ChatGPT.appを使用します。再ビルドは不要です。
 
 ```sh
 /usr/bin/ruby scripts/uninstall-native.rb --check
 /usr/bin/ruby scripts/uninstall-native.rb --execute
 ```
 
-スクリプトは導入済みCLIの所有範囲検査と `uninstall` を使用し、橋のruntime、専用profile、LaunchAgent、管理対象のpicker設定を撤去・復元します。撤去後、橋の待受がないこと、既定接続先が組み込みOpenAIであること、橋のprovider・catalog・URL設定がないことを確認し、公式App Serverの一時タスクでChatGPT OAuthによる短い実推論を1回行います。推論はアカウントのCodex利用枠を使います。ソース、認証情報、会話本文、履歴DBは変更・削除しません。旧接続先の別名やモデル互換設定も残しません。
+スクリプトは導入済みCLIの所有範囲検査と `uninstall` を使用し、橋のruntime、専用profile、LaunchAgent、管理対象のpicker設定を撤去・復元します。その後、公式App Serverの設定更新APIで `grok_codex_picker` と `grok_bridge` を公式OpenAIへの直接接続として定義し、過去タスクを開く際の「接続先が見つからない」エラーを防ぎます。橋のサービスは復活させず、新規タスクの既定接続先は組み込みOpenAIのままです。直接接続の定義と橋の待受・catalog・URL設定の不在を確認し、公式App Serverの一時タスクでChatGPT OAuthによる短い実推論を1回行います。推論はアカウントのCodex利用枠を使います。ソース、認証情報、会話本文、履歴DB、無関係な設定は保持します。
 
 Codex内から撤去する場合、実行中の会話が橋への接続を失うため、次の操作でTerminalへ処理を引き渡します。導入済み `codex-remote-restart` が必要です。
 
@@ -226,9 +226,9 @@ Codex内から撤去する場合、実行中の会話が橋への接続を失う
 
 `--handoff` は引渡しメッセージを表示するため15秒待ってから、撤去・検証・再起動を別プロセスで実行します。結果は `~/Library/Logs/grok-codex-uninstall.log` に出力します。再起動の引渡しと画面の復帰は別の状態です。通常のTerminalから `--execute` を使った場合は、完了後にCodexを完全終了して開き直してください。`--execute --restart` でも導入済み再起動ツールへ引き渡せます。
 
-保存済みprovider/model参照は変換しません。過去の橋経由タスクが必要な場合は、この撤去を実行せず、互換モードを使用してください。
+保存済みprovider/model参照は変換しません。GPTモデルで保存されたタスクは、旧接続先名から公式OpenAIへ直接接続できます。保存済みモデルがGrokの場合は、タスクを開いてGPTを選択してください。接続先の別名定義はGrokモデルを変換せず、すべての過去会話の互換性を保証するものでもありません。
 
-可逆なNative-only運用には `native` を使います。これは意図的にuninstallではありません。導入済みprovider定義、resolver、互換metadataを残すため、後から `grok` へ戻してもtask履歴を書き換えずにGrok routingを復元できます。完全撤去は、旧タスクが利用できなくなることを受け入れる場合、または別途明示されたdata migrationが完了した場合に限ります。
+可逆なNative-only運用には `native` を使います。これは意図的にuninstallではありません。導入済みprovider定義、resolver、互換metadataを残すため、後から `grok` へ戻してもtask履歴を書き換えずにGrok routingを復元できます。完全撤去では旧接続先名の公式OpenAI直接接続だけを残し、Grokモデルの変換は行いません。
 
 source更新はmode切替とは別のlifecycle境界です。新しいnative componentのbuild/materializeとinstallは、Native GPT taskまたはTerminalから実行し、導入済みreplacement経路にserviceの停止・再起動を任せます。通常のmode切替でbinaryを再buildすることはありません。更新後はCodex Desktopを一度再起動し、新しいpicker catalogを読み込ませてください。
 

@@ -120,13 +120,13 @@ picker activationは、既存service状態を確認し、必要なら停止、pi
 
 ## 11. Full uninstall
 
-`scripts/uninstall-native.rb` は、旧bridge taskが利用できなくなることを明示的に受け入れた利用者向けの完全撤去経路である。橋の推論・mode実装は変更せず、導入済みCLIの `doctor --native-compatibility` と `uninstall` を使用する。既定の `--check` は読み取りのみ、`--execute` は撤去と公式OAuth実推論確認、`--handoff` はCodex内からTerminalへの外部実行と導入済み再起動ツールへの引渡しを行う。旧provider名のalias、Grok modelの互換metadata、橋の待受を残して成功にしない。ソースとOAuth認証情報は保持し、会話DB・rolloutを直接変換または削除しない。旧task互換性が必要な利用者には完全撤去を適用しない。
+`scripts/uninstall-native.rb` は、橋を撤去して公式OpenAI接続へ戻す経路である。橋の推論・mode実装は変更せず、導入済みCLIの `doctor --native-compatibility` と `uninstall` を使用する。既定の `--check` は読み取りのみ、`--execute` は撤去、旧provider名の直接接続設定、公式OAuth実推論確認を行い、`--handoff` はCodex内からTerminalへの外部実行と導入済み再起動ツールへの引渡しを行う。撤去後に公式App Serverの `config/batchWrite` を使い、user configのversion一致を条件として `grok_codex_picker` と `grok_bridge` をChatGPT OAuth・Responses・WebSocket対応の公式OpenAI直接接続として定義する。既定provider/modelや無関係な設定は変更せず、旧provider名が欠落していることによる過去taskの再開失敗を防ぐ。Grok modelの互換metadata、橋の待受・認証headerは残さない。ソースとOAuth認証情報は保持し、会話DB・rolloutを直接変換または削除しない。
 
-撤去の受け入れは、所有されたruntime/profile/LaunchAgentの撤去または元の状態への復元、bridge待受の消失、実際の設定から起動した組み込みOpenAI provider、bridge provider/catalog/URL設定の不在、公式App Serverのephemeral threadでのChatGPT OAuth実推論完了とする。既存の無関係な設定の復元・保全はnative uninstallの所有経路に任せる。再起動の引渡しだけでは画面の復帰完了としない。実行中の旧provider sessionが切れるため、Codex内からの撤去は外部引渡しを使う。
+撤去の受け入れは、所有されたruntime/profile/LaunchAgentの撤去または元の状態への復元、bridge待受の消失、実際の設定から起動した組み込みOpenAI provider、旧provider名が公式OpenAIへ直接接続すること、bridge catalog/URL設定の不在、公式App Serverのephemeral threadでのChatGPT OAuth実推論完了とする。既存の無関係な設定の復元・保全はnative uninstallの所有経路に任せる。再起動の引渡しだけでは画面の復帰完了としない。実行中の旧provider sessionが切れるため、Codex内からの撤去は外部引渡しを使う。
 
 full uninstallは日常の `mode native` と別の明示的な破壊境界である。順序はservice停止、picker managed blockと生成artifactの復元・削除、isolated profileとLaunchAgentの原状復帰、install rootのmanifest-owned tree削除とする。
 
-uninstallはGrok credential、ChatGPT credential、Codex task/session、SQLite、rollout、projects、MCP、Skills、Browser設定、`AGENTS.md`、Native catalogを変更しない。保存済みtaskにGrok provider/model参照が残る場合、それを自動変換・削除せず、Grok環境が存在しないことによる参照不能を明示的なデータ移行なしに解消したとは扱わない。
+uninstallはGrok credential、ChatGPT credential、Codex task/session、SQLite、rollout、projects、MCP、Skills、Browser設定、`AGENTS.md`、Native catalogを変更しない。保存済みtaskのprovider/model参照は自動変換・削除しない。旧provider名の解決とGrok modelの推論互換性は別であり、保存済みmodelがGrokの場合は利用者がGPTを選択する必要がある。直接接続設定だけで全履歴の表示や推論互換性を保証したとは扱わない。
 
 manifest、backup、picker state、managed config identityが読めない、改変されている、または対象がsymlinkの場合は削除せず停止する。rollback不能な状態で部分削除を進めない。picker artifactの削除途中で失敗した場合は、事前に保持したbridge所有artifact、managed config、必要なexact backupを復元して再試行可能な状態へ戻す。補償復元自体も失敗した場合は、元の削除失敗と復元失敗の両方を報告する。
 

@@ -1,5 +1,5 @@
 #!/usr/bin/ruby
-# Complete bridge removal. Saved bridge-provider conversations are not migrated.
+# Remove the bridge while resolving saved provider IDs directly through OpenAI.
 require 'json'
 require 'open3'
 require 'timeout'
@@ -9,17 +9,48 @@ require 'socket'
 module NativeUninstall
   APP_CODEX = '/Applications/ChatGPT.app/Contents/Resources/codex'.freeze
   LEGACY = %w[grok_codex_picker grok_bridge].freeze
+  DIRECT_OPENAI = {
+    'name' => 'OpenAI',
+    'base_url' => 'https://chatgpt.com/backend-api/codex',
+    'wire_api' => 'responses',
+    'requires_openai_auth' => true,
+    'supports_websockets' => true
+  }.freeze
 
-  def self.verify_config(config, root)
+  def self.verify_config(config, root, require_aliases: true)
     raise 'Default provider is not the built-in OpenAI provider' unless (config['model_provider'] || 'openai') == 'openai'
     raise 'Default model is still Grok' if config['model'].to_s.start_with?('grok-')
     providers = config['model_providers'] || {}
-    raise 'A bridge provider definition remains' unless (providers.keys & LEGACY).empty?
+    LEGACY.each do |id|
+      provider = providers[id]
+      next if !require_aliases && !provider
+      # config/read includes unset fields as null and the disabled search default.
+      explicit = provider&.reject { |key, value| value.nil? || (key == 'supports_standalone_web_search' && value == false) }
+      raise "Saved provider #{id} must connect directly to OpenAI" unless explicit == DIRECT_OPENAI
+    end
     raise 'The built-in OpenAI provider is overridden' if providers.key?('openai')
     raise 'The OpenAI base URL is overridden' if config['openai_base_url']
     catalog = config['model_catalog_json']
     raise 'The bridge model catalog remains configured' if catalog && File.expand_path(catalog).start_with?(root + '/')
     true
+  end
+
+  def self.restore_saved_providers(connection, codex_home, root)
+    snapshot = connection.call('config/read', includeLayers: true)
+    verify_config(snapshot.fetch('config'), root, require_aliases: false)
+    config_path = File.realpath(File.join(codex_home, 'config.toml'))
+    layer = snapshot.fetch('layers').find do |entry|
+      entry.dig('name', 'type') == 'user' && entry.dig('name', 'file') == config_path
+    end
+    raise 'Cannot identify the user config version' unless layer
+    result = connection.call('config/batchWrite', filePath: config_path,
+      expectedVersion: layer.fetch('version'), reloadUserConfig: false,
+      edits: LEGACY.map do |id|
+        { keyPath: "model_providers.#{id}", value: DIRECT_OPENAI, mergeStrategy: 'replace' }
+      end)
+    raise 'Direct OpenAI provider settings were overridden' unless result['status'] == 'ok'
+    config = connection.call('config/read', includeLayers: false).fetch('config')
+    verify_config(config, root)
   end
 
   class AppServer
@@ -118,7 +149,7 @@ module NativeUninstall
       @agent_created = manifest.fetch('launch_agent_created')
       puts 'Preflight passed: installed bridge ownership and ChatGPT OAuth login.'
       puts 'Removal includes bridge runtime, managed picker settings and service; source and saved conversations are retained.'
-      puts 'Saved bridge-provider conversations may become unusable. No compatibility aliases or history migration are installed.'
+      puts 'Saved provider IDs will connect directly to OpenAI. History is not migrated; saved Grok models require selecting a GPT model.'
     end
 
     def execute(restart)
@@ -142,9 +173,8 @@ module NativeUninstall
           raise 'A process is still listening on the bridge port'
         end
         connection = AppServer.new(@codex_home)
-        config = connection.call('config/read', includeLayers: false).fetch('config')
-        NativeUninstall.verify_config(config, @root)
-        puts 'Verified: built-in OpenAI defaults, no bridge provider/catalog/URL, no bridge listener.'
+        NativeUninstall.restore_saved_providers(connection, @codex_home, @root)
+        puts 'Verified: built-in OpenAI defaults, saved provider IDs connect directly to OpenAI, no bridge catalog/URL/listener.'
         puts "Verified: direct ChatGPT OAuth inference completed with #{connection.smoke(@home)}."
         puts 'Native restoration: complete. Existing in-memory sessions still require an app restart.'
       ensure
