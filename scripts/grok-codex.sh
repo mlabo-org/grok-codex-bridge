@@ -13,7 +13,7 @@ installed_overlay="$installed_launcher/Contents/Resources/grok-codex-bridge-over
 codex_home="${CODEX_HOME:-"$HOME/.codex"}"
 native_catalog="$codex_home/models_cache.json"
 grok_overlay="$project_root/Grok.md"
-chatgpt_codex="/Applications/ChatGPT.app/Contents/Resources/codex"
+chatgpt_codex="/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex"
 
 usage() {
     printf '%s\n' "usage: $0 grok|native" >&2

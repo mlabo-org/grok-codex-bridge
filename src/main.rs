@@ -186,7 +186,7 @@ fn require_regular_file(path: &Path, label: &'static str) -> Result<(), Operatio
 }
 
 fn verify_chatgpt_native_route() -> Result<(), OperationError> {
-    let binary = Path::new("/Applications/ChatGPT.app/Contents/Resources/codex");
+    let binary = Path::new("/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex");
     require_regular_file(binary, "ChatGPT.app Codex executable")?;
     let output = ProcessCommand::new(binary)
         .args(["login", "status"])

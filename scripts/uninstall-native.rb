@@ -7,7 +7,7 @@ require 'shellwords'
 require 'socket'
 
 module NativeUninstall
-  APP_CODEX = '/Applications/ChatGPT.app/Contents/Resources/codex'.freeze
+  APP_CODEX = '/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex'.freeze
   LEGACY = %w[grok_codex_picker grok_bridge].freeze
   DIRECT_OPENAI = {
     'name' => 'OpenAI',

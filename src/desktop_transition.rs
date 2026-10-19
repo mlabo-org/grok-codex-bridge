@@ -16,7 +16,7 @@ const KILL: &str = "/bin/kill";
 const PS: &str = "/bin/ps";
 const CHATGPT_APP: &str = "/Applications/ChatGPT.app";
 const CHATGPT_EXECUTABLE: &str = "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT";
-const CODEX_EXECUTABLE: &str = "/Applications/ChatGPT.app/Contents/Resources/codex";
+const CODEX_EXECUTABLE: &str = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex";
 const MAX_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Operations required by the transition.  The trait keeps the process
@@ -426,7 +426,7 @@ mod tests {
                 (11, CHATGPT_EXECUTABLE),
                 (
                     12,
-                    "/Applications/ChatGPT.app/Contents/Resources/codex app-server",
+                    "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex app-server",
                 ),
             ]
             .into_iter()
@@ -465,7 +465,7 @@ mod tests {
                 (11, CHATGPT_EXECUTABLE),
                 (
                     12,
-                    "/Applications/ChatGPT.app/Contents/Resources/codex app-server",
+                    "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex app-server",
                 ),
             ]
             .into_iter()
@@ -574,22 +574,22 @@ mod tests {
             "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"
         ));
         assert!(is_app_server_command(
-            "/Applications/ChatGPT.app/Contents/Resources/codex -c features.code_mode_host=true app-server --analytics-default-enabled"
+            "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex -c features.code_mode_host=true app-server --analytics-default-enabled"
         ));
         assert!(is_app_server_command(
-            "/Applications/ChatGPT.app/Contents/Resources/codex --config=foo=bar -c baz=qux app-server"
+            "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex --config=foo=bar -c baz=qux app-server"
         ));
         assert!(!is_app_server_command(
-            "/Applications/ChatGPT.app/Contents/Resources/codex login status"
+            "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex login status"
         ));
         assert!(!is_app_server_command(
-            "/Applications/ChatGPT.app/Contents/Resources/codex --config app-server"
+            "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex --config app-server"
         ));
         assert!(!is_app_server_command(
-            "/Applications/ChatGPT.app/Contents/Resources/codex exec app-server"
+            "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex exec app-server"
         ));
         assert!(!is_app_server_command(
-            "/Applications/ChatGPT.app/Contents/Resources/codex --unknown app-server"
+            "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex --unknown app-server"
         ));
         assert!(!is_chatgpt_command(
             "/Applications/ChatGPT.app/Contents/Resources/native/bare-modifier-monitor"
