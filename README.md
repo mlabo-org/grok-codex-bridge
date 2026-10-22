@@ -152,7 +152,7 @@ The merged picker is the only documented operating route. Native GPT remains ava
 ## Requirements
 
 - macOS on Apple Silicon.
-- Rust 1.95.0 for building from source, pinned by [rust-toolchain.toml](rust-toolchain.toml).
+- Rust 1.99.1 for building from source, pinned by [rust-toolchain.toml](rust-toolchain.toml).
 - A local source build is required. This project does not ship compiled binaries in the repository or through GitHub Releases; the Rust bridge and Swift launcher are compiled once on the user's own macOS arm64 machine and then installed.
 - An official Grok CLI installation and either a current login or the ability to complete its official browser OAuth flow.
 - A current Codex CLI installation.

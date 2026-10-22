@@ -150,7 +150,7 @@ Grok / xAI
 ## 必要環境
 
 - Apple Silicon搭載macOS。
-- ソースからビルドする場合は [rust-toolchain.toml](rust-toolchain.toml) で固定されたRust 1.95.0。
+- ソースからビルドする場合は [rust-toolchain.toml](rust-toolchain.toml) で固定されたRust 1.99.1。
 - sourceからのローカルbuildが必須です。コンパイル済みbinaryはrepositoryにもGitHub Releasesにも配布しません。利用者自身のmacOS arm64環境でRust bridgeとSwift launcherを一度compileしてinstallし、その後は導入済み成果物を使います。
 - 公式Grok CLIと、有効なloginまたは公式browser OAuthを完了できる環境。
 - 現行のCodex CLI。
