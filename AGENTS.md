@@ -35,7 +35,7 @@
 ## Agent Build, Install, Update, And Switching Route
 
 - このrepoを受け取ったagentは、最初に`git status --short`、`README.md`または`README.ja.md`、`rust-toolchain.toml`、`scripts/materialize-macos.sh`を確認する。既存差分がある場合は保持し、競合するfileを上書きしない。
-- build前提はApple Silicon macOS、pinned Rust 1.95.0 toolchain、`swiftc`、`codesign`である。build要求ではrepo rootから`./scripts/materialize-macos.sh`を一度実行する。Rust executableだけをlauncherなしでinstallまたはhandoffしてはならない。normal operationへ`cargo run`または`target/`内binaryを渡さない。
+- build前提はApple Silicon macOS、pinned Rust 1.99.1 toolchain、`swiftc`、`codesign`である。build要求ではrepo rootから`./scripts/materialize-macos.sh`を一度実行する。Rust executableだけをlauncherなしでinstallまたはhandoffしてはならない。normal operationへ`cargo run`または`target/`内binaryを渡さない。
 - sourceからのinstallまたはactivationはuserがそのactionを明示した場合だけ、Native GPT taskまたはTerminalから`./scripts/grok-codex.sh grok`または`./scripts/grok-codex.sh native`を使用する。scriptはcompileしない。materialized pairがmissingまたはstaleなら停止するため、先にmaterializationを完了する。
 - source更新ではmaterialization後に`./scripts/grok-codex.sh grok|native`を使う。明示的なpair交換要求では`./scripts/replace-installed-bridge.sh ./dist/aarch64-apple-darwin/grok-codex-bridge "./dist/aarch64-apple-darwin/Grok Codex Switch.app"`を使う。Rust executableとSwift launcherを別versionのまま交換しない。
 - install後の日常切替は`$HOME/Library/Application Support/grok-codex-bridge/bin/grok-codex-bridge mode grok`または`mode native`を直接使う。この経路はrepo、`target/`、`dist/`、source `Grok.md`、replacement script、compilerを探索せず、source checkoutを移動または削除した後もinstalled treeだけで完結する。
