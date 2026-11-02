@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::io::{self, Cursor, Read};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::{Path, State};
@@ -1312,6 +1312,7 @@ mod tests {
     use std::path::{Path as FsPath, PathBuf};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
 
     use std::fs;
     use std::os::unix::fs::PermissionsExt;

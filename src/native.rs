@@ -222,6 +222,9 @@ impl NativeClient {
         Ok(Self { client, base_url })
     }
 
+    /// Sends a request with a fresh retry budget. Production paths call
+    /// `post_with_started` with the caller's start time; tests use this.
+    #[cfg(test)]
     pub(crate) async fn post(
         &self,
         suffix: NativeApiPath,
